@@ -63,6 +63,17 @@ class AccountNotFoundError(TransactionServiceError):
         )
 
 
+class EntityMismatchError(TransactionServiceError):
+    """A posting references an account owned by a different entity."""
+
+    def __init__(self, account_id: uuid.UUID) -> None:
+        super().__init__(
+            f"Account '{account_id}' belongs to a different entity",
+            status_code=422,
+        )
+        self.error_type = "entity_mismatch"
+
+
 class TransactionNotFoundError(TransactionServiceError):
     """Referenced transaction does not exist."""
 
@@ -252,10 +263,16 @@ class TransactionService:
     async def _validate_accounts(
         db: AsyncSession,
         account_ids: set[uuid.UUID],
+        *,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> None:
-        """Verify all referenced accounts exist and are active.
+        """Verify all referenced accounts exist, are active, and are owned.
 
         Raises AccountNotFoundError if any account is missing or inactive.
+        When the transaction carries ``entity_id`` (Contract F19), every
+        posting's account must belong to the SAME entity — or be
+        NULL-scoped legacy — else :class:`EntityMismatchError` (422).
+        ``entity_id=None`` keeps the legacy global validation unchanged.
         """
         if not account_ids:
             return
@@ -270,6 +287,8 @@ class TransactionService:
                 raise AccountNotFoundError(account_id)
             if not account.is_active:
                 raise AccountNotFoundError(account_id)
+            if entity_id is not None and account.entity_id not in (None, entity_id):
+                raise EntityMismatchError(account_id)
 
     @staticmethod
     async def _generate_je_reference(
@@ -338,9 +357,11 @@ class TransactionService:
                 existing_tx.id,
             )
 
-        # ---- Validate accounts ----
+        # ---- Validate accounts (entity-ownership checked when stamped) ----
         account_ids = {p.account_id for p in data.postings}
-        await TransactionService._validate_accounts(db, account_ids)
+        await TransactionService._validate_accounts(
+            db, account_ids, entity_id=entity_id
+        )
 
         # ---- Create transaction ----
         total_amount = sum(

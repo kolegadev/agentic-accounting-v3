@@ -315,13 +315,22 @@ async def _list_all_formance_transactions(ledger: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-async def verify_parity(db: AsyncSession, ledger: str = "main") -> ParityReport:
+async def verify_parity(
+    db: AsyncSession,
+    ledger: str = "main",
+    entity_id: Optional[uuid.UUID] = None,
+) -> ParityReport:
     """Verify Formance ledger ``ledger`` is a faithful image of Postgres.
 
     Reads in-scope transactions (posted/reversed) and accounts from ``db``;
     reads the Formance transaction list and balances through the
     ``formance_client`` singleton.  Formance being unreachable produces a
     report with ``ok=False`` and a non-empty ``error`` (never raises).
+
+    ``entity_id`` (Contract F19) scopes the Postgres universe: the
+    transaction query AND the account/code map are filtered to that entity
+    when provided.  ``None`` keeps the legacy unfiltered behavior
+    byte-identical.
     """
     missing: list[dict[str, Any]] = []
     orphans: list[dict[str, Any]] = []
@@ -334,14 +343,20 @@ async def verify_parity(db: AsyncSession, ledger: str = "main") -> ParityReport:
     missing_balance_addresses: list[dict[str, Any]] = []
 
     # ---- Postgres reads -------------------------------------------------
-    tx_result = await db.execute(
+    tx_stmt = (
         select(Transaction)
         .where(Transaction.status.in_(IN_SCOPE_STATUSES))
         .options(selectinload(Transaction.postings))
     )
+    if entity_id is not None:
+        tx_stmt = tx_stmt.where(Transaction.entity_id == entity_id)
+    tx_result = await db.execute(tx_stmt)
     pg_transactions: list[Transaction] = list(tx_result.scalars().all())
 
-    account_result = await db.execute(select(Account))
+    account_stmt = select(Account)
+    if entity_id is not None:
+        account_stmt = account_stmt.where(Account.entity_id == entity_id)
+    account_result = await db.execute(account_stmt)
     accounts: list[Account] = list(account_result.scalars().all())
     codes = {a.id: a.code for a in accounts}
     code_to_account = {str(a.code): a for a in accounts}

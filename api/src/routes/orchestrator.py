@@ -4,6 +4,12 @@ Exposes classify → construct → preview, plus approve / reject / pending.
 The LLM is only invoked by the message endpoint; approve, reject and
 pending never touch it.  Orchestrator structured errors map to 422 with
 {type, message}; service exceptions map to 404 / 422.
+
+Contract F19: every endpoint accepts an optional ``entity_id`` (the
+message body for /message, a query param for approve/reject/pending).
+The scope resolves explicit > single-active > NULL legacy; more than one
+active entity without an explicit id is a 409 {type: ambiguous_entity} —
+never a silent global fallback.
 """
 
 from __future__ import annotations
@@ -12,12 +18,13 @@ import uuid
 from dataclasses import asdict
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.database import get_db
+from src.services.entity_service import AmbiguousEntityError, resolve_entity_scope
 from src.services.orchestrator import (
     approve_entry,
     orchestrate_message,
@@ -44,12 +51,33 @@ class MessageRequest(BaseModel):
     message: str
     history: Optional[list[dict[str, Any]]] = None
     session_id: Optional[str] = None
+    entity_id: Optional[uuid.UUID] = None
 
 
 class TransactionRef(BaseModel):
     """Body for POST /approve and /reject — the draft to act on."""
 
     transaction_id: uuid.UUID
+
+
+# ---------------------------------------------------------------------------
+# Entity scope resolution (Contract F19)
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_scope(
+    db: AsyncSession,
+    entity_id: Optional[uuid.UUID],
+) -> Optional[uuid.UUID]:
+    """Explicit > single-active > NULL legacy; ambiguous → the exception."""
+    return await resolve_entity_scope(db, entity_id)
+
+
+def _ambiguous_response(exc: AmbiguousEntityError) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"type": exc.error_type or "ambiguous_entity", "message": exc.message},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -71,9 +99,17 @@ async def message(
 
     Returns 200 with status "preview" (draft awaiting approval) or
     "clarification" (the LLM needs more detail).  Hard errors map to
-    422 with {type, message}.
+    422 with {type, message}.  An ambiguous entity scope maps to
+    409 {type: ambiguous_entity}.
     """
-    result = await orchestrate_message(db, data.message, history=data.history)
+    try:
+        scope_id = await _resolve_scope(db, data.entity_id)
+    except AmbiguousEntityError as exc:
+        return _ambiguous_response(exc)
+
+    result = await orchestrate_message(
+        db, data.message, history=data.history, entity_id=scope_id
+    )
 
     if result.status == "preview":
         return JSONResponse(
@@ -126,16 +162,24 @@ async def message(
     status_code=200,
     responses={
         404: {"description": "Transaction not found"},
+        409: {"description": "Ambiguous entity scope: {type: ambiguous_entity}"},
         422: {"description": "Transaction not in draft, or unbalanced"},
     },
 )
 async def approve(
     data: TransactionRef,
+    entity_id: Optional[uuid.UUID] = Query(
+        None, description="Entity scope (required when several are active)"
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Post the draft: assigns JE ref, mirrors to Formance, verifies parity."""
     try:
-        result = await approve_entry(db, data.transaction_id)
+        scope_id = await _resolve_scope(db, entity_id)
+    except AmbiguousEntityError as exc:
+        return _ambiguous_response(exc)
+    try:
+        result = await approve_entry(db, data.transaction_id, entity_id=scope_id)
     except TransactionNotFoundError as exc:
         raise HTTPException(status_code=404, detail=exc.message)
     except TransactionNotDraftError as exc:
@@ -166,9 +210,16 @@ async def approve(
 )
 async def reject(
     data: TransactionRef,
+    entity_id: Optional[uuid.UUID] = Query(
+        None, description="Entity scope (required when several are active)"
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Discard the draft. Posted rows are append-only — never deleted."""
+    try:
+        await _resolve_scope(db, entity_id)
+    except AmbiguousEntityError as exc:
+        return _ambiguous_response(exc)
     try:
         result = await reject_entry(db, data.transaction_id)
     except TransactionNotFoundError as exc:
@@ -187,11 +238,22 @@ async def reject(
     "/pending",
     summary="List draft transactions awaiting approval",
     status_code=200,
+    responses={409: {"description": "Ambiguous entity scope: {type: ambiguous_entity}"}},
 )
-async def pending(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    """Return drafts only (status='draft'), newest first, with legs."""
+async def pending(
+    entity_id: Optional[uuid.UUID] = Query(
+        None, description="Entity scope (required when several are active)"
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Return drafts only (status='draft'), newest first, with legs —
+    scoped to the resolved entity (stamped rows) in multi-entity mode."""
+    try:
+        scope_id = await _resolve_scope(db, entity_id)
+    except AmbiguousEntityError as exc:
+        return _ambiguous_response(exc)
     transactions, total = await TransactionService.list_transactions(
-        db, status="draft"
+        db, status="draft", entity_id=scope_id
     )
     return {
         "transactions": [

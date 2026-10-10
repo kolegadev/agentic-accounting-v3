@@ -219,15 +219,20 @@ async def test_get_active_entity_inactive_only_returns_none(
 
 
 @pytest.mark.asyncio
-async def test_get_active_ledger_multiple_entities_still_main(
+async def test_get_active_ledger_multiple_entities_raises(
     mock_db: AsyncMock,
 ) -> None:
-    """get_active_ledger keeps single-entity semantics: two active entities
-    → 'main' (delegates to get_active_entity, catches the ambiguity)."""
+    """Contract F19: get_active_ledger is fail-loud — two active entities
+    raise AmbiguousEntityError (409), never a silent 'main'."""
     e1 = make_entity()
     e2 = make_entity(id=uuid.uuid4(), name="Beta LLP")
     mock_db.execute.return_value = _entities_result([e1, e2])
-    assert await get_active_ledger(mock_db) == "main"
+
+    with pytest.raises(AmbiguousEntityError) as excinfo:
+        await get_active_ledger(mock_db)
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.error_type == "ambiguous_entity"
 
 
 def test_ambiguous_entity_error_contract() -> None:

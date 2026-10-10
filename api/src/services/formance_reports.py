@@ -53,6 +53,7 @@ from collections import defaultdict
 from datetime import date, datetime, time, timezone
 from decimal import InvalidOperation
 from typing import Any, Optional
+import uuid
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -300,9 +301,21 @@ async def _list_all_transactions(ledger: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-async def _load_coa(db: AsyncSession) -> tuple[dict[str, str], dict[str, str]]:
-    """(code -> class, code -> name) for every COA account."""
-    result = await db.execute(select(Account).order_by(Account.code))
+async def _load_coa(
+    db: AsyncSession,
+    *,
+    entity_id: Optional[uuid.UUID] = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """(code -> class, code -> name) for every COA account.
+
+    ``entity_id`` (Contract F19) scopes the COA classification to one
+    entity's accounts — two COAs sharing codes never collapse into one
+    map; ``None`` keeps the legacy global classification.
+    """
+    stmt = select(Account).order_by(Account.code)
+    if entity_id is not None:
+        stmt = stmt.where(Account.entity_id == entity_id)
+    result = await db.execute(stmt)
     accounts = list(result.scalars().all())
     class_map = build_code_class_map(accounts)
     name_map = {str(a.code): a.name for a in accounts}
@@ -604,6 +617,7 @@ async def generate_pl(
     ledger: str = DEFAULT_LEDGER,
     period_start: Optional[date] = None,
     period_end: Optional[date] = None,
+    entity_id: Optional[uuid.UUID] = None,
 ) -> dict[str, Any]:
     """F8 income statement from Formance period flows (never balances).
 
@@ -613,7 +627,7 @@ async def generate_pl(
     and raises :class:`ReportEngineError` when a section silently drops
     a line item — a broken P&L is never returned.
     """
-    class_map, name_map = await _load_coa(db)
+    class_map, name_map = await _load_coa(db, entity_id=entity_id)
     scope_ids = await _load_scope_ids(db)
     debit, credit = await _period_flows(ledger, scope_ids, period_start, period_end)
     _check_flow_codes(debit, credit, class_map)
@@ -636,6 +650,7 @@ async def generate_bs(
     db: AsyncSession,
     ledger: str = DEFAULT_LEDGER,
     as_at: Optional[date] = None,
+    entity_id: Optional[uuid.UUID] = None,
 ) -> dict[str, Any]:
     """F8 balance sheet from Formance balances (never period flows).
 
@@ -647,7 +662,7 @@ async def generate_bs(
     Identity: Σ assets == Σ liabilities + Σ equity, exact in pence.
     """
     as_at = as_at or date.today()
-    class_map, name_map = await _load_coa(db)
+    class_map, name_map = await _load_coa(db, entity_id=entity_id)
     balances = await _ledger_balances(ledger, class_map)
 
     def raw_section(codes: list[str]) -> list[dict[str, Any]]:
@@ -774,6 +789,7 @@ async def generate_tb(
     db: AsyncSession,
     ledger: str = DEFAULT_LEDGER,
     as_at: Optional[date] = None,
+    entity_id: Optional[uuid.UUID] = None,
 ) -> dict[str, Any]:
     """F8 trial balance from Formance balances.
 
@@ -781,7 +797,7 @@ async def generate_tb(
     credit column (positive). Identity: Σ debits == Σ credits, exact.
     """
     as_at = as_at or date.today()
-    class_map, name_map = await _load_coa(db)
+    class_map, name_map = await _load_coa(db, entity_id=entity_id)
     balances = await _ledger_balances(ledger, class_map)
 
     accounts: list[dict[str, Any]] = []
@@ -830,6 +846,7 @@ async def generate_cash_flow(
     ledger: str = DEFAULT_LEDGER,
     period_start: Optional[date] = None,
     period_end: Optional[date] = None,
+    entity_id: Optional[uuid.UUID] = None,
 ) -> dict[str, Any]:
     """F8 indirect cash flow from period flows + current bank balances.
 
@@ -838,7 +855,7 @@ async def generate_cash_flow(
     :class:`ReportEngineError` when the identity breaks — e.g. closing
     entries inside the period or tax provisions posted outside 3020.
     """
-    class_map, name_map = await _load_coa(db)
+    class_map, name_map = await _load_coa(db, entity_id=entity_id)
     scope_ids = await _load_scope_ids(db)
     debit, credit = await _period_flows(ledger, scope_ids, period_start, period_end)
     _check_flow_codes(debit, credit, class_map)
@@ -1003,6 +1020,7 @@ async def generate_funds(
     ledger: str = DEFAULT_LEDGER,
     period_start: Optional[date] = None,
     period_end: Optional[date] = None,
+    entity_id: Optional[uuid.UUID] = None,
 ) -> dict[str, Any]:
     """F8 funds statement: long-term sources vs applications + WC movement.
 
@@ -1010,7 +1028,7 @@ async def generate_funds(
     working-capital movement == Δ current assets − Δ current liabilities
     (period net flows). A working-capital DECREASE is presented as a source.
     """
-    class_map, name_map = await _load_coa(db)
+    class_map, name_map = await _load_coa(db, entity_id=entity_id)
     scope_ids = await _load_scope_ids(db)
     debit, credit = await _period_flows(ledger, scope_ids, period_start, period_end)
     _check_flow_codes(debit, credit, class_map)

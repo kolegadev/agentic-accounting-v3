@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 
 from src.models.entity import Entity
 from src.services.entity_service import (
+    AmbiguousEntityError,
     DuplicateEntityNameError,
     DuplicateLedgerNameError,
     EntityService,
@@ -248,13 +249,20 @@ async def test_get_active_ledger_single_entity(mock_db: AsyncMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_active_ledger_multiple_entities_returns_main(
+async def test_get_active_ledger_multiple_entities_raises_ambiguous(
     mock_db: AsyncMock,
 ) -> None:
+    """Contract F19: 2+ active entities → AmbiguousEntityError (409), never
+    a silent 'main' (the F12 premise predates multi-entity)."""
     e1 = make_entity()
     e2 = make_entity(name="Beta LLP")
     mock_db.execute.return_value = _entities_result([e1, e2])
-    assert await get_active_ledger(mock_db) == "main"
+
+    with pytest.raises(AmbiguousEntityError) as excinfo:
+        await get_active_ledger(mock_db)
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.error_type == "ambiguous_entity"
 
 
 @pytest.mark.asyncio

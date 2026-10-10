@@ -196,6 +196,7 @@ async def test_orchestrate_supplier_invoice_vat_preview(
         '"vat_rate": "20%", "expense_account_code": "5000"}]}}'
     )
     mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
         _result(scalars=list(coa.values())),  # list_accounts
         _result(scalar=coa["5000"]),  # get_account_by_code
         _result(scalar=coa["2220"]),
@@ -241,6 +242,7 @@ async def test_orchestrate_bank_transfer_preview(
         '"reference": "sweep"}}'
     )
     mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
         _result(scalars=list(coa.values())),
         _result(scalar=coa["1001"]),
         _result(scalar=coa["1000"]),
@@ -273,6 +275,7 @@ async def test_orchestrate_payroll_preview(
         '"employer_nic_pence": 14000, "bank_account_code": "1000"}}'
     )
     mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
         _result(scalars=list(coa.values())),
         _result(scalar=coa["6600"]),
         _result(scalar=coa["1000"]),
@@ -407,6 +410,7 @@ async def test_orchestrate_constructor_error_structured(
         '"vat_rate": "0%", "expense_account_code": "9999"}]}}'
     )
     mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
         _result(scalars=list(coa.values())),
     ]
 

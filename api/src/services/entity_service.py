@@ -237,21 +237,20 @@ async def get_active_ledger(db: AsyncSession) -> str:
 
     Deterministic resolution used for posting, parity and reports:
     exactly one active entity (``is_active=True``) → its ``ledger_name``;
-    zero or multiple active entities → ``"main"``.  Any lookup failure
-    (e.g. a pre-F11 schema without the ``entities`` table) degrades to
-    ``"main"`` so the no-entity system keeps behaving exactly as before.
+    zero → ``"main"`` (legacy global mode); MORE than one →
+    :class:`AmbiguousEntityError` (409) — an explicit ``entity_id`` is then
+    required (Contract F19: fail-loud, never a silent ``"main"``).  Any
+    lookup failure (e.g. a pre-F11 schema without the ``entities`` table)
+    degrades to ``"main"`` so the no-entity system keeps behaving exactly
+    as before.
 
-    Delegates to :func:`get_active_entity`; the multi-active case keeps
-    resolving to ``"main"`` (single-entity semantics preserved — its
-    callers become entity-aware in F19).
+    Delegates to :func:`get_active_entity`; the multi-active case is
+    DELIBERATELY no longer swallowed here.
     """
     try:
         entity = await get_active_entity(db)
     except AmbiguousEntityError:
-        logger.warning(
-            "get_active_ledger: multiple active entities; falling back to 'main'"
-        )
-        return "main"
+        raise
     except Exception as exc:  # noqa: BLE001 — resolution is best-effort
         logger.warning(
             "get_active_ledger: active-entity lookup failed (%s); "
@@ -262,3 +261,33 @@ async def get_active_ledger(db: AsyncSession) -> str:
     if entity is None:
         return "main"
     return entity.ledger_name
+
+
+async def resolve_entity_scope(
+    db: AsyncSession,
+    entity_id: Optional[uuid.UUID] = None,
+) -> Optional[uuid.UUID]:
+    """Resolve the entity scope for a request (Contract F19).
+
+    Explicit ``entity_id`` wins without a query; otherwise the single
+    active entity (``get_active_entity``); none → ``None`` (legacy global
+    scope).  MORE than one active entity raises
+    :class:`AmbiguousEntityError` (fail-loud, never silent).  Non-ambiguous
+    lookup failures (e.g. a pre-F11 schema without the ``entities`` table)
+    degrade to ``None`` so the no-entity system keeps behaving exactly as
+    before.
+    """
+    if entity_id is not None:
+        return entity_id
+    try:
+        active = await get_active_entity(db)
+    except AmbiguousEntityError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — resolution is best-effort
+        logger.warning(
+            "resolve_entity_scope: active-entity lookup failed (%s); "
+            "falling back to legacy scope",
+            exc,
+        )
+        return None
+    return active.id if active is not None else None

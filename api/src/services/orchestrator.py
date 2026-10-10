@@ -29,7 +29,12 @@ import httpx
 from src.constructors import CONSTRUCTORS, ConstructorError, resolve_from_coa
 from src.constructors.facts import FACTS_MODELS, parse_facts
 from src.services.coa_service import CoaService
-from src.services.entity_service import get_active_ledger
+from src.services.entity_service import (
+    AmbiguousEntityError,
+    get_active_ledger,  # noqa: F401 — patch seam for legacy tests
+    get_ledger_for_entity,
+    resolve_entity_scope,
+)
 from src.services.ledger_parity import ParityReport, verify_parity
 from src.services.transaction_service import (
     TransactionService,
@@ -330,6 +335,7 @@ async def orchestrate_message(
     message: str,
     history: list[dict[str, Any]] | None = None,
     llm: LLMTransport | None = None,
+    entity_id: uuid.UUID | None = None,
 ) -> OrchestrateResult:
     """Run the classify → construct → draft pipeline for one user message.
 
@@ -337,6 +343,12 @@ async def orchestrate_message(
     error.  ``llm`` is the injectable transport: an async callable
     ``(system_prompt, user_message) -> raw text``; defaults to
     :func:`call_llm`.
+
+    ``entity_id`` (Contract F19) is the entity scope: an explicit id wins;
+    otherwise the single active entity; otherwise the legacy global scope
+    (NULL).  The COA resolution and the stamped draft are entity-scoped;
+    more than one active entity without an explicit id fails loud as a
+    structured ``ambiguous_entity`` error (never a silent global draft).
     """
     transport: LLMTransport = llm or call_llm
     system_prompt = build_system_prompt(history)
@@ -378,9 +390,17 @@ async def orchestrate_message(
     except ConstructorError as exc:
         return OrchestrateResult.failure("invalid_facts", str(exc))
 
+    # ---- 2b) entity scope (Contract F19): explicit > single-active > NULL.
+    #          More than one active entity without an explicit id is a
+    #          structured error — never a silent global draft.
+    try:
+        scope_id: uuid.UUID | None = await resolve_entity_scope(db, entity_id)
+    except AmbiguousEntityError as exc:
+        return OrchestrateResult.failure("ambiguous_entity", exc.message)
+
     # ---- 3) constructor = CONSTRUCTORS[skill_id] (F4) ---------------------
     try:
-        accounts = await CoaService.list_accounts(db)
+        accounts = await CoaService.list_accounts(db, entity_id=scope_id)
         codes = resolve_from_coa(
             [{"code": a.code, "category": a.category, "type": a.type} for a in accounts]
         )
@@ -392,7 +412,9 @@ async def orchestrate_message(
     legs: list[PreviewLeg] = []
     postings: list[PostingCreate] = []
     for leg in entry.legs:
-        account = await CoaService.get_account_by_code(db, leg.account)
+        account = await CoaService.get_account_by_code(
+            db, leg.account, entity_id=scope_id
+        )
         if account is None:
             return OrchestrateResult.failure(
                 "constructor_error",
@@ -430,6 +452,7 @@ async def orchestrate_message(
                 idempotency_key=uuid.uuid4(),
                 postings=postings,
             ),
+            entity_id=scope_id,
         )
     except TransactionServiceError as exc:
         return OrchestrateResult.failure("transaction_error", exc.message)
@@ -450,24 +473,35 @@ async def approve_entry(
     db: Any,
     transaction_id: uuid.UUID,
     ledger: str | None = None,
+    entity_id: uuid.UUID | None = None,
 ) -> PostResult:
     """Post a draft: assigns JE ref, mirrors to Formance, verifies parity.
 
-    Resolves ``ledger = ledger or await get_active_ledger(db)`` and uses it
-    for BOTH the Formance mirror (via ``post_transaction``) and the
-    post-approve ``verify_parity`` — the active entity's ledger when one
-    exists, ``"main"`` otherwise (backward compatible).
+    Ledger resolution NEVER consults ``get_active_ledger``: the Formance
+    mirror follows the TRANSACTION's own ``entity_id`` (F18's per-row
+    resolution inside ``post_transaction``), and the post-approve
+    ``verify_parity`` runs on that same ledger WITH the transaction's
+    entity scope — an explicit ``entity_id`` argument overrides the parity
+    scope (the routes pass their resolved scope), otherwise the tx row
+    decides.
 
     Raises TransactionNotFoundError / TransactionNotDraftError /
     UnbalancedTransactionError from the service layer.  If parity reports a
     drift the result is still returned with ``parity_ok=False`` — posting
     already happened and parity flags drift, it does not roll back.
     """
-    resolved_ledger = ledger or await get_active_ledger(db)
     transaction = await TransactionService.post_transaction(
-        db, transaction_id, ledger=resolved_ledger
+        db, transaction_id, ledger=ledger
     )
-    report: ParityReport = await verify_parity(db, resolved_ledger)
+    resolved_ledger = ledger or await get_ledger_for_entity(
+        db, transaction.entity_id
+    )
+    parity_scope: uuid.UUID | None = (
+        entity_id if entity_id is not None else transaction.entity_id
+    )
+    report: ParityReport = await verify_parity(
+        db, resolved_ledger, entity_id=parity_scope
+    )
     return PostResult(
         transaction=TransactionService._transaction_to_response(transaction),
         parity_ok=report.ok,

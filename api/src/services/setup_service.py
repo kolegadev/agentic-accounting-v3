@@ -337,7 +337,9 @@ async def get_entity_status(db: AsyncSession, entity_id: uuid.UUID) -> EntitySta
             formance_status, parity = "unreachable", "na"
         else:
             formance_status = "reachable"
-            report = await verify_parity(db, ledger=entity.ledger_name)
+            report = await verify_parity(
+                db, ledger=entity.ledger_name, entity_id=entity.id
+            )
             parity = "ok" if report.ok else "drift"
 
     return EntityStatus(

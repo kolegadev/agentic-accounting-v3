@@ -6,10 +6,17 @@ param validation only, then straight calls into the F9 engine.
 
 Engine identity failures surface as ReportEngineError → 422 {type,
 message}; a broken report is never returned (the engine raises first).
+
+Contract F19: an optional ``entity_id`` query param scopes the report.
+Resolution: explicit id → its ledger + COA scope; else the single active
+entity → its ledger + scope; else NULL + ``"main"`` (legacy).  More than
+one active entity without an explicit id is a 409
+{type: ambiguous_entity} — never a silent ``"main"`` report.
 """
 
 from __future__ import annotations
 
+import uuid
 from datetime import date
 from typing import Any, Optional
 
@@ -19,7 +26,11 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.database import get_db
-from src.services.entity_service import get_active_ledger
+from src.services.entity_service import (
+    AmbiguousEntityError,
+    get_ledger_for_entity,
+    resolve_entity_scope,
+)
 from src.services.formance_reports import (
     ReportEngineError,
     generate_bs,
@@ -38,6 +49,17 @@ BALANCE_TYPES = ("balance-sheet", "trial-balance")
 VALID_REPORT_TYPES = FLOW_TYPES + BALANCE_TYPES
 
 NO_POSTGRES_NOTE = "no Postgres equivalent"
+
+
+async def _resolve_scope(
+    db: AsyncSession,
+    entity_id: Optional[uuid.UUID],
+) -> tuple[Optional[uuid.UUID], str]:
+    """(entity scope, ledger) per the F19 rule; ambiguous raises."""
+    scope_id = await resolve_entity_scope(db, entity_id)
+    if scope_id is None:
+        return None, "main"
+    return scope_id, await get_ledger_for_entity(db, scope_id)
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +90,9 @@ async def formance_report(
     ),
     as_at: Optional[date] = Query(
         None, description="Balance date (balance reports: defaults to today)"
+    ),
+    entity_id: Optional[uuid.UUID] = Query(
+        None, description="Entity scope (required when several are active)"
     ),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
@@ -102,9 +127,19 @@ async def formance_report(
             },
         )
 
-    # Resolve the Formance ledger once per request: the active entity's
-    # ledger when one exists, "main" otherwise (backward compatible).
-    ledger = await get_active_ledger(db)
+    # Resolve the entity scope once per request (Contract F19): explicit id
+    # > single active entity > NULL legacy; ambiguity is a 409, never a
+    # silent 'main'.
+    try:
+        scope_id, ledger = await _resolve_scope(db, entity_id)
+    except AmbiguousEntityError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "type": exc.error_type or "ambiguous_entity",
+                "message": exc.message,
+            },
+        )
 
     if report_type == "pl":
         generator, kwargs = generate_pl, {
@@ -127,7 +162,7 @@ async def formance_report(
         generator, kwargs = generate_tb, {"as_at": as_at or date.today()}
 
     try:
-        report = await generator(db, ledger, **kwargs)
+        report = await generator(db, ledger, entity_id=scope_id, **kwargs)
     except ReportEngineError as exc:
         return JSONResponse(
             status_code=422,

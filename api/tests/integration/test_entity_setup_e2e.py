@@ -537,7 +537,7 @@ async def test_entity_setup_resumes_after_partial_failure(monkeypatch) -> None:
 
 async def test_get_active_ledger_resolution_with_real_orm(monkeypatch) -> None:
     """get_active_ledger against the real ORM: single active entity wins;
-    inactive-only or multiple-active resolves to 'main'."""
+    none resolves to 'main' and multiple-active raises AmbiguousEntityError."""
     engine = create_async_engine("sqlite+aiosqlite://", poolclass=StaticPool)
 
     @event.listens_for(engine.sync_engine, "connect")
@@ -570,7 +570,7 @@ async def test_get_active_ledger_resolution_with_real_orm(monkeypatch) -> None:
         db.add(owner)
         await db.commit()
 
-        from src.services.entity_service import get_active_ledger
+        from src.services.entity_service import AmbiguousEntityError, get_active_ledger
 
         # No entities at all -> "main".
         assert await get_active_ledger(db) == "main"
@@ -588,8 +588,11 @@ async def test_get_active_ledger_resolution_with_real_orm(monkeypatch) -> None:
             EntityCreate(name="Retired Holdings Ltd"),
             created_by=owner.id,
         )
-        # Two active entities -> deterministic "main".
-        assert await get_active_ledger(db) == "main"
+        # Two active entities -> fail-loud AmbiguousEntityError (409),
+        # never a silent 'main' (Contract F19).
+        with pytest.raises(AmbiguousEntityError) as excinfo:
+            await get_active_ledger(db)
+        assert excinfo.value.status_code == 409
 
         # Deactivate one -> the single active entity's ledger wins again.
         await EntityService.update_entity(db, retired.id, EntityUpdate(is_active=False))

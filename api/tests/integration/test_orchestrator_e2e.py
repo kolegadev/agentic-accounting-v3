@@ -25,24 +25,47 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import event, select, text
+from sqlalchemy import event, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from src.config.database import Base
 from src.models.account import Account
+from src.models.entity import Entity
 from src.models.transaction import Transaction
 from src.services.orchestrator import (
     approve_entry,
     orchestrate_message,
     reject_entry,
 )
-from src.services.transaction_service import TransactionNotFoundError
+from src.services.transaction_service import (
+    TransactionNotFoundError,
+    TransactionService,
+)
 
 GBP = "GBP/2"
 
 _SQLITE_SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS entities (
+        id CHAR(36) PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
+        name VARCHAR(255) NOT NULL UNIQUE,
+        legal_type VARCHAR(30) NOT NULL DEFAULT 'limited_company',
+        framework VARCHAR(20) NOT NULL DEFAULT 'uk-gaap',
+        fiscal_year_start VARCHAR(5) NOT NULL DEFAULT '04-06',
+        vat_registered BOOLEAN NOT NULL DEFAULT 0,
+        vat_number VARCHAR(20),
+        vat_scheme VARCHAR(10),
+        currency VARCHAR(3) NOT NULL DEFAULT 'GBP',
+        ledger_name VARCHAR(64) NOT NULL UNIQUE,
+        setup_state VARCHAR(16) NOT NULL DEFAULT 'none',
+        created_by CHAR(36) NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS accounts (
         id CHAR(36) PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
@@ -438,3 +461,68 @@ async def test_clarification_creates_no_rows(ctx) -> None:
     rows = (await db.execute(select(Transaction))).scalars().all()
     assert rows == []
     assert fake.transactions == []
+
+
+# ---------------------------------------------------------------------------
+# (f) F19 — entity-scoped orchestration round-trip
+# ---------------------------------------------------------------------------
+
+
+async def test_entity_scoped_orchestration_roundtrip(ctx) -> None:
+    """An entity-scoped message drafts into the entity's scope (stamped row,
+    scoped COA); approve mirrors to the ENTITY's own ledger via the tx row
+    (never a global guess) and the scoped parity check passes."""
+    db, fake = ctx["db"], ctx["fake"]
+    entity = Entity(
+        id=uuid.uuid4(),
+        name="Acme Scoped Ltd",
+        legal_type="limited_company",
+        framework="uk-gaap",
+        fiscal_year_start="04-06",
+        vat_registered=False,
+        currency="GBP",
+        ledger_name="entity-scoped",
+        setup_state="complete",
+        created_by=uuid.uuid4(),
+        is_active=True,
+    )
+    db.add(entity)
+    await db.commit()
+    # Stamp the seeded COA with the entity (an entity's COA is its own rows).
+    await db.execute(update(Account).values(entity_id=entity.id))
+    await db.commit()
+
+    from src.services.formance_client import formance_client
+
+    ledgers: list[str] = []
+
+    async def recording_create(**kwargs) -> dict:
+        ledgers.append(kwargs.get("ledger"))
+        return await fake.create_transaction(**kwargs)
+
+    llm = make_fake_llm({"supplier invoice INV-1001": SUPPLIER_RAW})
+    with patch.object(
+        formance_client,
+        "create_transaction",
+        AsyncMock(side_effect=recording_create),
+    ):
+        preview = await orchestrate_message(
+            db,
+            "supplier invoice INV-1001 from Acme Office Supplies",
+            llm=llm,
+            entity_id=entity.id,
+        )
+        assert preview.status == "preview", preview.error
+
+        draft_row = await TransactionService.get_transaction(
+            db, preview.transaction_id
+        )
+        assert draft_row is not None
+        assert draft_row.entity_id == entity.id
+
+        post = await approve_entry(db, preview.transaction_id)
+
+    assert post.transaction.status == "posted"
+    assert post.parity_ok is True, post.parity_report.summary
+    assert ledgers == ["entity-scoped"]
+    assert fake.transactions[-1]["reference"] == "JE-2026-0001"

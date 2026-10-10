@@ -26,6 +26,7 @@ Flow:
 from __future__ import annotations
 
 import copy
+import json
 import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -42,6 +43,11 @@ from src.models.account import Account
 from src.models.bank_account import BankAccount
 from src.models.transaction import Transaction
 from src.models.user import User
+from src.routes.orchestrator import (
+    TransactionRef,
+    approve as approve_route,
+    pending as pending_route,
+)
 from src.services.bank_service import BankService
 from src.services.coa_service import CoaService
 from src.services.entity_service import (
@@ -52,9 +58,14 @@ from src.services.entity_service import (
     get_ledger_for_entity,
 )
 from src.services.formance_client import formance_client
+from src.services.formance_reports import _load_coa, generate_pl
 from src.services.ledger_parity import verify_parity
+from src.services.orchestrator import approve_entry
 from src.services.setup_service import setup_entity
-from src.services.transaction_service import TransactionService
+from src.services.transaction_service import (
+    EntityMismatchError,
+    TransactionService,
+)
 from src.validators.bank import BankAccountCreate
 from src.validators.entity import (
     EntityCreate,
@@ -224,6 +235,35 @@ class FakeFormance:
     async def get_balances(self, ledger, address=None) -> dict:
         nets: dict[str, dict[str, Decimal]] = {}
         for tx in self.transactions:
+            for posting in tx["postings"]:
+                asset = posting["asset"]
+                amount = Decimal(posting["amount"])
+                src = nets.setdefault(posting["source"], {})
+                src[asset] = src.get(asset, Decimal(0)) - amount
+                dst = nets.setdefault(posting["destination"], {})
+                dst[asset] = dst.get(asset, Decimal(0)) + amount
+        return {
+            "data": [
+                {"address": addr, "balances": {a: str(v) for a, v in assets.items()}}
+                for addr, assets in nets.items()
+            ]
+        }
+
+
+class LedgerAwareFormance(FakeFormance):
+    """F19 scripted Formance: per-ledger isolation — lists and balances are
+    served for the REQUESTED ledger only (mirrors of other ledgers are
+    invisible), so scoped parity proves real per-entity isolation."""
+
+    def _for(self, ledger: str) -> list[dict]:
+        return [t for t in self.transactions if t["ledger"] == ledger]
+
+    async def list_transactions(self, ledger, page_size=None, after=None) -> dict:
+        return {"cursor": {"hasMore": False}, "data": copy.deepcopy(self._for(ledger))}
+
+    async def get_balances(self, ledger, address=None) -> dict:
+        nets: dict[str, dict[str, Decimal]] = {}
+        for tx in self._for(ledger):
             for posting in tx["postings"]:
                 asset = posting["asset"]
                 amount = Decimal(posting["amount"])
@@ -446,9 +486,10 @@ async def test_multi_entity_e2e(monkeypatch) -> None:
             )
             assert [t.id for t in legacy_drafts] == [draft_b.id]
 
-            # ---- two active entities: get_active_ledger still 'main',
-            #      get_active_entity raises AmbiguousEntityError (409) ----
-            assert await get_active_ledger(db) == "main"
+            # ---- two active entities: get_active_ledger is fail-loud
+            #      (409) — never a silent 'main' (Contract F19) ----
+            with pytest.raises(AmbiguousEntityError):
+                await get_active_ledger(db)
             with pytest.raises(AmbiguousEntityError) as excinfo:
                 await get_active_entity(db)
             assert excinfo.value.status_code == 409
@@ -551,7 +592,8 @@ async def test_entity_b_per_row_ledger_parity(monkeypatch) -> None:
             ),
             patch("src.services.ledger_parity.formance_client", parity_client),
         ):
-            # TWO active entities — get_active_ledger resolves to 'main'.
+            # TWO active entities — get_active_ledger raises (409); the
+            # per-row resolution never consults it.
             entity_b = await EntityService.create_entity(
                 db,
                 EntityCreate(name="Beta Trading", legal_type="sole_trader"),
@@ -562,7 +604,8 @@ async def test_entity_b_per_row_ledger_parity(monkeypatch) -> None:
                 EntityCreate(name="Gamma Holdings Ltd"),
                 created_by=owner.id,
             )
-            assert await get_active_ledger(db) == "main"
+            with pytest.raises(AmbiguousEntityError):
+                await get_active_ledger(db)
 
             res_b = await setup_entity(
                 db,
@@ -721,6 +764,323 @@ async def test_null_scope_backward_compat_probe(monkeypatch) -> None:
             assert await get_active_ledger(db) == entity.ledger_name
             active = await get_active_entity(db)
             assert active is not None and active.id == entity.id
+    finally:
+        await db.close()
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# F19 — scoped approve / pending / reports / cross-entity refusal
+# ---------------------------------------------------------------------------
+
+
+async def _f19_session(engine) -> tuple[AsyncSession, User]:
+    async def build() -> None:
+        async with engine.begin() as conn:
+            try:
+                await conn.run_sync(Base.metadata.create_all)
+            except SQLAlchemyError:
+                for ddl in _SQLITE_SCHEMA:
+                    await conn.execute(text(ddl))
+
+    await build()
+    session_factory = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
+    db = session_factory()
+    now = datetime.now(UTC)
+    owner = User(
+        id=uuid.uuid4(),
+        email=f"owner-{uuid.uuid4().hex[:8]}@f19.test",
+        hashed_password="h",
+        display_name="Owner",
+        role="owner",
+        is_active=True,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(owner)
+    await db.commit()
+    return db, owner
+
+
+async def test_f19_approve_scoped_parity_and_pending_isolation(monkeypatch) -> None:
+    """Two active entities: approve_entry follows the TRANSACTION's own
+    entity (recorder captures A's ledger, never 'main'), the post-approve
+    parity is scoped to A, B's pending list excludes A's drafts, and the
+    ambiguous no-entity_id route calls return 409 — never a silent
+    'main'."""
+    monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
+    engine = _make_session_factory()
+    db, owner = await _f19_session(engine)
+    try:
+        fake = LedgerAwareFormance()
+        parity_client = MagicMock()
+        parity_client.list_transactions = AsyncMock(
+            side_effect=fake.list_transactions
+        )
+        parity_client.get_balances = AsyncMock(side_effect=fake.get_balances)
+        with (
+            patch.object(
+                formance_client,
+                "create_transaction",
+                AsyncMock(side_effect=fake.create_transaction),
+            ),
+            patch.object(
+                formance_client, "create_ledger", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                formance_client, "health_check", AsyncMock(return_value=True)
+            ),
+            patch("src.services.ledger_parity.formance_client", parity_client),
+        ):
+            entity_a = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Alpha Holdings Ltd"),
+                created_by=owner.id,
+            )
+            entity_b = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Beta Trading", legal_type="sole_trader"),
+                created_by=owner.id,
+            )
+            res_a = await setup_entity(
+                db, entity_a.id, "uk_limited_company_vat",
+                opening_balances=_opening(1000000),
+            )
+            res_b = await setup_entity(
+                db, entity_b.id, "uk_sole_trader_vat",
+                opening_balances=_opening(500000, day=7),
+            )
+            draft_a = await TransactionService.get_transaction(
+                db, res_a.opening_transaction_ids[0]
+            )
+            draft_b = await TransactionService.get_transaction(
+                db, res_b.opening_transaction_ids[0]
+            )
+
+            # A's draft approved with NO explicit scope — the tx row decides:
+            # A's ledger (never 'main') + A's scoped parity, all green.
+            post_a = await approve_entry(db, draft_a.id)
+            assert post_a.parity_ok is True, post_a.parity_report.summary
+            assert fake.transactions[-1]["ledger"] == entity_a.ledger_name
+            assert fake.transactions[-1]["ledger"] != "main"
+
+            # B's pending list excludes A's drafts (entity-scoped route).
+            pending_b = await pending_route(entity_id=entity_b.id, db=db)
+            assert [t.id for t in pending_b["transactions"]] == [draft_b.id]
+
+            # Ambiguous route calls (no entity_id, two active) -> 409.
+            resp = await pending_route(entity_id=None, db=db)
+            assert resp.status_code == 409
+            assert json.loads(resp.body)["type"] == "ambiguous_entity"
+            resp = await approve_route(
+                TransactionRef(transaction_id=draft_b.id), entity_id=None, db=db
+            )
+            assert resp.status_code == 409
+            assert json.loads(resp.body)["type"] == "ambiguous_entity"
+
+            # An explicit scope approves B's draft to B's ledger + parity.
+            resp = await approve_route(
+                TransactionRef(transaction_id=draft_b.id),
+                entity_id=entity_b.id,
+                db=db,
+            )
+            assert resp["status"] == "posted"
+            assert resp["parity_ok"] is True
+            assert fake.transactions[-1]["ledger"] == entity_b.ledger_name
+            assert fake.transactions[-1]["ledger"] != entity_a.ledger_name
+    finally:
+        await db.close()
+        await engine.dispose()
+
+
+async def test_f19_report_uses_entity_scoped_coa_no_code_collapse(
+    monkeypatch,
+) -> None:
+    """Two COAs share codes; B's 4000 is sabotaged to a WRONG class.  A's
+    entity-scoped report still classifies 4000 as Revenue (no code-map
+    collapse) and the identity holds."""
+    monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
+    engine = _make_session_factory()
+    db, owner = await _f19_session(engine)
+    try:
+        fake = LedgerAwareFormance()
+        report_client = MagicMock()
+        report_client.list_transactions = AsyncMock(
+            side_effect=fake.list_transactions
+        )
+        report_client.get_balances = AsyncMock(side_effect=fake.get_balances)
+        with (
+            patch.object(
+                formance_client,
+                "create_transaction",
+                AsyncMock(side_effect=fake.create_transaction),
+            ),
+            patch.object(
+                formance_client, "create_ledger", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                formance_client, "health_check", AsyncMock(return_value=True)
+            ),
+            patch("src.services.formance_reports.formance_client", report_client),
+        ):
+            entity_a = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Alpha Holdings Ltd"),
+                created_by=owner.id,
+            )
+            entity_b = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Beta Trading", legal_type="sole_trader"),
+                created_by=owner.id,
+            )
+            await setup_entity(
+                db, entity_a.id, "uk_limited_company_vat",
+                opening_balances=_opening(1000000),
+            )
+            await setup_entity(
+                db, entity_b.id, "uk_sole_trader_vat",
+                opening_balances=_opening(500000, day=7),
+            )
+
+            # Sabotage B's 4000 row: same code, WRONG class.
+            rogue = (
+                await db.execute(
+                    select(Account).where(
+                        Account.entity_id == entity_b.id,
+                        Account.code == "4000",
+                    )
+                )
+            ).scalar_one()
+            rogue.category = "Expense"
+            rogue.type = "DirectCost"
+            await db.commit()
+
+            # A posts a sale: Dr bank / Cr sales.
+            acc_bank = await CoaService.get_account_by_code(
+                db, "1000", entity_id=entity_a.id
+            )
+            acc_sales = await CoaService.get_account_by_code(
+                db, "4000", entity_id=entity_a.id
+            )
+            assert acc_bank is not None and acc_sales is not None
+            tx = await TransactionService.create_transaction(
+                db,
+                TransactionCreate(
+                    description="Cash sale",
+                    effective_date=date(2026, 10, 1),
+                    idempotency_key=uuid.uuid4(),
+                    postings=[
+                        PostingCreate(
+                            account_id=acc_bank.id,
+                            debit_amount=100000,
+                            credit_amount=0,
+                        ),
+                        PostingCreate(
+                            account_id=acc_sales.id,
+                            debit_amount=0,
+                            credit_amount=100000,
+                        ),
+                    ],
+                ),
+                entity_id=entity_a.id,
+            )
+            await TransactionService.post_transaction(db, tx.id)
+            assert fake.transactions[-1]["ledger"] == entity_a.ledger_name
+
+            # A's scoped classification: 4000 stays Revenue — B's rogue row
+            # never collapses into A's code map.
+            class_map, _name_map = await _load_coa(db, entity_id=entity_a.id)
+            assert class_map["4000"] == "Revenue (Revenue)"
+
+            report = await generate_pl(
+                db,
+                ledger=entity_a.ledger_name,
+                period_start=date(2026, 1, 1),
+                period_end=date(2026, 12, 31),
+                entity_id=entity_a.id,
+            )
+            assert report["identity_ok"] is True
+            revenue = {
+                line["code"]: line["amount"]
+                for line in report["sections"]["revenue"]
+            }
+            assert revenue.get("4000") == 100000
+    finally:
+        await db.close()
+        await engine.dispose()
+
+
+async def test_f19_cross_entity_posting_refused(monkeypatch) -> None:
+    """A hostile cross-entity posting (A's transaction referencing B's
+    account) is refused with EntityMismatchError (422) at the write path."""
+    monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
+    engine = _make_session_factory()
+    db, owner = await _f19_session(engine)
+    try:
+        with (
+            patch.object(
+                formance_client, "create_ledger", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                formance_client, "health_check", AsyncMock(return_value=True)
+            ),
+        ):
+            entity_a = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Alpha Holdings Ltd"),
+                created_by=owner.id,
+            )
+            entity_b = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Beta Trading", legal_type="sole_trader"),
+                created_by=owner.id,
+            )
+            await setup_entity(
+                db, entity_a.id, "uk_limited_company_vat",
+                opening_balances=_opening(1000000),
+            )
+            await setup_entity(
+                db, entity_b.id, "uk_sole_trader_vat",
+                opening_balances=_opening(500000, day=7),
+            )
+
+            acc_a = await CoaService.get_account_by_code(
+                db, "1000", entity_id=entity_a.id
+            )
+            acc_b = await CoaService.get_account_by_code(
+                db, "1000", entity_id=entity_b.id
+            )
+            assert acc_a is not None and acc_b is not None
+            assert acc_a.id != acc_b.id
+
+            with pytest.raises(EntityMismatchError) as excinfo:
+                await TransactionService.create_transaction(
+                    db,
+                    TransactionCreate(
+                        description="Hostile cross-entity entry",
+                        effective_date=date(2026, 10, 1),
+                        idempotency_key=uuid.uuid4(),
+                        postings=[
+                            PostingCreate(
+                                account_id=acc_a.id,
+                                debit_amount=100000,
+                                credit_amount=0,
+                            ),
+                            PostingCreate(
+                                account_id=acc_b.id,
+                                debit_amount=0,
+                                credit_amount=100000,
+                            ),
+                        ],
+                    ),
+                    entity_id=entity_a.id,
+                )
+
+            assert excinfo.value.status_code == 422
+            assert excinfo.value.error_type == "entity_mismatch"
+            assert str(acc_b.id) in excinfo.value.message
     finally:
         await db.close()
         await engine.dispose()

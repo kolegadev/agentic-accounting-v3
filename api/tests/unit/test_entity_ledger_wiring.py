@@ -170,16 +170,20 @@ async def test_reverse_transaction_passes_ledger_to_formance() -> None:
 async def test_approve_entry_resolves_entity_ledger_for_post_and_parity(
     monkeypatch,
 ) -> None:
-    """With an active entity, approve_entry posts to its ledger and runs
-    parity against the same ledger."""
+    """approve_entry posts to the TRANSACTION's own entity ledger and runs
+    the post-approve parity on that same ledger with the tx's entity scope
+    (Contract F19 — never a global guess)."""
     monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
     draft = _draft_transaction()
+    draft.entity_id = ENTITY_ID
+    entity = make_entity("entity-abc123")
     db = AsyncMock()
     db.execute.side_effect = [
-        _result(scalars=[make_entity("entity-abc123")]),  # get_active_ledger
         _result(scalar=draft),  # post_transaction load
         _result(scalar=None),  # _generate_je_reference
+        _result(scalar=entity),  # get_ledger_for_entity (post mirror)
         _result(scalars=[]),  # _post_to_formance account-code lookup
+        _result(scalar=entity),  # get_ledger_for_entity (parity ledger)
     ]
     mock_create = AsyncMock(return_value={"txid": 1})
     parity = ParityReport(ok=True, summary="Ledger parity OK")
@@ -201,16 +205,17 @@ async def test_approve_entry_resolves_entity_ledger_for_post_and_parity(
     assert mock_create.call_args.kwargs["ledger"] == "entity-abc123"
     mock_parity.assert_awaited_once()
     assert mock_parity.await_args.args[1] == "entity-abc123"
+    assert mock_parity.await_args.kwargs["entity_id"] == ENTITY_ID
 
 
 @pytest.mark.asyncio
 async def test_approve_entry_no_entity_uses_main(monkeypatch) -> None:
-    """No active entity → both the post and parity use 'main'."""
+    """A NULL-scoped transaction resolves both post and parity to 'main' —
+    WITHOUT any entity lookup (the legacy scope never consults entities)."""
     monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
     draft = _draft_transaction()
     db = AsyncMock()
     db.execute.side_effect = [
-        _result(scalars=[]),  # get_active_ledger — no active entity
         _result(scalar=draft),
         _result(scalar=None),
         _result(scalars=[]),
@@ -234,6 +239,7 @@ async def test_approve_entry_no_entity_uses_main(monkeypatch) -> None:
     assert mock_create.call_args.kwargs["ledger"] == "main"
     mock_parity.assert_awaited_once()
     assert mock_parity.await_args.args[1] == "main"
+    assert mock_parity.await_args.kwargs["entity_id"] is None
 
 
 @pytest.mark.asyncio
@@ -242,7 +248,7 @@ async def test_approve_entry_explicit_ledger_wins(monkeypatch) -> None:
     monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
     draft = _draft_transaction()
     db = AsyncMock()
-    # Only the post flow queries are expected — no get_active_ledger query:
+    # Only the post flow queries are expected — no ledger-resolution query:
     # had resolution run, it would consume the draft result and fail.
     db.execute.side_effect = [
         _result(scalar=draft),
@@ -270,18 +276,22 @@ async def test_approve_entry_explicit_ledger_wins(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_approve_entry_default_resolution_uses_get_active_ledger(
+async def test_approve_entry_never_consults_get_active_ledger(
     monkeypatch,
 ) -> None:
-    """With no explicit ledger, approve_entry resolves through
-    get_active_ledger and reuses the SAME ledger for post and parity."""
+    """The ledger comes from the TRANSACTION's own entity (per-row
+    resolution) — get_active_ledger is never called (Contract F19)."""
     monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
     draft = _draft_transaction()
+    draft.entity_id = ENTITY_ID
+    entity = make_entity("entity-abc123")
     db = AsyncMock()
     db.execute.side_effect = [
         _result(scalar=draft),
         _result(scalar=None),
+        _result(scalar=entity),
         _result(scalars=[]),
+        _result(scalar=entity),
     ]
     parity = ParityReport(ok=True, summary="Ledger parity OK")
 
@@ -302,9 +312,10 @@ async def test_approve_entry_default_resolution_uses_get_active_ledger(
         result = await approve_entry(db, draft.id)
 
     assert result.parity_ok is True
-    mock_resolve.assert_awaited_once_with(db)
+    mock_resolve.assert_not_awaited()
     assert mock_create.call_args.kwargs["ledger"] == "entity-abc123"
     assert mock_parity.await_args.args[1] == "entity-abc123"
+    assert mock_parity.await_args.kwargs["entity_id"] == ENTITY_ID
 
 
 # ---------------------------------------------------------------------------
@@ -326,9 +337,9 @@ def clear_overrides() -> None:
 def test_report_route_passes_entity_ledger_to_engine(report_client: TestClient) -> None:
     with (
         patch(
-            "src.routes.formance_reports.get_active_ledger",
+            "src.routes.formance_reports._resolve_scope",
             new_callable=AsyncMock,
-            return_value="entity-abc123",
+            return_value=(ENTITY_ID, "entity-abc123"),
         ),
         patch(
             "src.routes.formance_reports.generate_pl", new_callable=AsyncMock
@@ -348,14 +359,15 @@ def test_report_route_passes_entity_ledger_to_engine(report_client: TestClient) 
     assert response.status_code == 200
     generate.assert_awaited_once()
     assert generate.await_args.args[1] == "entity-abc123"
+    assert generate.await_args.kwargs["entity_id"] == ENTITY_ID
 
 
 def test_report_route_no_entity_uses_main(report_client: TestClient) -> None:
     with (
         patch(
-            "src.routes.formance_reports.get_active_ledger",
+            "src.routes.formance_reports._resolve_scope",
             new_callable=AsyncMock,
-            return_value="main",
+            return_value=(None, "main"),
         ),
         patch(
             "src.routes.formance_reports.generate_bs", new_callable=AsyncMock
@@ -378,6 +390,7 @@ def test_report_route_no_entity_uses_main(report_client: TestClient) -> None:
     assert response.status_code == 200
     generate.assert_awaited_once()
     assert generate.await_args.args[1] == "main"
+    assert generate.await_args.kwargs["entity_id"] is None
 
 
 @pytest.mark.parametrize(
@@ -393,13 +406,13 @@ def test_report_route_no_entity_uses_main(report_client: TestClient) -> None:
 def test_every_report_type_passes_the_resolved_ledger(
     report_client: TestClient, report_type: str, params: dict, engine: str
 ) -> None:
-    """Every generate_* call receives the resolved entity ledger."""
+    """Every generate_* call receives the resolved entity ledger + scope."""
     generic = {"report": report_type, "identity_ok": True}
     with (
         patch(
-            "src.routes.formance_reports.get_active_ledger",
+            "src.routes.formance_reports._resolve_scope",
             new_callable=AsyncMock,
-            return_value="entity-abc123",
+            return_value=(ENTITY_ID, "entity-abc123"),
         ),
         patch(
             f"src.routes.formance_reports.{engine}", new_callable=AsyncMock
@@ -418,6 +431,7 @@ def test_every_report_type_passes_the_resolved_ledger(
     assert response.status_code == 200
     generate.assert_awaited_once()
     assert generate.await_args.args[1] == "entity-abc123"
+    assert generate.await_args.kwargs["entity_id"] == ENTITY_ID
 
 
 # ---------------------------------------------------------------------------
