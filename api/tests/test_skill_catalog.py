@@ -1,7 +1,8 @@
 """Validation tests for the transaction-type skill catalog (Contract F3).
 
 Implements the six contract checks:
-1. 10 skills present; registry complete and consistent (bidirectional).
+1. 10 transaction skills present; registry complete and consistent
+   (bidirectional; report entries under Contract F8 are excluded).
 2. Every SKILL.md has all 10 required sections (frontmatter + 9 headings).
 3. Frontmatter parses and constraints hold (id matches directory,
    frameworks valid, status v0).
@@ -194,8 +195,8 @@ def _code_to_class() -> dict[str, tuple[str, str]]:
 
 
 def test_registry_is_complete_and_bidirectional() -> None:
-    registry = _registry()
-    assert len(registry) == 10, "catalog must contain exactly 10 skills"
+    registry = [e for e in _registry() if e.get("category") == "transaction"]
+    assert len(registry) == 10, "catalog must contain exactly 10 transaction skills"
 
     reg_ids = [entry["id"] for entry in registry]
     assert len(set(reg_ids)) == 10, "registry ids must be unique"
@@ -249,6 +250,10 @@ def test_frontmatter_constraints() -> None:
 
     registry = _registry()
     for entry in registry:
+        if entry.get("category") != "transaction":
+            # Report-type entries (Contract F8) live under reports/ and are
+            # validated by test_report_catalog.py, not this F3 test.
+            continue
         fm = _frontmatter(_read_skill(entry["id"]))
         assert entry["name"] == fm["name"], f"{entry['id']}: name mismatch"
         assert entry["frameworks"] == fm["frameworks"]
