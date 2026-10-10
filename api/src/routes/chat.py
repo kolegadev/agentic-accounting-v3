@@ -1,0 +1,257 @@
+"""FastAPI router for LLM Chat Interface — WebSocket + REST skill endpoints."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from typing import Any, Optional
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+import logging
+
+logger = logging.getLogger("accounting-api.chat")
+from pydantic import BaseModel
+
+from src.services.chat_service import ChatService
+from src.services.skill_registry import SkillRegistry
+from src.validators.chat import (
+    ErrorMessage,
+    ToolCall,
+    ToolResult,
+    UserMessage,
+)
+
+router = APIRouter(prefix="/api/v1", tags=["Chat"])
+
+_chat_service = ChatService()
+_registry = SkillRegistry()
+
+
+# ---------------------------------------------------------------------------
+# WebSocket /ws/chat/{session_id}
+# ---------------------------------------------------------------------------
+@router.websocket("/ws/chat/{session_id}")
+async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
+    """WebSocket endpoint for multi-turn LLM chat."""
+    await websocket.accept()
+    PROCESSING_TIMEOUT = float(os.getenv("WS_PROCESSING_TIMEOUT", "120"))
+    _cancel_current = False  # flag for stop requests
+
+    try:
+        cancel_event: "asyncio.Event | None" = None
+
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                err = ErrorMessage(
+                    session_id=session_id,
+                    code="INVALID_JSON",
+                    message="Could not parse message as JSON.",
+                )
+                await websocket.send_text(err.model_dump_json())
+                continue
+
+            msg_type = data.get("type", "")
+            content = data.get("content", "")
+
+            # ── Handle stop/cancel requests ──────────────────────────
+            if msg_type == "stop":
+                if cancel_event is not None:
+                    cancel_event.set()
+                _cancel_current = True
+                logger.info("Stop requested for session %s", session_id)
+                await websocket.send_text(json.dumps({
+                    "type": "cancelled",
+                    "content": "Processing cancelled.",
+                }))
+                continue
+
+            if not content or msg_type != "user_message":
+                err = ErrorMessage(
+                    session_id=session_id,
+                    code="BAD_REQUEST",
+                    message="Expected a 'user_message' with non-empty 'content'.",
+                )
+                await websocket.send_text(err.model_dump_json())
+                continue
+
+            # Process the message through the chat pipeline (with timeout)
+            _cancel_current = False
+            cancel_event = asyncio.Event()
+
+            # Progress callback — sends intermediate tool-call notifications
+            async def _send_progress(skill_id: str, params: dict, step: int, total: int) -> None:
+                await websocket.send_text(json.dumps({
+                    "type": "tool_calls",
+                    "content": f"Step {step}/{total}: {skill_id}...",
+                    "tools": [{"id": "", "name": skill_id, "args": params}],
+                }))
+
+            try:
+                result = await asyncio.wait_for(
+                    _chat_service.process_message(
+                        session_id, content,
+                        cancel_event=cancel_event,
+                        on_tool_start=_send_progress,
+                    ),
+                    timeout=PROCESSING_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Processing timed out (session %s)", session_id)
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "content": "Request timed out — please try a shorter query.",
+                }))
+                continue
+            except asyncio.CancelledError:
+                logger.info("Processing cancelled by user (session %s)", session_id)
+                await websocket.send_text(json.dumps({
+                    "type": "cancelled",
+                    "content": "Processing stopped.",
+                }))
+                continue
+            except Exception as exc:
+                logger.error("Chat processing failed (session %s): %s", session_id, exc)
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "content": f"LLM processing failed: {exc}",
+                }))
+                continue
+
+            # Send response — may be a text reply or a tool call
+            response_text = result.get("message", {}).get("text", "")
+            tc = result.get("tool_call")
+
+            if tc and tc.get("skill_id"):
+                # Tool call was executed — send tool call + result
+                tool_call = ToolCall(
+                    session_id=session_id,
+                    skill_id=tc["skill_id"],
+                    params=tc.get("params", {}),
+                    confidence=tc.get("confidence", 1.0),
+                )
+                await websocket.send_text(tool_call.model_dump_json())
+
+                tool_result = ToolResult(
+                    session_id=session_id,
+                    tool_call_id=tool_call.tool_call_id,
+                    success=tc.get("result", {}).get("success", False),
+                    result={
+                        "response": response_text,
+                        "persona": result.get("message", {}).get("persona", "professional"),
+                        "detail": tc.get("result", {}).get("result"),
+                    },
+                )
+                await websocket.send_text(tool_result.model_dump_json())
+            else:
+                # Text response (no tool call) — send as a chat message
+                await websocket.send_text(json.dumps({
+                    "type": "assistant_message",
+                    "session_id": session_id,
+                    "content": response_text,
+                }))
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected (session %s)", session_id)
+
+
+# ---------------------------------------------------------------------------
+# GET /skills — list all skills
+# ---------------------------------------------------------------------------
+class SkillListResponse(BaseModel):
+    skills: list[dict[str, Any]]
+    total: int
+
+
+@router.get(
+    "/skills",
+    response_model=SkillListResponse,
+    summary="List all registered skills",
+)
+async def list_skills(category: Optional[str] = None) -> SkillListResponse:
+    """Return all skills, optionally filtered by category."""
+    skills = _registry.list_skills(category)
+    return SkillListResponse(skills=skills, total=len(skills))
+
+
+# ---------------------------------------------------------------------------
+# GET /skills/{skill_id} — skill detail
+# ---------------------------------------------------------------------------
+@router.get(
+    "/skills/{skill_id}",
+    summary="Get skill detail",
+)
+async def get_skill(skill_id: str) -> dict[str, Any]:
+    """Return a single skill definition by ID."""
+    skill = _registry.get_skill(skill_id)
+    if skill is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_id}' not found")
+    return skill
+
+
+# ---------------------------------------------------------------------------
+# POST /chat/message — REST endpoint for chat messages
+# ---------------------------------------------------------------------------
+class ChatMessageRequest(BaseModel):
+    session_id: str
+    message: str
+    persona: str = "professional"
+
+
+class ChatMessageResponse(BaseModel):
+    session_id: str
+    message: dict[str, Any]
+    tool_call: Optional[dict[str, Any]] = None
+
+
+@router.post(
+    "/chat/message",
+    response_model=ChatMessageResponse,
+    summary="Process a chat message via REST (fallback for WS-unavailable clients)",
+)
+async def chat_message(body: ChatMessageRequest) -> ChatMessageResponse:
+    """Process a chat message through the same pipeline as the WebSocket endpoint.
+
+    This is the fallback REST endpoint used by the Chat UI when WebSocket
+    bridging is unavailable.  It returns the full pipeline result including the
+    formatted response and tool-call metadata.
+    """
+    try:
+        result = await _chat_service.process_message(body.session_id, body.message)
+    except Exception as exc:
+        logger.error("Chat processing failed (session %s): %s", body.session_id, exc)
+        from fastapi import HTTPException
+        raise HTTPException(status_code=502, detail=f"LLM processing failed: {exc}")
+    return ChatMessageResponse(
+        session_id=result["session_id"],
+        message=result["message"],
+        tool_call=result["tool_call"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /skills/reload — reload registry from YAML
+# ---------------------------------------------------------------------------
+class ReloadResponse(BaseModel):
+    skills: list[dict[str, Any]]
+    total: int
+    message: str
+
+
+@router.post(
+    "/skills/reload",
+    response_model=ReloadResponse,
+    summary="Reload skill registry from YAML",
+)
+async def reload_skills() -> ReloadResponse:
+    """Force a reload of the skill registry from the YAML file on disk."""
+    skills = _registry.reload()
+    return ReloadResponse(
+        skills=skills,
+        total=len(skills),
+        message=f"Reloaded {len(skills)} skills from registry.yaml",
+    )

@@ -1,0 +1,393 @@
+"""LLM Router — calls an OpenAI-compatible LLM to understand user intent and select the
+correct accounting tool with extracted parameters.
+
+Replaces the regex-based intent_router.py with structured LLM prompts that include
+the full tool registry, conversation history, and setup-wizard awareness.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Any
+
+import httpx
+
+from src.services.skill_registry import SkillRegistry
+from src.services.instrument import log_event, get_correlation_id
+from src.services.prompt_assembler import assemble_system_prompt
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# LLM configuration (env vars)
+# ---------------------------------------------------------------------------
+LLM_API_URL: str = os.getenv("LLM_API_URL", "http://localhost:11434/v1/chat/completions")
+LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
+LLM_MODEL: str = os.getenv("LLM_MODEL", "deepseek-v4-flash")
+LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+LLM_TIMEOUT: float = float(os.getenv("LLM_TIMEOUT", "15.0"))
+
+# ---------------------------------------------------------------------------
+# System prompt template
+# ---------------------------------------------------------------------------
+SYSTEM_PROMPT = """You are an accounting assistant for **Agentic Accounting**, a headless
+double-entry accounting system for UK small businesses.
+
+You have access to the following tools.  When the user asks to perform an
+accounting action, respond with a JSON object containing the tool call:
+
+    {"tool": "<skill_id>", "params": {<extracted parameters>}}
+
+If you need more information before calling a tool, respond with:
+
+    {"response": "<your clarifying question>"}
+
+If the user is just chatting or asking a general question, respond with:
+
+    {"response": "<helpful answer>"}
+
+## CRITICAL Rules
+
+1. **All monetary amounts in INTEGER PENCE.**  £50.00 → 5000.
+   Never use floats or decimals for money.
+
+2. **Dates in ISO 8601 format** (YYYY-MM-DD).  Today is {today}.
+
+3. **Only call tools that exist** in the registry below.  If no matching
+   tool exists, respond with: {{"response": "<clarifying question>"}}
+
+3.5 **Report defaults:** When the user asks for a financial report without specifying dates, use the current financial year (6 April to 5 April) or year-to-date (1 Jan to today). Call `report.run` directly — don't ask for dates unless the user explicitly wants a custom range.
+
+3.6 **When the user asks about a SPECIFIC account by code (e.g., "show account detail for code 1000"), use `coa.detail`.** Provide the account code. NEVER re-list the full COA.
+
+4. **For chart of accounts setup: ALWAYS use `coa.load_template`.**
+   NEVER list individual accounts in your response text during setup.
+   When the user asks to SEE the chart of accounts, call `coa.list`
+   and output EVERY account — no summaries, no "and X more".
+
+   Available templates: uk_sole_trader, uk_limited_company, uk_partnership,
+   uk_micro_entity, uk_property_landlord.
+
+4.5 **When the user asks you to FIX, DELETE, REMOVE, or CORRECT accounts:**
+   CALL `coa.delete_account` with the account code to remove it.  Always
+   start with the FIRST wrong account mentioned.  DO NOT reply with text
+   claiming you deleted something unless you actually called the tool.
+   After each deletion, tell the user what you removed and confirm the next
+   step.  Once all wrong accounts are deleted, CALL `coa.add_account` to
+   create the replacement accounts.  NEVER use `coa.list` when the user is
+   asking you to DELETE — that's ignoring their request.
+
+4.6 **When creating an invoice for a customer, ALWAYS ensure the contact exists
+   first.**  If `contact.list` returns no results for the customer name, CALL
+   `contact.create` immediately — do NOT stop and tell the user the contact
+   wasn't found.  After creating the contact, proceed to `invoice.create`.
+   Creating invoices for new customers is a two-step workflow: create contact,
+   then create invoice.
+
+5. **Use `memory.search` for past ACTIVITY — use tools for current STATE.**
+   When the user asks about progress or history, call `memory.search` FIRST.
+   But when the user asks about current data (address, type, status, accounts),
+   call the appropriate QUERY tool directly (`contact.detail`, `contact.list`,
+   `coa.list`, etc.) — do NOT rely on memory for current state.
+
+6. **ALWAYS use markdown formatting — NEVER emit raw HTML tags.**
+   Bullet lists use `-`, bold uses `**`, line breaks are just newlines.
+   Do NOT use `<br>`, `<strong>`, `<ul>`, `<li>`, or any other HTML tags.
+
+7. **NEVER use bullet lists for accounts — ALWAYS use markdown tables.**
+   Use this exact format for chart of accounts:
+   ```
+   | Code | Account Name | Category | Type |
+   |------|-------------|----------|------|
+   | 1000 | Bank Account | Asset | Bank |
+   ```
+   For financial reports (P&L, Trial Balance, Balance Sheet), use debits
+   on the left and credits on the right.  Convert all amounts from pence
+   to £X,XXX.XX.
+
+7. **Keep responses concise.**  The user doesn't need a wall of text —
+   a short, helpful reply is better.  Let tool results speak for themselves.
+
+8. **YOU ARE IN A TOOL-CHAINING LOOP.**  After you call a tool, the
+   system will ask you to continue.  Only return a `{"response": "text"}`
+   when the user's ENTIRE request is fulfilled.  If the task is incomplete
+   — for example, you just listed contacts but haven't created the invoice,
+   or you deleted one account but haven't deleted the other — you MUST
+   call the next tool.  Showing data is NOT the final response if the
+   user asked you to take action.
+
+## Available Tools
+
+{tools_json}
+
+## Current Conversation Context
+
+{context}
+"""
+
+# ---------------------------------------------------------------------------
+# Setup wizard detection prompt (used before normal routing)
+# ---------------------------------------------------------------------------
+SETUP_CHECK_PROMPT = """You are checking whether this accounting system needs initial setup.
+
+The system currently has {account_count} accounts in the chart of accounts.
+
+If account_count is 0:
+  - The system is FRESH — this is a first-time user.
+  - Respond with: {{"setup_required": true, "step": "welcome"}}
+
+If account_count is greater than 0:
+  - The system is already set up.
+  - Respond with: {{"setup_required": false}}"""
+
+
+class LLMRouterError(Exception):
+    """LLM call failed or returned unparseable response."""
+
+
+class LLMRouter:
+    """Stateless service that routes user messages to accounting tools via LLM."""
+
+    def __init__(self) -> None:
+        self._registry = SkillRegistry()
+
+    # ------------------------------------------------------------------
+    # public API
+    # ------------------------------------------------------------------
+    async def route(
+        self,
+        user_message: str,
+        history: list[dict[str, Any]],
+        context: dict[str, Any],
+        account_count: int = 0,
+    ) -> dict[str, Any]:
+        """Route a user message to a tool call or text response.
+
+        Returns one of:
+          {"tool": "skill_id", "params": {...}}     — tool to execute
+          {"response": "text"}                       — chat reply
+          {"setup_required": true, "step": "welcome"} — start setup wizard
+        """
+        # 1) Build prompt using the assembler (replaces thin _build_system_prompt)
+        tools = self._registry.list_skills()
+        prompt = assemble_system_prompt(tools, history, account_count, mode="routing")
+
+        # ── I1: contract check — does prompt now include docs? ─────────
+        doc_sections_present = []
+        for doc_name in ["MCP_DOCUMENTATION", "SKILL", "FORMANCE", "KATRA",
+                          "episodic", "semantic", "knowledge graph",
+                          "double-entry", "Formance Ledger"]:
+            if doc_name.lower() in prompt.lower():
+                doc_sections_present.append(doc_name)
+        log_event(
+            module="llm_router", function="route", event="contract_check",
+            state_snapshot={
+                "prompt_chars": len(prompt),
+                "sections": ["identity", "architecture", "katra", "formance",
+                             "tools", "context", "rules"],
+                "docs_loaded": doc_sections_present,
+                "tool_count": len(tools),
+            },
+            contract="System prompt must include MCP docs, Formance docs, Katra docs, full SKILL.md",
+            contract_held=len(doc_sections_present) >= 5,
+        )
+
+        # 3) Call LLM
+        raw = await self._call_llm(prompt, user_message)
+
+        # 4) Parse JSON response
+        return self._parse_response(raw)
+
+    # ------------------------------------------------------------------
+    # internal
+    # ------------------------------------------------------------------
+    def _build_system_prompt(
+        self,
+        tools: list[dict[str, Any]],
+        history: list[dict[str, Any]],
+        context: dict[str, Any],
+        account_count: int = 0,
+    ) -> str:
+        """Build the full system prompt with tools and context."""
+        # Inject setup context if system is fresh
+        setup_extra = ""
+        if account_count == 0:
+            from src.services.setup_wizard import SetupWizard
+            setup_extra = SetupWizard.get_setup_prompt()
+
+        # Build a compact tool list (id, name, description, params, example)
+        tool_snippets: list[dict[str, Any]] = []
+        for t in tools:
+            snippet = {
+                "id": t.get("id"),
+                "name": t.get("name", t.get("id")),
+                "description": t.get("description", ""),
+                "params": t.get("inputSchema", {}).get("properties", {}),
+                "required": t.get("inputSchema", {}).get("required", []),
+                "example": t.get("example", ""),
+            }
+            tool_snippets.append(snippet)
+
+        tools_json = json.dumps(tool_snippets, indent=2)
+
+        # Build context string from recent history
+        context_lines: list[str] = []
+        for entry in history[-10:]:  # last 10 turns
+            role = entry.get("role", "unknown")
+            content = entry.get("content", "")
+            if isinstance(content, str) and len(content) > 300:
+                content = content[:300] + "..."
+            context_lines.append(f"[{role}] {content}")
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        ctx_str = "\n".join(context_lines) if context_lines else "(no prior conversation)"
+        result = SYSTEM_PROMPT.replace("{today}", today).replace("{tools_json}", tools_json).replace("{context}", ctx_str)
+        if setup_extra:
+            result += "\n" + setup_extra
+
+        # ── I1: contract check — what did the LLM actually receive? ─────
+        sections = ["rules", "tools_snippets", "context"]
+        if setup_extra:
+            sections.append("setup_extra")
+        # Check what documentation sections are present (none — no loader exists)
+        doc_sections_present = []
+        for doc_name in ["MCP_DOCUMENTATION", "SKILL_MD", "FORMANCE_API", "KATRA_API"]:
+            if doc_name.lower() in result.lower():
+                doc_sections_present.append(doc_name)
+        log_event(
+            module="llm_router", function="_build_system_prompt", event="contract_check",
+            state_snapshot={
+                "prompt_chars": len(result),
+                "sections": sections,
+                "docs_loaded": doc_sections_present,
+                "tool_count": len(tool_snippets),
+            },
+            contract="System prompt must include MCP docs, Formance docs, Katra docs, full SKILL.md",
+            contract_held=len(doc_sections_present) >= 3,
+        )
+        return result
+
+    async def _call_llm(self, system_prompt: str, user_message: str) -> str:
+        """Call the LLM API and return the raw response text."""
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if LLM_API_KEY:
+            headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+
+        payload = {
+            "model": LLM_MODEL,
+            "temperature": LLM_TEMPERATURE,
+            "max_tokens": LLM_MAX_TOKENS,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+        }
+
+        # ── I2: log what the LLM API receives ──────────────────────────
+        log_event(
+            module="llm_router", function="_call_llm", event="entry",
+            state_snapshot={
+                "system_prompt_chars": len(system_prompt),
+                "user_message_chars": len(user_message),
+                "total_payload_chars": len(system_prompt) + len(user_message),
+                "model": LLM_MODEL,
+                "temperature": LLM_TEMPERATURE,
+                "max_tokens": LLM_MAX_TOKENS,
+            },
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+                response = await client.post(LLM_API_URL, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                content = data["choices"][0]["message"]["content"]
+                return content.strip()
+        except httpx.HTTPError as exc:
+            logger.error("LLM API call failed: %s", exc)
+            raise LLMRouterError(f"LLM API error: {exc}") from exc
+        except (KeyError, IndexError) as exc:
+            logger.error("Unexpected LLM response format: %s", exc)
+            raise LLMRouterError("LLM returned unexpected response format") from exc
+
+    def _parse_response(self, raw: str) -> dict[str, Any]:
+        """Parse the LLM's JSON response into a structured result.
+
+        Handles common LLM output quirks: wrapping in ```json fences,
+        trailing commas, leading garbage characters, extra whitespace.
+        """
+        text = raw.strip()
+
+        # Strip markdown code fences
+        if text.startswith("```"):
+            text = text[text.index("\n") + 1:] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[: text.rindex("```")].strip()
+
+        # Remove trailing commas (common LLM artifact)
+        text = text.replace(",}", "}").replace(",]", "]")
+
+        # Strip leading garbage before first { — LLMs sometimes
+        # prefix JSON with "." or other non-JSON characters
+        brace_pos = text.find("{")
+        if brace_pos > 0:
+            text = text[brace_pos:]
+
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            # Try to extract a nested JSON object
+            import re
+            match = re.search(r'\{[^{}]*\}(?:\s*\n\s*\{[^{}]*\})*', text, re.DOTALL)
+            if match:
+                try:
+                    result = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    # Try a simpler regex for non-nested JSON
+                    m2 = re.search(r'\{.*\}', text, re.DOTALL)
+                    if m2:
+                        try:
+                            result = json.loads(m2.group(0))
+                        except json.JSONDecodeError:
+                            logger.warning("Could not parse LLM response as JSON: %s", raw[:200])
+                            return {"response": raw[:500]}
+                    else:
+                        logger.warning("No JSON object in LLM response: %s", raw[:200])
+                        return {"response": raw[:500]}
+            else:
+                logger.warning("No JSON object in LLM response: %s", raw[:200])
+                return {"response": raw[:500]}
+
+        # Normalise result
+        if "tool" in result:
+            return {"tool": result["tool"], "params": result.get("params", {})}
+        if "response" in result:
+            return {"response": result["response"]}
+        if "setup_required" in result:
+            return result
+
+        # Fallback: treat whole response as text
+        return {"response": raw[:500]}
+
+    async def _check_setup(
+        self,
+        user_message: str,
+        account_count: int,
+        history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Only force setup wizard on the very first message. After that,
+        let the LLM handle routing — it will naturally guide the user
+        through setup by calling the appropriate tools."""
+        if account_count > 0:
+            return {"setup_required": False}
+
+        # Only intercept the first-ever message (no history yet).
+        # The LLM is perfectly capable of guiding setup via natural conversation.
+        if len(history) <= 1:
+            return {"setup_required": True, "step": "welcome"}
+
+        return {"setup_required": False}

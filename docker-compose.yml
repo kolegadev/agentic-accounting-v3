@@ -1,0 +1,267 @@
+networks:
+  accounting-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  formance_data:
+  katra_data:
+  katra_mongo_data:
+  katra_redis_data:
+  katra_minio_data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: accounting-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-accounting}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-accounting}
+      POSTGRES_DB: ${DB_NAME:-accounting}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - accounting-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-accounting}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: accounting-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - accounting-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: accounting-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - accounting-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  formance-postgres:
+    image: postgres:16-alpine
+    container_name: accounting-formance-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-accounting}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-accounting}
+      POSTGRES_DB: formance
+    volumes:
+      - formance_data:/var/lib/postgresql/data
+    networks:
+      - accounting-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-accounting} -d formance"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  formance-ledger:
+    image: ghcr.io/formancehq/ledger:latest
+    container_name: accounting-formance
+    restart: unless-stopped
+    environment:
+      POSTGRES_URI: postgresql://${DB_USER:-accounting}:${DB_PASSWORD:-accounting}@formance-postgres:5432/formance?sslmode=disable
+    depends_on:
+      formance-postgres:
+        condition: service_healthy
+    networks:
+      - accounting-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3068/_info"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  accounting-api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: accounting-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${DB_USER:-accounting}:${DB_PASSWORD:-accounting}@postgres:5432/${DB_NAME:-accounting}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minioadmin}
+      FORNANCE_LEDGER_URL: http://formance-ledger:3068
+      KATRA_MCP_URL: http://accounting-katra-server:3113/mcp
+      KATRA_API_KEY: ${KATRA_API_KEY:-katra-mcp-key-2026}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LLM_API_URL: ${LLM_API_URL:-https://api.deepseek.com/v1/chat/completions}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-pro}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.1}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-60}
+    volumes:
+      - ./api:/app
+      - ./coa_templates:/app/coa_templates
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - accounting-net
+
+  mcp-gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: accounting-gateway
+    restart: unless-stopped
+    ports:
+      - "${MCP_PORT:-3200}:3200"
+    environment:
+      API_BASE_URL: http://accounting-api:8000
+      SKILL_REGISTRY_PATH: /app/skills/registry.yaml
+      MCP_TRANSPORT: sse
+      MCP_PORT: 3200
+    volumes:
+      - ./skills:/app/skills:ro
+    depends_on:
+      accounting-api:
+        condition: service_started
+    networks:
+      - accounting-net
+
+  # ── Dedicated Katra for Agentic Accounting ──
+  accounting-katra-mongo:
+    image: mongo:7.0
+    container_name: accounting-katra-mongo
+    restart: unless-stopped
+    volumes:
+      - katra_mongo_data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: katra_admin
+      MONGO_INITDB_ROOT_PASSWORD: ${KATRA_MONGO_PASS:-katra-accounting-2026}
+    command: ["--bind_ip_all", "--auth"]
+    networks:
+      - accounting-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  accounting-katra-redis:
+    image: redis:7-alpine
+    container_name: accounting-katra-redis
+    restart: unless-stopped
+    volumes:
+      - katra_redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - accounting-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  accounting-katra-minio:
+    image: minio/minio:latest
+    container_name: accounting-katra-minio
+    restart: unless-stopped
+    volumes:
+      - katra_minio_data:/data
+    environment:
+      MINIO_ROOT_USER: ${KATRA_MINIO_USER:-katra-admin}
+      MINIO_ROOT_PASSWORD: ${KATRA_MINIO_PASS:-katra-accounting-2026}
+    command: server /data --console-address ":9003"
+    networks:
+      - accounting-net
+
+  accounting-katra-server:
+    build:
+      context: ../Projects/katra
+      dockerfile: Dockerfile
+    image: accounting-katra:latest
+    container_name: accounting-katra-server
+    restart: unless-stopped
+    ports:
+      - "3113:3113"
+      - "9013:9013"
+    environment:
+      PORT: "9013"
+      MCP_PORT: "3113"
+      MONGODB_URI: mongodb://katra_admin:${KATRA_MONGO_PASS:-katra-accounting-2026}@accounting-katra-mongo:27017/katra_accounting?authSource=admin
+      REDIS_URL: redis://accounting-katra-redis:6379
+      MINIO_ENDPOINT: accounting-katra-minio
+      MINIO_PORT: "9000"
+      MINIO_ACCESS_KEY: ${KATRA_MINIO_USER:-katra-admin}
+      MINIO_SECRET_KEY: ${KATRA_MINIO_PASS:-katra-accounting-2026}
+      MINIO_USE_SSL: "false"
+      KATRA_ENABLED: "true"
+      MCP_API_KEY: katra-mcp-key-2026
+      KATRA_API_KEY: katra-admin-key-2026
+    depends_on:
+      accounting-katra-mongo:
+        condition: service_healthy
+      accounting-katra-redis:
+        condition: service_healthy
+      accounting-katra-minio:
+        condition: service_started
+    networks:
+      - accounting-net
+
+  chat-ui:
+    build:
+      context: ./chat-ui
+      dockerfile: Dockerfile
+    container_name: accounting-chat-ui
+    restart: unless-stopped
+    ports:
+      - "${UI_PORT:-3002}:3000"
+    environment:
+      API_BASE_URL: http://accounting-api:8000
+      WS_URL: ws://accounting-api:8000/ws
+    volumes:
+      - ./chat-ui/data:/app/data
+    depends_on:
+      accounting-api:
+        condition: service_started
+    networks:
+      - accounting-net
+    profiles:
+      - ui
