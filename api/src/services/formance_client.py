@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Optional
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 FORNANCE_URL = os.getenv("FORNANCE_LEDGER_URL", "http://localhost:3068")
 
@@ -107,6 +110,33 @@ class FormanceClient:
                 resp = await client.get(f"{self.base_url}/_info")
                 return resp.status_code == 200
         except Exception:
+            return False
+
+    async def create_ledger(self, ledger: str) -> bool:
+        """Create a Formance v2 ledger (POST ``{base}/v2/{ledger}``).
+
+        Tolerates 409 (ledger already exists) and connection failures with a
+        logged warning — never raises.  Returns True when the ledger exists
+        (created now or already present), False when Formance is unreachable
+        (the ledger can be created later).
+        """
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(f"{self.base_url}/v2/{ledger}")
+            if resp.status_code == 409:
+                logger.warning(
+                    "Formance ledger '%s' already exists (409) — continuing", ledger
+                )
+                return True
+            resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Failed to create Formance ledger '%s': %s — continuing "
+                "(Formance may be started later)",
+                ledger,
+                exc,
+            )
             return False
 
 

@@ -1,0 +1,348 @@
+"""Route tests for Entity + setup endpoints (Contract F11).
+
+FastAPI TestClient with the service layer mocked, following the existing
+route-test pattern (dependency overrides for get_current_user / require_role).
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from src.index import app
+from src.models.entity import Entity
+from src.models.user import User
+from src.services.entity_service import (
+    DuplicateEntityNameError,
+    EntityNotFoundError,
+    EntityServiceError,
+)
+from src.services.setup_service import SetupError
+from src.validators.entity import EntityStatus, SetupResult
+
+ENTITY_ID = uuid.uuid4()
+USER_ID = uuid.uuid4()
+NOW = datetime(2026, 10, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def make_entity(**overrides) -> Entity:
+    defaults = {
+        "id": ENTITY_ID,
+        "name": "Acme Holdings Ltd",
+        "legal_type": "limited_company",
+        "framework": "uk-gaap",
+        "fiscal_year_start": "04-06",
+        "vat_registered": True,
+        "vat_number": "GB123456789",
+        "vat_scheme": "standard",
+        "currency": "GBP",
+        "ledger_name": "entity-acme123",
+        "created_by": USER_ID,
+        "is_active": True,
+        "created_at": NOW,
+        "updated_at": NOW,
+    }
+    defaults.update(overrides)
+    return Entity(**defaults)
+
+
+def make_user(role: str) -> User:
+    return User(
+        id=USER_ID,
+        email="owner@acme.test",
+        hashed_password="h",
+        display_name="Owner",
+        role=role,
+        is_active=True,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def make_setup_result(**overrides) -> SetupResult:
+    defaults = {
+        "entity_id": ENTITY_ID,
+        "coa_count": 65,
+        "bank_account_ids": [uuid.uuid4()],
+        "ledger_name": "entity-acme123",
+        "opening_transaction_ids": [uuid.uuid4()],
+        "opening_draft_total_pence": 1000000,
+    }
+    defaults.update(overrides)
+    return SetupResult(**defaults)
+
+
+def make_status(**overrides) -> EntityStatus:
+    defaults = {
+        "entity": {
+            "id": str(ENTITY_ID),
+            "name": "Acme Holdings Ltd",
+            "legal_type": "limited_company",
+            "framework": "uk-gaap",
+            "fiscal_year_start": "04-06",
+            "vat_registered": True,
+            "vat_number": "GB123456789",
+            "vat_scheme": "standard",
+            "currency": "GBP",
+            "ledger_name": "entity-acme123",
+            "created_by": str(USER_ID),
+            "is_active": True,
+            "created_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(),
+        },
+        "has_coa": True,
+        "account_count": 65,
+        "bank_accounts": [],
+        "pending_opening_transactions": [],
+        "ledger_name": "entity-acme123",
+        "formance": "reachable",
+        "parity": "ok",
+    }
+    defaults.update(overrides)
+    return EntityStatus(**defaults)
+
+
+@pytest.fixture
+def client() -> TestClient:
+    return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def clear_overrides() -> None:
+    yield
+    app.dependency_overrides.clear()
+
+
+def _override_auth(user: User) -> None:
+    from src.middleware.auth import get_current_user
+
+    app.dependency_overrides[get_current_user] = lambda: user
+
+
+# ---------------------------------------------------------------------------
+# POST / — create entity
+# ---------------------------------------------------------------------------
+
+def test_create_entity_requires_auth(client: TestClient) -> None:
+    """Missing token -> 401."""
+    resp = client.post("/api/v1/entities", json={"name": "Acme"})
+    assert resp.status_code == 401
+
+
+def test_create_entity_success(client: TestClient) -> None:
+    """Auth + valid body -> 201 with entity, no setup."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.EntityService.create_entity",
+        new_callable=AsyncMock,
+    ) as mock_create:
+        mock_create.return_value = make_entity()
+        resp = client.post(
+            "/api/v1/entities",
+            json={"name": "Acme Holdings Ltd", "legal_type": "limited_company"},
+        )
+
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["entity"]["name"] == "Acme Holdings Ltd"
+    assert data["entity"]["ledger_name"] == "entity-acme123"
+    assert data["setup"] is None
+
+    created_by = mock_create.await_args.kwargs["created_by"]
+    assert created_by == USER_ID
+
+
+def test_create_entity_with_setup_runs_setup(client: TestClient) -> None:
+    """A `setup` body runs setup_entity immediately; 201 includes the result."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.EntityService.create_entity",
+        new_callable=AsyncMock,
+    ) as mock_create, patch(
+        "src.routes.entities.setup_entity",
+        new_callable=AsyncMock,
+    ) as mock_setup:
+        mock_create.return_value = make_entity()
+        mock_setup.return_value = make_setup_result()
+        resp = client.post(
+            "/api/v1/entities",
+            json={
+                "name": "Acme Holdings Ltd",
+                "setup": {
+                    "template_name": "uk_limited_company_vat",
+                    "bank_accounts": [
+                        {"name": "Barclays", "opening_balance": 1000}
+                    ],
+                    "opening_balances": {
+                        "opening_date": "2026-04-06",
+                        "equity_account_code": "3000",
+                        "assets": [{"code": "1000", "balance_pence": 1000000}],
+                    },
+                },
+            },
+        )
+
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["setup"]["coa_count"] == 65
+    assert data["setup"]["opening_draft_total_pence"] == 1000000
+    assert mock_setup.await_count == 1
+    assert mock_setup.await_args.args[2] == "uk_limited_company_vat"
+
+
+def test_create_entity_duplicate_name_409(client: TestClient) -> None:
+    """Duplicate entity name -> 409."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.EntityService.create_entity",
+        new_callable=AsyncMock,
+    ) as mock_create:
+        mock_create.side_effect = DuplicateEntityNameError("Acme Holdings Ltd")
+        resp = client.post("/api/v1/entities", json={"name": "Acme Holdings Ltd"})
+
+    assert resp.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# GET / and GET /{id}
+# ---------------------------------------------------------------------------
+
+def test_list_entities(client: TestClient) -> None:
+    _override_auth(make_user("viewer"))
+    with patch(
+        "src.routes.entities.EntityService.list_entities",
+        new_callable=AsyncMock,
+    ) as mock_list:
+        mock_list.return_value = [make_entity()]
+        resp = client.get("/api/v1/entities")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["id"] == str(ENTITY_ID)
+
+
+def test_get_entity(client: TestClient) -> None:
+    _override_auth(make_user("viewer"))
+    with patch(
+        "src.routes.entities.EntityService.get_entity",
+        new_callable=AsyncMock,
+    ) as mock_get:
+        mock_get.return_value = make_entity()
+        resp = client.get(f"/api/v1/entities/{ENTITY_ID}")
+
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "Acme Holdings Ltd"
+
+
+def test_get_entity_404(client: TestClient) -> None:
+    _override_auth(make_user("viewer"))
+    with patch(
+        "src.routes.entities.EntityService.get_entity",
+        new_callable=AsyncMock,
+    ) as mock_get:
+        mock_get.return_value = None
+        resp = client.get(f"/api/v1/entities/{ENTITY_ID}")
+
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /{id}/setup
+# ---------------------------------------------------------------------------
+
+def test_setup_requires_admin_role(client: TestClient) -> None:
+    """viewer role -> 403 on the setup endpoint (role guard)."""
+    _override_auth(make_user("viewer"))
+    resp = client.post(
+        f"/api/v1/entities/{ENTITY_ID}/setup",
+        json={"template_name": "uk_limited_company_vat"},
+    )
+    assert resp.status_code == 403
+
+
+def test_setup_success_owner(client: TestClient) -> None:
+    """owner role -> 200 with the SetupResult."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.setup_entity",
+        new_callable=AsyncMock,
+    ) as mock_setup:
+        mock_setup.return_value = make_setup_result()
+        resp = client.post(
+            f"/api/v1/entities/{ENTITY_ID}/setup",
+            json={"template_name": "uk_limited_company_vat"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["entity_id"] == str(ENTITY_ID)
+    assert data["coa_count"] == 65
+    assert data["ledger_name"] == "entity-acme123"
+
+
+def test_setup_already_set_up_409(client: TestClient) -> None:
+    _override_auth(make_user("admin"))
+    with patch(
+        "src.routes.entities.setup_entity",
+        new_callable=AsyncMock,
+    ) as mock_setup:
+        mock_setup.side_effect = SetupError("already set up")
+        resp = client.post(
+            f"/api/v1/entities/{ENTITY_ID}/setup",
+            json={"template_name": "uk_limited_company_vat"},
+        )
+
+    assert resp.status_code == 409
+
+
+def test_setup_unknown_entity_404(client: TestClient) -> None:
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.setup_entity",
+        new_callable=AsyncMock,
+    ) as mock_setup:
+        mock_setup.side_effect = EntityNotFoundError(ENTITY_ID)
+        resp = client.post(
+            f"/api/v1/entities/{ENTITY_ID}/setup",
+            json={"template_name": "uk_limited_company_vat"},
+        )
+
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /{id}/status
+# ---------------------------------------------------------------------------
+
+def test_entity_status(client: TestClient) -> None:
+    _override_auth(make_user("viewer"))
+    with patch(
+        "src.routes.entities.get_entity_status",
+        new_callable=AsyncMock,
+    ) as mock_status:
+        mock_status.return_value = make_status()
+        resp = client.get(f"/api/v1/entities/{ENTITY_ID}/status")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["has_coa"] is True
+    assert data["account_count"] == 65
+    assert data["formance"] == "reachable"
+    assert data["parity"] == "ok"
+
+
+def test_entity_status_404(client: TestClient) -> None:
+    _override_auth(make_user("viewer"))
+    with patch(
+        "src.routes.entities.get_entity_status",
+        new_callable=AsyncMock,
+    ) as mock_status:
+        mock_status.side_effect = EntityNotFoundError(ENTITY_ID)
+        resp = client.get(f"/api/v1/entities/{ENTITY_ID}/status")
+
+    assert resp.status_code == 404
