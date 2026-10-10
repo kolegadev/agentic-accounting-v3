@@ -272,6 +272,11 @@ async def test_perfect_parity_with_scripted_formance(monkeypatch) -> None:
         assert report.orphans_in_formance == []
         assert report.leg_mismatches == []
         assert report.balance_mismatches == []
+        assert report.parse_errors == []
+        assert report.duplicate_rows == []
+        assert report.foreign_addresses == []
+        assert report.foreign_assets == []
+        assert report.missing_balance_addresses == []
         assert "OK" in report.summary
 
         # Spot-check the mirrors the service actually recorded: 1 reversal of
@@ -400,6 +405,110 @@ async def test_sabotage_orphan_injection_flagged(monkeypatch) -> None:
         assert report.missing_in_formance == []
         assert report.leg_mismatches == []
         assert report.balance_mismatches == []
+    finally:
+        await ctx["db"].close()
+        await ctx["engine"].dispose()
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: duplicate mirror row (F13 gaps 3+4)
+# ---------------------------------------------------------------------------
+
+
+async def test_sabotage_duplicate_mirror_flagged(monkeypatch) -> None:
+    ctx = await _build_scripted_ledger(monkeypatch)
+    try:
+        fake = ctx["fake"]
+        tx2 = ctx["transactions"]["tx2"]
+        original = fake.mirror_for(str(tx2.id))
+        fake.transactions.append(
+            {
+                "txid": 99,
+                "reference": original["reference"],
+                "metadata": copy.deepcopy(original["metadata"]),
+                "postings": copy.deepcopy(original["postings"]),
+            }
+        )
+
+        report = await _verify(ctx["db"], fake)
+
+        assert report.ok is False
+        assert report.duplicate_rows == [
+            {
+                "kind": "duplicate",
+                "transaction_id": str(tx2.id),
+                "reference": tx2.reference,
+                "txids": [original["txid"], 99],
+                "indices": [0, 1],
+            }
+        ]
+        assert report.leg_mismatches == []
+        assert report.missing_in_formance == []
+        assert report.orphans_in_formance == []
+        # Balance cascade: the duplicated legs double the 1000/5210 movement.
+        entries = {
+            (e["account_code"], e["expected"], e["actual"])
+            for e in report.balance_mismatches
+        }
+        assert entries == {("1000", -2500, -5000), ("5210", 2500, 5000)}
+    finally:
+        await ctx["db"].close()
+        await ctx["engine"].dispose()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: foreign balance addresses (F13 gap 5)
+# ---------------------------------------------------------------------------
+
+
+async def test_sabotage_foreign_address_flagged(monkeypatch) -> None:
+    ctx = await _build_scripted_ledger(monkeypatch)
+    try:
+        fake = ctx["fake"]
+        fake.add_orphan(
+            txid=99,
+            reference="JE-1999-9999",
+            metadata={"transaction_id": str(uuid.uuid4()), "description": "rogue"},
+            postings=[{"source": "9999", "destination": "8888", "amount": "1.00", "asset": GBP}],
+        )
+
+        report = await _verify(ctx["db"], fake)
+
+        assert report.ok is False
+        assert report.foreign_addresses == [
+            {"kind": "foreign_address", "address": "8888", "value": 100},
+            {"kind": "foreign_address", "address": "9999", "value": -100},
+        ]
+        assert len(report.orphans_in_formance) == 1
+        assert report.balance_mismatches == []
+        assert report.foreign_assets == []
+        assert report.missing_balance_addresses == []
+    finally:
+        await ctx["db"].close()
+        await ctx["engine"].dispose()
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: sub-penny balance (F13 gap 6)
+# ---------------------------------------------------------------------------
+
+
+async def test_sabotage_sub_penny_amount_flagged(monkeypatch) -> None:
+    ctx = await _build_scripted_ledger(monkeypatch)
+    try:
+        fake = ctx["fake"]
+        tx2 = ctx["transactions"]["tx2"]
+        fake.alter_amount(fake.mirror_for(str(tx2.id))["txid"], "25.005")
+
+        report = await _verify(ctx["db"], fake)
+
+        assert report.ok is False
+        # The wrong mirror amount is a leg mismatch...
+        assert len(report.leg_mismatches) == 1
+        # ...and the sub-penny balances it produces are parse errors, not
+        # truncations to matching values.
+        assert {e["raw"] for e in report.parse_errors} == {"25.005", "-25.005"}
+        assert all(e["kind"] == "parse_error" for e in report.parse_errors)
     finally:
         await ctx["db"].close()
         await ctx["engine"].dispose()
