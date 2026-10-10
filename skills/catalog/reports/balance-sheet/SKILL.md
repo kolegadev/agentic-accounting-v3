@@ -94,7 +94,7 @@ of posted/reversed postings, integer pence (see Formance interaction).
   presentation (A = L + E is the format). Current classification turns on
   the one-year/operating-cycle rule (ASC 210-10-45-5). Deferred tax
   assets and liabilities are ALWAYS non-current under ASC 740-10-45-4
-  regardless of expected reversal timing — a classification IAS 1 does
+  regardless of expected reversal timing; IAS 1.56 likewise bars classifying deferred tax as current when a classified balance sheet is presented, so the practical classification agrees — a nuance IAS 1 does
   not force. Leases keep ASC 842's operating/finance dual model (no
   IFRS 16 single model), so lease accounts remain a client-created COA
   concern, not a framework difference in the line recipe.

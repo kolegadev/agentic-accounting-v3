@@ -94,7 +94,7 @@ integer pence; ΔX = closing balance − opening balance.
   discretion. Regardless of method, ASC 230-10-50-2 REQUIRES supplemental
   disclosure of interest paid and income taxes paid, and non-cash
   investing/financing activity must be disclosed (ASC 230-10-50-3) — an
-  interest-paid mandate IAS 7 does not have. Public companies present
+  interest-paid mandate IAS 7 expresses differently (IAS 7.31 requires interest paid to be disclosed separately rather than through a supplemental schedule). Public companies present
   three years of statements of cash flows; IFRS requires one comparative
   year.
 

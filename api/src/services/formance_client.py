@@ -202,9 +202,9 @@ class FormanceClient:
         """List transactions with cursor-based pagination (normalised).
 
         ``after`` is the opaque ``cursor.next`` value from the previous page;
-        on the real API it must be sent as the ``cursor`` query param ALONE
-        (v2.3.x rejects it when ``pageSize`` accompanies it, and the legacy
-        ``after`` param expects a numeric txid).
+        on the real API it is sent as the ``cursor`` query param (the legacy ``after``
+        param expects a numeric txid and 500s otherwise); the client omits
+        pageSize on follow-ups.
         """
         if after:
             params: dict[str, Any] = {"cursor": after}

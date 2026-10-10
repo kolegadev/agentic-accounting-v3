@@ -303,9 +303,9 @@ class FormanceClient:
         """One page of GET /{ledger}/transactions, normalised.
 
         ``after`` is the opaque ``cursor.next`` value from the previous page;
-        on the real API it must be sent as the ``cursor`` query param ALONE
-        (v2.3.x rejects the legacy ``after`` param — numeric or opaque — with
-        500).  The cursor-embedded envelope is flattened to
+        on the real API it is sent as the ``cursor`` query param (v2.3.x 500s on the
+        legacy ``after`` param, numeric or opaque alike; pageSize may accompany
+        cursor but the client omits it on follow-ups).  The cursor-embedded envelope is flattened to
         ``{"cursor": {...}, "data": [...]}`` with major-unit amount strings.
         """
         if after:
@@ -339,7 +339,7 @@ class FormanceClient:
 
         Returns the F2-compatible shape ``{"data": [...], "cursor": {"hasMore":
         false, "next": null}}`` once pagination is exhausted.  Follow-up pages
-        send the opaque ``cursor.next`` value alone.
+        send the opaque ``cursor.next`` value without pageSize.
         """
         collected: list[Any] = []
         cursor_after: Optional[str] = after

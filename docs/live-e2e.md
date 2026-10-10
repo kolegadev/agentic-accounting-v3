@@ -259,5 +259,5 @@ cd api && .venv/bin/python -m pytest tests/ -q --no-header -p no:cacheprovider -
 cd formance-mcp && .venv/bin/python -m pytest -q
 ```
 
-→ 0 failed, 59 passed, 1 skipped (the live MCP test skips on hosts without
+→ 0 failed, 60 passed, 1 skipped (the live MCP test skips on hosts without
 a ledger).

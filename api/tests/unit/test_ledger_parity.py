@@ -1556,3 +1556,40 @@ async def test_zero_net_ledger_clean_payload_reports_ok() -> None:
     assert report.foreign_assets == []
     assert report.missing_balance_addresses == []
     assert "OK" in report.summary
+
+
+async def test_empty_ledger_malformed_balances_payload_fails_closed() -> None:
+    """F13 residual I1: a malformed (non-dict) balances payload must never
+    read as ok=True, even on a completely empty ledger (no mirror rows)."""
+    db = FakeSession(transactions=[], accounts=[])
+    client = client_mock(list_response(), "not-a-dict")
+    report = await run_verify(db, client)
+    assert report.ok is False
+    assert report.parse_errors != []
+    assert "malformed balances payload" in report.parse_errors[0]["error"]
+
+
+async def test_huge_exponent_amount_is_parse_error_not_raise() -> None:
+    """F13 residual I2: an absurd-exponent amount ('1e1000000') must become a
+    parse_error entry — never an uncaught decimal.Overflow escaping verify_parity."""
+    bank = make_account("1000")
+    revenue = make_account("4000")
+    tx = make_transaction(
+        "JE-2026-0001",
+        "posted",
+        [make_posting(bank, debit=10000), make_posting(revenue, credit=10000)],
+    )
+    db = FakeSession(transactions=[tx], accounts=[bank, revenue])
+    mirrors = list_response(
+        f_tx(
+            1,
+            "JE-2026-0001",
+            str(tx.id),
+            [{"source": "4000", "destination": "1000", "amount": "100.00", "asset": GBP}],
+        )
+    )
+    balances = {"data": [{"address": "1000", "balances": {GBP: "1e1000000"}}]}
+    client = client_mock(mirrors, balances)
+    report = await run_verify(db, client)
+    assert report.ok is False
+    assert report.parse_errors != []

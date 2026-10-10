@@ -35,16 +35,18 @@ MCP_TRANSPORT=streamable-http .venv/bin/formance-mcp
 1. `health` — Formance `_info` + version.
 2. `create_transaction(ledger, postings, reference?, timestamp?, metadata?,
    idempotency_key?)` — commits a transaction; postings use decimal-string
-   amounts; sends `Idempotency-Key` when provided; returns the committed
-   transaction.
+   amounts; sends `Idempotency-Key` when provided; returns `{"txid": N}`.
 3. `get_transaction(ledger, txid)`
 4. `list_transactions(ledger, page_size=100, after?)` — cursor pagination,
    follows `cursor.hasMore` to the end.
-5. `get_balances(ledger, address?)` — preserves per-address/per-asset
-   structure.
+5. `get_balances(ledger, address?)` — returns
+   `{"data": [{"address", "balances": {asset: amount}}]}` with major-unit
+   decimal strings.
 6. `list_ledgers()`
 7. `run_script(ledger, plain)` — POST `/{ledger}/script` with Numscript
    body `{plain}`.
+8. `create_ledger(ledger)` — POST `/v2/{ledger}`; idempotent
+   (204 create / 400 LEDGER_ALREADY_EXISTS tolerated).
 
 ## Amount validation
 

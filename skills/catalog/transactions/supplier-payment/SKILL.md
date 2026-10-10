@@ -121,7 +121,6 @@ Debits 60000 == credits 60000. One Formance posting:
   the supplier grants is a reduction of the purchase price (ASC 606's
   consideration framework; ASC 605-50's customer-payments-and-incentives
   guidance for legacy arrangements) — taken against cost, never booked as
-  income. The sales-tax element mirrors the output side: tax is never an
-  expense of the buyer — an exempt purchase keeps it out of cost, and a
+  income. The sales-tax element mirrors the output side: tax is not a VAT-style recoverable input for the buyer — on a taxable purchase it capitalises into cost (see supplier-invoice), an exempt purchase keeps it out of cost, and a
   self-assessed use-tax remittance to the state is Dr use-tax payable /
   Cr bank. There is no input-VAT credit chain to settle.

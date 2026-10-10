@@ -34,7 +34,7 @@ engine and every other tolerant caller keep working).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, Overflow
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -122,7 +122,7 @@ def _safe_pence(raw: Any) -> int:
     """Decimal round-trip that degrades to 0 for unparseable amounts."""
     try:
         return _decimal_to_pence(raw)
-    except (InvalidOperation, TypeError, ValueError):
+    except (InvalidOperation, Overflow, TypeError, ValueError):
         return 0
 
 
@@ -161,7 +161,15 @@ def _parse_balances_strict(
       the expected set.
     """
     if not isinstance(raw, dict):
-        return {}, [], []
+        return {}, [
+            {
+                "kind": "parse_error",
+                "address": None,
+                "asset": None,
+                "raw": repr(raw)[:200],
+                "error": "malformed balances payload (expected a dict envelope)",
+            }
+        ], []
     data = raw.get("data", raw)
     if isinstance(data, dict):
         data = data.get("balances", data)
@@ -173,7 +181,7 @@ def _parse_balances_strict(
     def record(address: str, asset: str, value: Any) -> None:
         try:
             pence = _decimal_to_pence(value, strict=True)
-        except (InvalidOperation, TypeError, ValueError) as exc:
+        except (InvalidOperation, Overflow, TypeError, ValueError) as exc:
             parse_errors.append(
                 {
                     "kind": "parse_error",
