@@ -106,16 +106,97 @@
 
   /* ── Dashboard (Left) ── */
   .dashboard {
-    width:53%; min-width:0; overflow-y:auto;
+    width:40%; min-width:0; overflow-y:auto;
     border-right:1px solid var(--border); padding:22px 26px 30px;
     display:flex; flex-direction:column; gap:22px;
   }
 
-  /* ── Chat (Right) ── */
+  /* ── Chat (Middle) ── */
   .chat-panel {
-    width:47%; min-width:0; display:flex; flex-direction:column;
+    width:35%; min-width:0; display:flex; flex-direction:column;
     background:var(--topbar-bg);
   }
+
+  /* ── Orchestrator Preview / Approval (Right) ── */
+  .orch-pane {
+    width:25%; min-width:0; display:flex; flex-direction:column;
+    background:var(--topbar-bg); border-left:1px solid var(--border);
+  }
+  .orch-status {
+    padding:10px 16px; font-size:12.5px; color:var(--text-dim3);
+    border-bottom:1px solid var(--border2); line-height:1.45; flex:none;
+  }
+  .orch-status.ready { color:var(--accent); }
+  .orch-status.working { color:var(--blue); }
+  .orch-status.error { color:var(--red); }
+  .orch-status.clarify { color:var(--amber); }
+  .orch-status.posted { color:var(--green); }
+  .orch-status.rejected { color:var(--text-dim3); }
+  .orch-body {
+    flex:1; overflow-y:auto; padding:14px 16px;
+    display:flex; flex-direction:column; gap:12px;
+  }
+  .skill-badge {
+    display:inline-block; background:var(--accent-tint2); border:1px solid var(--accent-border);
+    color:var(--accent); border-radius:6px; padding:3px 9px; font-size:11px; font-weight:700;
+    font-family:var(--mono); margin-right:8px; text-transform:uppercase; letter-spacing:.04em;
+  }
+  .orch-skill-label { font-size:11px; color:var(--text-dim3); }
+  .legs-table { width:100%; border-collapse:collapse; font-size:11.5px; }
+  .legs-table th {
+    text-align:left; color:var(--text-dim4); font-weight:600; padding:4px 6px;
+    border-bottom:1px solid var(--border4); font-size:10px;
+    text-transform:uppercase; letter-spacing:.05em;
+  }
+  .legs-table th.num, .legs-table td.num { text-align:right; }
+  .legs-table td { padding:5px 6px; border-bottom:1px solid var(--border2); vertical-align:top; }
+  .leg-code { font-family:var(--mono); color:var(--blue); font-size:11px; white-space:nowrap; }
+  .leg-name { display:block; font-weight:600; }
+  .leg-desc { display:block; font-size:10.5px; color:var(--text-dim3); }
+  .leg-class { color:var(--text-dim3); font-size:11px; }
+  .leg-amt { font-family:var(--mono); font-size:11px; white-space:nowrap; }
+  .orch-total {
+    display:flex; align-items:center; justify-content:space-between;
+    border-top:2px solid var(--border4); padding-top:9px; margin-top:2px;
+  }
+  .orch-total-label {
+    font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+    color:var(--text-dim3); font-weight:700;
+  }
+  .orch-total-value { font-family:var(--mono); font-size:17px; font-weight:700; color:var(--green); }
+  .formance-title {
+    font-size:10.5px; text-transform:uppercase; letter-spacing:.07em;
+    color:var(--text-dim4); margin-bottom:6px;
+  }
+  .orch-actions { display:flex; gap:8px; padding:10px 16px; border-top:1px solid var(--border2); flex:none; }
+  .orch-btn {
+    flex:1; border:none; border-radius:8px; padding:9px 0; font-size:12.5px; font-weight:700;
+    cursor:pointer; font-family:inherit; transition:all .15s;
+  }
+  .orch-btn.approve { background:var(--accent); color:var(--accent-dark); }
+  .orch-btn.approve:hover { filter:brightness(1.1); }
+  .orch-btn.approve:disabled { opacity:.4; cursor:not-allowed; }
+  .orch-btn.reject { background:transparent; color:var(--text-dim3); border:1px solid var(--border4); }
+  .orch-btn.reject:hover { color:var(--text); border-color:var(--text-dim3); }
+  .orch-btn.reject:disabled { opacity:.4; cursor:not-allowed; }
+  .pending-block {
+    border-top:1px solid var(--border2); padding:12px 16px 16px;
+    max-height:34%; overflow-y:auto; flex:none;
+  }
+  .pending-list { display:flex; flex-direction:column; gap:6px; }
+  .pending-empty { font-size:11.5px; color:var(--text-dim4); padding:6px 0; }
+  .pending-item {
+    display:flex; flex-direction:column; gap:2px; text-align:left;
+    background:var(--surface2); border:1px solid var(--border4); border-radius:8px;
+    padding:8px 10px; cursor:pointer; color:var(--text); font-family:inherit;
+    transition:all .15s;
+  }
+  .pending-item:hover { border-color:#34a795; }
+  .pending-item-desc {
+    font-size:12px; font-weight:600; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap;
+  }
+  .pending-item-meta { font-size:10.5px; color:var(--text-dim3); font-family:var(--mono); }
 
   /* ── Topbar Components ── */
   .co-switcher { position:relative; }
@@ -543,6 +624,7 @@
     .body-columns { flex-direction:column; }
     .dashboard { width:100%; border-right:none; border-bottom:1px solid var(--border); max-height:45vh; }
     .chat-panel { width:100%; flex:1; }
+    .orch-pane { width:100%; flex:none; border-left:none; border-top:1px solid var(--border); max-height:40vh; }
     .topbar { padding:0 12px; gap:10px; }
     .topbar-pill.hide-mobile { display:none; }
   }
@@ -661,6 +743,39 @@
           <input class="chat-input" id="msg-input" type="text" placeholder="Record a transaction, create an invoice, check your VAT…" disabled />
           <button class="chat-send-btn" id="send-btn" disabled>Send</button>
         </div>
+      </div>
+    </div>
+
+    <!-- ── RIGHT: ORCHESTRATOR PREVIEW / APPROVAL ── -->
+    <div class="orch-pane" id="orchestrator-preview">
+      <div class="chat-header">
+        <div class="chat-avatar">🧾</div>
+        <div>
+          <div class="chat-header-title">Entry preview</div>
+          <div class="chat-header-sub">Nothing posts until you approve</div>
+        </div>
+      </div>
+
+      <div class="orch-status" id="preview-status">No entry to review — send a message to build a draft.</div>
+
+      <div class="orch-body" id="preview-body" style="display:none">
+        <div id="preview-skill"></div>
+        <div id="preview-legs"></div>
+        <div class="orch-total" id="preview-total"></div>
+        <div id="preview-formance"></div>
+      </div>
+
+      <div class="orch-actions">
+        <button class="orch-btn approve" id="preview-approve" disabled>✓ Approve &amp; post</button>
+        <button class="orch-btn reject" id="preview-reject" disabled>✗ Reject</button>
+      </div>
+
+      <div class="pending-block">
+        <div class="section-header">
+          <span class="section-title">Pending drafts</span>
+          <span class="section-sub">awaiting approval</span>
+        </div>
+        <div class="pending-list" id="pending-drafts"><div class="pending-empty">Loading…</div></div>
       </div>
     </div>
 
@@ -1885,6 +2000,7 @@ function closeAdmin() {
     setIsProcessing(true);
     addTyping();
     ws.send(JSON.stringify({ type: 'message', content: text }));
+    requestOrchestratorPreview(text);
   }
 
   window.confirmAction = function() {
@@ -2007,6 +2123,243 @@ function closeAdmin() {
   })();
 
 })();
+
+// ═══════════════════════════════════════════
+//  ORCHESTRATOR PREVIEW / APPROVAL (F7)
+//  Right pane: draft preview, approve/reject, pending drafts.
+// ═══════════════════════════════════════════
+var OrchState = { transactionId: null };
+
+function fmtMoney(pence) {
+  var n = Number(pence || 0);
+  var sign = n < 0 ? '-' : '';
+  var abs = Math.abs(n) / 100;
+  return sign + '\u00a3' + abs.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function setPreviewStatus(text, tone) {
+  var el = document.getElementById('preview-status');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'orch-status' + (tone ? ' ' + tone : '');
+}
+
+function renderPreview(data) {
+  var body = document.getElementById('preview-body');
+  var approveBtn = document.getElementById('preview-approve');
+  var rejectBtn = document.getElementById('preview-reject');
+  if (!data || data.status !== 'preview' || !data.preview) {
+    if (body) body.style.display = 'none';
+    if (approveBtn) approveBtn.disabled = true;
+    if (rejectBtn) rejectBtn.disabled = true;
+    OrchState.transactionId = null;
+    return;
+  }
+  var p = data.preview;
+  OrchState.transactionId = p.transaction_id;
+
+  var skillEl = document.getElementById('preview-skill');
+  if (skillEl) {
+    skillEl.innerHTML = '<span class="skill-badge">' + esc(p.skill_id || 'entry') + '</span>' +
+      '<span class="orch-skill-label">constructed draft · awaiting approval</span>';
+  }
+
+  var legsEl = document.getElementById('preview-legs');
+  if (legsEl) {
+    var rows = (p.legs || []).map(function(l) {
+      var dr = l.debit_pence ? fmtMoney(l.debit_pence) : '';
+      var cr = l.credit_pence ? fmtMoney(l.credit_pence) : '';
+      return '<tr>' +
+        '<td class="leg-code">' + esc(l.code) + '</td>' +
+        '<td><span class="leg-name">' + esc(l.name) + '</span><span class="leg-desc">' + esc(l.description || '') + '</span></td>' +
+        '<td class="leg-class">' + esc(l.account_class || '') + '</td>' +
+        '<td class="leg-amt num">' + dr + '</td>' +
+        '<td class="leg-amt num">' + cr + '</td>' +
+        '</tr>';
+    }).join('');
+    legsEl.innerHTML = '<table class="legs-table"><thead><tr>' +
+      '<th>Code</th><th>Account</th><th>Class</th><th class="num">Debit</th><th class="num">Credit</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table>';
+  }
+
+  var totalEl = document.getElementById('preview-total');
+  if (totalEl) {
+    totalEl.innerHTML = '<span class="orch-total-label">Total</span><span class="orch-total-value">' + fmtMoney(p.total_pence) + '</span>';
+  }
+
+  var fpEl = document.getElementById('preview-formance');
+  if (fpEl) {
+    var fp = p.formance_preview || [];
+    fpEl.innerHTML = fp.length
+      ? '<div class="formance-title">Formance postings (preview)</div><table class="legs-table"><thead><tr>' +
+        '<th>Source</th><th>Destination</th><th class="num">Amount</th><th>Asset</th>' +
+        '</tr></thead><tbody>' +
+        fp.map(function(x) {
+          return '<tr>' +
+            '<td class="leg-code">' + esc(x.source) + '</td>' +
+            '<td class="leg-code">' + esc(x.destination) + '</td>' +
+            '<td class="leg-amt num">£' + esc(String(x.amount)) + '</td>' +
+            '<td class="leg-class">' + esc(x.asset) + '</td>' +
+            '</tr>';
+        }).join('') + '</tbody></table>'
+      : '';
+  }
+
+  if (body) body.style.display = 'flex';
+  if (approveBtn) approveBtn.disabled = false;
+  if (rejectBtn) rejectBtn.disabled = false;
+  setPreviewStatus('Draft ready — review the legs, then approve or reject.', 'ready');
+}
+
+async function requestOrchestratorPreview(text) {
+  try {
+    setPreviewStatus('Classifying & constructing draft…', 'working');
+    var resp = await fetch('/api/orchestrator/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text })
+    });
+    var data = await resp.json();
+    if (resp.status === 422) {
+      setPreviewStatus((data.type ? data.type + ': ' : '') + (data.message || 'Cannot construct this entry.'), 'error');
+      renderPreview(null);
+      return;
+    }
+    if (data.status === 'preview') {
+      renderPreview(data);
+      loadPendingDrafts();
+      return;
+    }
+    if (data.status === 'clarification') {
+      var err = data.error || {};
+      setPreviewStatus(err.message || 'I need a bit more detail to construct this entry.', 'clarify');
+      renderPreview(null);
+      return;
+    }
+    setPreviewStatus((data.error && data.error.message) || ('Unexpected orchestrator response (' + resp.status + ')'), 'error');
+    renderPreview(null);
+  } catch (e) {
+    setPreviewStatus('Orchestrator unreachable: ' + e.message, 'error');
+  }
+}
+
+async function approvePreview() {
+  if (!OrchState.transactionId) return;
+  var btn = document.getElementById('preview-approve');
+  if (btn) btn.disabled = true;
+  setPreviewStatus('Posting to the ledger & mirroring to Formance…', 'working');
+  try {
+    var resp = await fetch('/api/orchestrator/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transaction_id: OrchState.transactionId })
+    });
+    var data = await resp.json();
+    if (resp.ok) {
+      var parity = data.parity_ok ? 'parity OK ✓' : 'parity drift flagged';
+      var ref = data.transaction && data.transaction.reference ? data.transaction.reference + ' · ' : '';
+      setPreviewStatus('POSTED — ' + ref + parity, 'posted');
+      renderPreview(null);
+      loadPendingDrafts();
+      loadDashboardFromAPI(AppState.companyId).then(function(d) { renderDashboard(d); });
+    } else {
+      var detail = data.detail;
+      var msg = typeof detail === 'string' ? detail : (detail && detail.message) || ('HTTP ' + resp.status);
+      setPreviewStatus('Approval failed: ' + msg, 'error');
+      if (btn) btn.disabled = false;
+    }
+  } catch (e) {
+    setPreviewStatus('Orchestrator unreachable: ' + e.message, 'error');
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function rejectPreview() {
+  if (!OrchState.transactionId) return;
+  var btn = document.getElementById('preview-reject');
+  if (btn) btn.disabled = true;
+  try {
+    var resp = await fetch('/api/orchestrator/reject', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transaction_id: OrchState.transactionId })
+    });
+    var data = await resp.json();
+    if (resp.ok) {
+      setPreviewStatus('Draft discarded — nothing was posted.', 'rejected');
+      renderPreview(null);
+      loadPendingDrafts();
+    } else {
+      var detail = data.detail;
+      var msg = typeof detail === 'string' ? detail : (detail && detail.message) || ('HTTP ' + resp.status);
+      setPreviewStatus('Reject failed: ' + msg, 'error');
+      if (btn) btn.disabled = false;
+    }
+  } catch (e) {
+    setPreviewStatus('Orchestrator unreachable: ' + e.message, 'error');
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function loadPendingDrafts() {
+  var list = document.getElementById('pending-drafts');
+  if (!list) return;
+  try {
+    var resp = await fetch('/api/orchestrator/pending');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    var data = await resp.json();
+    var items = (data && data.transactions) || data || [];
+    if (!items.length) {
+      list.innerHTML = '<div class="pending-empty">No drafts awaiting approval.</div>';
+      return;
+    }
+    list.innerHTML = items.map(function(t) {
+      var legs = t.postings || [];
+      var total = legs.reduce(function(acc, p) { return acc + (p.debit_amount || 0); }, 0);
+      return '<button class="pending-item" onclick="loadPendingDraft(\'' + t.id + '\')">' +
+        '<span class="pending-item-desc">' + esc(t.description || 'Draft entry') + '</span>' +
+        '<span class="pending-item-meta">' + legs.length + ' leg' + (legs.length === 1 ? '' : 's') + ' · ' + fmtMoney(total) + '</span>' +
+        '</button>';
+    }).join('');
+  } catch (e) {
+    list.innerHTML = '<div class="pending-empty">Pending drafts unavailable (' + esc(e.message) + ')</div>';
+  }
+}
+
+async function loadPendingDraft(transactionId) {
+  try {
+    var resp = await fetch('/api/orchestrator/pending');
+    var data = await resp.json();
+    var items = (data && data.transactions) || data || [];
+    var t = null;
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].id === transactionId) { t = items[i]; break; }
+    }
+    if (!t) return;
+    var legs = (t.postings || []).map(function(p) {
+      return {
+        code: p.account_code || '',
+        name: p.account_name || '',
+        account_class: '',
+        debit_pence: p.debit_amount || 0,
+        credit_pence: p.credit_amount || 0,
+        description: p.description || ''
+      };
+    });
+    var total = legs.reduce(function(acc, l) { return acc + l.debit_pence; }, 0);
+    renderPreview({
+      status: 'preview',
+      preview: { transaction_id: t.id, skill_id: 'draft', legs: legs, total_pence: total, formance_preview: [] }
+    });
+    setPreviewStatus('Draft loaded from pending list — approve or reject.', 'ready');
+  } catch (e) {
+    setPreviewStatus('Could not load draft: ' + e.message, 'error');
+  }
+}
+
+document.getElementById('preview-approve').addEventListener('click', approvePreview);
+document.getElementById('preview-reject').addEventListener('click', rejectPreview);
+loadPendingDrafts();
 </script>
 </body>
 </html>

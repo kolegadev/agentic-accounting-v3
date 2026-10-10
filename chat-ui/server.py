@@ -16,7 +16,7 @@ from pathlib import Path
 import httpx
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://accounting-api:8000")
@@ -936,6 +936,88 @@ async def _fallback_http_bridge(ws: WebSocket, session_id: str):
 
     except WebSocketDisconnect:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator forwarding (Contract F7) — real pipeline only, NO mock fallback.
+#
+# These endpoints mirror the accounting API's /api/v1/orchestrator/* routes.
+# Requests are forwarded over httpx with status codes and JSON passed through
+# untouched.  If the upstream API is unreachable the response is 502 JSON.
+#
+# Test seam: assign an httpx.AsyncClient (e.g. one built on httpx.MockTransport)
+# to server._upstream_client — the endpoints use it instead of a real socket.
+# ---------------------------------------------------------------------------
+_upstream_client: httpx.AsyncClient | None = None
+
+_ORCHESTRATOR_ROUTES = {
+    "message": {"method": "POST", "path": "/api/v1/orchestrator/message"},
+    "approve": {"method": "POST", "path": "/api/v1/orchestrator/approve"},
+    "reject": {"method": "POST", "path": "/api/v1/orchestrator/reject"},
+    "pending": {"method": "GET", "path": "/api/v1/orchestrator/pending"},
+}
+
+
+def _get_upstream_client() -> httpx.AsyncClient:
+    """Return the injectable upstream client (tests replace this seam)."""
+    global _upstream_client
+    if _upstream_client is None:
+        _upstream_client = httpx.AsyncClient(timeout=10.0)
+    return _upstream_client
+
+
+async def _forward_orchestrator(action: str, body: dict | None) -> JSONResponse:
+    """Forward one orchestrator call to the accounting API.
+
+    Status code and JSON body pass through untouched; upstream
+    connection failures become a 502 JSON error.
+    """
+    spec = _ORCHESTRATOR_ROUTES[action]
+    url = f"{API_BASE_URL}{spec['path']}"
+    try:
+        client = _get_upstream_client()
+        if spec["method"] == "GET":
+            resp = await client.get(url)
+        else:
+            resp = await client.post(url, json=body)
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "type": "upstream_unreachable",
+                "message": f"Accounting API unreachable: {exc}",
+            },
+        )
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=payload)
+
+
+@app.post("/api/orchestrator/message")
+async def orchestrator_message(data: dict):
+    """POST → /api/v1/orchestrator/message (LLM classify + construct preview)."""
+    return await _forward_orchestrator("message", data)
+
+
+@app.post("/api/orchestrator/approve")
+async def orchestrator_approve(data: dict):
+    """POST → /api/v1/orchestrator/approve (post the approved draft)."""
+    return await _forward_orchestrator("approve", data)
+
+
+@app.post("/api/orchestrator/reject")
+async def orchestrator_reject(data: dict):
+    """POST → /api/v1/orchestrator/reject (discard the draft)."""
+    return await _forward_orchestrator("reject", data)
+
+
+@app.get("/api/orchestrator/pending")
+async def orchestrator_pending():
+    """GET → /api/v1/orchestrator/pending (drafts awaiting approval)."""
+    return await _forward_orchestrator("pending", None)
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ from src.routes.documents import router as documents_router
 from src.routes.invoices import router as invoices_router
 from src.routes.open_banking import router as open_banking_router
 from src.routes.mtd import router as mtd_router
+from src.routes.orchestrator import router as orchestrator_router
 from src.routes.reconciliation import router as reconciliation_router
 from src.routes.recurring import router as recurring_router
 from src.routes.reports import router as reports_router
@@ -62,6 +63,7 @@ app.include_router(documents_router)
 app.include_router(invoices_router)
 app.include_router(mtd_router)
 app.include_router(open_banking_router)
+app.include_router(orchestrator_router)
 app.include_router(reconciliation_router)
 app.include_router(recurring_router)
 app.include_router(reports_router)
