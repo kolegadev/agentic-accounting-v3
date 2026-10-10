@@ -374,8 +374,13 @@ class TransactionService:
     async def post_transaction(
         db: AsyncSession,
         transaction_id: uuid.UUID,
+        ledger: str | None = None,
     ) -> Transaction:
         """Post a Draft transaction — validates, assigns JE ref, sets status.
+
+        ``ledger`` is the Formance ledger to mirror to; ``None`` (the
+        default) mirrors to ``"main"`` — backward compatible with direct
+        callers that don't resolve an entity ledger.
 
         Raises TransactionNotFoundError, TransactionNotDraftError,
         or UnbalancedTransactionError.
@@ -417,7 +422,9 @@ class TransactionService:
         await db.refresh(transaction, attribute_names=["postings"])
 
         # Post to Formance Ledger if available
-        await TransactionService._post_to_formance(db, transaction)
+        await TransactionService._post_to_formance(
+            db, transaction, ledger=ledger or "main"
+        )
 
         return transaction
 
@@ -507,12 +514,14 @@ class TransactionService:
     async def reverse_transaction(
         db: AsyncSession,
         transaction_id: uuid.UUID,
+        ledger: str | None = None,
     ) -> Transaction:
         """Create a reversing (compensating) entry for a Posted transaction.
 
         The original transaction is set to 'reversed' status, and a new
         transaction is created with debits/credits swapped.  The new
-        transaction is automatically posted.
+        transaction is automatically posted.  ``ledger`` mirrors the
+        reversal to the given Formance ledger (default ``"main"``).
         """
         # ---- Load original ----
         stmt = (
@@ -580,7 +589,9 @@ class TransactionService:
         await db.refresh(reversing_tx, attribute_names=["postings"])
 
         # Mirror the reversing entry to Formance with the same pairing logic
-        await TransactionService._post_to_formance(db, reversing_tx)
+        await TransactionService._post_to_formance(
+            db, reversing_tx, ledger=ledger or "main"
+        )
 
         return reversing_tx
 
@@ -588,6 +599,7 @@ class TransactionService:
     async def _post_to_formance(
         db: AsyncSession,
         transaction: Transaction,
+        ledger: str = "main",
     ) -> Optional[dict[str, Any]]:
         """Mirror a transaction to the Formance Ledger as paired postings.
 
@@ -617,7 +629,7 @@ class TransactionService:
                 return None
 
             result = await formance_client.create_transaction(
-                ledger="main",
+                ledger=ledger,
                 postings=formance_postings,
                 reference=transaction.reference or str(transaction.id),
                 timestamp=(

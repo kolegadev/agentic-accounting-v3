@@ -1,15 +1,17 @@
-"""FastAPI router for Entity + initial-ledger setup (Contract F11)."""
+"""FastAPI router for Entity + initial-ledger setup (Contract F11/F12)."""
 
 from __future__ import annotations
 
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.database import get_db
 from src.middleware.auth import get_current_user, require_role
 from src.models.user import User
+from src.services.coa_service import CoaServiceError
 from src.services.entity_service import EntityService, EntityServiceError
 from src.services.setup_service import (
     SetupError,
@@ -32,8 +34,13 @@ async def _run_setup(
     db: AsyncSession,
     entity_id: uuid.UUID,
     setup: SetupRequest,
-) -> SetupResult:
-    """Execute setup_entity and translate service errors into HTTP errors."""
+) -> SetupResult | JSONResponse:
+    """Execute setup_entity and translate service errors into HTTP errors.
+
+    CoaServiceError (incl. TemplateNotFoundError) → 404 {type:"coa_error"};
+    SetupError → 409 {type:"setup_error"}; EntityServiceError → its status
+    code (404 as today).  No uncaught escape.
+    """
     try:
         return await setup_entity(
             db,
@@ -42,10 +49,21 @@ async def _run_setup(
             bank_accounts=setup.bank_accounts,
             opening_balances=setup.opening_balances,
         )
+    except CoaServiceError as exc:
+        return JSONResponse(
+            status_code=404,
+            content={"type": "coa_error", "message": exc.message},
+        )
     except SetupError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+        return JSONResponse(
+            status_code=409,
+            content={"type": "setup_error", "message": exc.message},
+        )
     except EntityServiceError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"type": "entity_error", "message": exc.message},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +84,7 @@ async def create_entity(
     data: EntityCreateWithSetup,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> EntitySetupResponse:
+) -> EntitySetupResponse | JSONResponse:
     """Create the entity (created_by = current user) and, when `setup` is
     provided, run the initial-ledger setup immediately."""
     try:
@@ -74,11 +92,22 @@ async def create_entity(
             db, data, created_by=current_user.id
         )
     except EntityServiceError as exc:
+        if exc.error_type is not None:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"type": exc.error_type, "message": exc.message},
+            )
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
     setup_result: SetupResult | None = None
     if data.setup is not None:
         setup_result = await _run_setup(db, entity.id, data.setup)
+        if isinstance(setup_result, JSONResponse):
+            # The entity row was committed by create_entity above, before
+            # setup ran. On setup failure it remains created — a documented,
+            # acceptable consequence: the client receives the mapped error
+            # (404/409) and can re-run setup via POST /{entity_id}/setup.
+            return setup_result
 
     return EntitySetupResponse(
         entity=EntityResponse.model_validate(entity),

@@ -30,6 +30,7 @@ VALID_LEGAL_TYPES = (
 )
 VALID_FRAMEWORKS = ("uk-gaap", "ifrs")
 VALID_VAT_SCHEMES = ("standard", "cash", "flat_rate")
+VALID_SETUP_STATES = ("none", "in_progress", "complete")
 
 
 class Entity(Base):
@@ -102,6 +103,13 @@ class Entity(Base):
         nullable=False,
         comment="Formance ledger name (default entity-<uuid4hex[:8]>)",
     )
+    setup_state: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="none",
+        server_default=text("'none'"),
+        comment="Setup lifecycle state: none|in_progress|complete",
+    )
     created_by: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="RESTRICT"),
@@ -139,6 +147,10 @@ class Entity(Base):
         CheckConstraint(
             f"vat_scheme IS NULL OR vat_scheme = ANY(ARRAY[{', '.join(repr(v) for v in VALID_VAT_SCHEMES)}])",
             name="ck_entities_vat_scheme",
+        ),
+        CheckConstraint(
+            f"setup_state = ANY(ARRAY[{', '.join(repr(v) for v in VALID_SETUP_STATES)}])",
+            name="ck_entities_setup_state",
         ),
         Index("ix_entities_name", "name", unique=True),
         Index("ix_entities_ledger_name", "ledger_name", unique=True),

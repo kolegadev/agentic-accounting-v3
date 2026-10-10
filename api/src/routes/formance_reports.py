@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.database import get_db
+from src.services.entity_service import get_active_ledger
 from src.services.formance_reports import (
     ReportEngineError,
     generate_bs,
@@ -101,6 +102,10 @@ async def formance_report(
             },
         )
 
+    # Resolve the Formance ledger once per request: the active entity's
+    # ledger when one exists, "main" otherwise (backward compatible).
+    ledger = await get_active_ledger(db)
+
     if report_type == "pl":
         generator, kwargs = generate_pl, {
             "period_start": period_start,
@@ -122,7 +127,7 @@ async def formance_report(
         generator, kwargs = generate_tb, {"as_at": as_at or date.today()}
 
     try:
-        report = await generator(db, **kwargs)
+        report = await generator(db, ledger, **kwargs)
     except ReportEngineError as exc:
         return JSONResponse(
             status_code=422,

@@ -29,6 +29,7 @@ import httpx
 from src.constructors import CONSTRUCTORS, ConstructorError, resolve_from_coa
 from src.constructors.facts import FACTS_MODELS, parse_facts
 from src.services.coa_service import CoaService
+from src.services.entity_service import get_active_ledger
 from src.services.ledger_parity import ParityReport, verify_parity
 from src.services.transaction_service import (
     TransactionService,
@@ -445,16 +446,28 @@ async def orchestrate_message(
     )
 
 
-async def approve_entry(db: Any, transaction_id: uuid.UUID) -> PostResult:
+async def approve_entry(
+    db: Any,
+    transaction_id: uuid.UUID,
+    ledger: str | None = None,
+) -> PostResult:
     """Post a draft: assigns JE ref, mirrors to Formance, verifies parity.
+
+    Resolves ``ledger = ledger or await get_active_ledger(db)`` and uses it
+    for BOTH the Formance mirror (via ``post_transaction``) and the
+    post-approve ``verify_parity`` — the active entity's ledger when one
+    exists, ``"main"`` otherwise (backward compatible).
 
     Raises TransactionNotFoundError / TransactionNotDraftError /
     UnbalancedTransactionError from the service layer.  If parity reports a
     drift the result is still returned with ``parity_ok=False`` — posting
     already happened and parity flags drift, it does not roll back.
     """
-    transaction = await TransactionService.post_transaction(db, transaction_id)
-    report: ParityReport = await verify_parity(db)
+    resolved_ledger = ledger or await get_active_ledger(db)
+    transaction = await TransactionService.post_transaction(
+        db, transaction_id, ledger=resolved_ledger
+    )
+    report: ParityReport = await verify_parity(db, resolved_ledger)
     return PostResult(
         transaction=TransactionService._transaction_to_response(transaction),
         parity_ok=report.ok,

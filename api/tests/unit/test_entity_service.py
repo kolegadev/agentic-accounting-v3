@@ -1,4 +1,4 @@
-"""Unit tests for EntityService with mocked DB session (Contract F11)."""
+"""Unit tests for EntityService with mocked DB session (Contract F11/F12)."""
 
 from __future__ import annotations
 
@@ -6,13 +6,16 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from src.models.entity import Entity
 from src.services.entity_service import (
     DuplicateEntityNameError,
+    DuplicateLedgerNameError,
     EntityService,
     EntityServiceError,
     EntityNotFoundError,
+    get_active_ledger,
 )
 from src.validators.entity import EntityCreate, EntityUpdate
 from tests.conftest import NOW
@@ -153,6 +156,134 @@ async def test_create_entity_trims_name(mock_db: AsyncMock, owner_id) -> None:
         mock_db, make_create(name="  Acme Holdings Ltd  "), created_by=owner_id
     )
     assert entity.name == "Acme Holdings Ltd"
+
+
+@pytest.mark.asyncio
+async def test_create_entity_auto_ledger_collision_retries(
+    mock_db: AsyncMock, owner_id
+) -> None:
+    """An AUTO-DERIVED ledger_name collision regenerates and retries."""
+    _no_existing_entity(mock_db)
+    mock_db.commit = AsyncMock(
+        side_effect=[IntegrityError("INSERT", {}, Exception("duplicate")), None]
+    )
+    mock_db.rollback = AsyncMock()
+
+    added: list[Entity] = []
+    mock_db.add = added.append
+
+    entity = await EntityService.create_entity(
+        mock_db, make_create(), created_by=owner_id
+    )
+
+    assert entity.ledger_name == f"entity-{entity.id.hex[:8]}"
+    assert mock_db.commit.await_count == 2
+    mock_db.rollback.assert_awaited_once()
+    assert len(added) == 2
+    assert added[0].ledger_name != added[1].ledger_name
+    assert entity.id == added[1].id
+
+
+@pytest.mark.asyncio
+async def test_create_entity_auto_ledger_collision_exhausts_retries(
+    mock_db: AsyncMock, owner_id
+) -> None:
+    """After the retry budget is exhausted, a 409 surfaces."""
+    _no_existing_entity(mock_db)
+    mock_db.commit = AsyncMock(
+        side_effect=IntegrityError("INSERT", {}, Exception("duplicate"))
+    )
+    mock_db.rollback = AsyncMock()
+
+    with pytest.raises(DuplicateLedgerNameError) as excinfo:
+        await EntityService.create_entity(mock_db, make_create(), created_by=owner_id)
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.error_type == "duplicate_ledger_name"
+    assert mock_db.commit.await_count == 4  # initial + 3 retries
+
+
+@pytest.mark.asyncio
+async def test_create_entity_explicit_ledger_collision_no_retry(
+    mock_db: AsyncMock, owner_id
+) -> None:
+    """An EXPLICIT ledger_name collision fails immediately — no retry."""
+    _no_existing_entity(mock_db)
+    mock_db.commit = AsyncMock(
+        side_effect=IntegrityError("INSERT", {}, Exception("duplicate"))
+    )
+    mock_db.rollback = AsyncMock()
+
+    with pytest.raises(DuplicateLedgerNameError) as excinfo:
+        await EntityService.create_entity(
+            mock_db, make_create(ledger_name="acme-main"), created_by=owner_id
+        )
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.error_type == "duplicate_ledger_name"
+    assert mock_db.commit.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# get_active_ledger
+# ---------------------------------------------------------------------------
+
+def _entities_result(entities: list[Entity]) -> MagicMock:
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = entities
+    return result
+
+
+@pytest.mark.asyncio
+async def test_get_active_ledger_no_entity_returns_main(mock_db: AsyncMock) -> None:
+    mock_db.execute.return_value = _entities_result([])
+    assert await get_active_ledger(mock_db) == "main"
+
+
+@pytest.mark.asyncio
+async def test_get_active_ledger_single_entity(mock_db: AsyncMock) -> None:
+    entity = make_entity(ledger_name="entity-abc123")
+    mock_db.execute.return_value = _entities_result([entity])
+    assert await get_active_ledger(mock_db) == "entity-abc123"
+
+
+@pytest.mark.asyncio
+async def test_get_active_ledger_multiple_entities_returns_main(
+    mock_db: AsyncMock,
+) -> None:
+    e1 = make_entity()
+    e2 = make_entity(name="Beta LLP")
+    mock_db.execute.return_value = _entities_result([e1, e2])
+    assert await get_active_ledger(mock_db) == "main"
+
+
+@pytest.mark.asyncio
+async def test_get_active_ledger_ignores_inactive_entities(
+    mock_db: AsyncMock,
+) -> None:
+    """An INACTIVE-only entity still resolves to 'main' (the mock models the
+    WHERE is_active filter by returning the post-filter row set)."""
+    mock_db.execute.return_value = _entities_result([])
+    assert await get_active_ledger(mock_db) == "main"
+
+
+@pytest.mark.asyncio
+async def test_get_active_ledger_prefers_the_single_active_entity(
+    mock_db: AsyncMock,
+) -> None:
+    """The one ACTIVE entity wins even when inactive entities exist."""
+    active = make_entity(ledger_name="entity-abc123", is_active=True)
+    mock_db.execute.return_value = _entities_result([active])
+    assert await get_active_ledger(mock_db) == "entity-abc123"
+
+
+@pytest.mark.asyncio
+async def test_get_active_ledger_query_failure_returns_main(
+    mock_db: AsyncMock,
+) -> None:
+    """A lookup failure (e.g. no entities table) degrades to 'main'."""
+    mock_db.execute = AsyncMock(side_effect=RuntimeError("no such table"))
+    assert await get_active_ledger(mock_db) == "main"
 
 
 # ---------------------------------------------------------------------------

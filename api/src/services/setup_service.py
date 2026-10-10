@@ -1,17 +1,27 @@
 """Initial-ledger setup — entity → COA → bank accounts → ledger → opening drafts.
 
-Contract F11: creates the initial ledger for a new accounting entity.
+Contract F11/F12: creates the initial ledger for a new accounting entity.
 
 Order of operations:
-  1. Refuse (idempotency guard) if the COA is already loaded for the entity.
-  2. Load the COA template via ``CoaService.load_template`` (fuzzy match).
-  3. Create bank accounts via ``BankService``.
-  4. Ensure the Formance ledger exists via ``formance_client.create_ledger``
-     (tolerated — failure logs a warning and setup continues).
-  5. Build the F4 ``opening-balances`` constructor facts from the request,
+  1. Refuse only when the entity's ``setup_state`` is already ``complete``
+     (idempotency = refusal for finished setups, resume for partial ones).
+  2. Mark ``setup_state='in_progress'`` and COMMIT before any heavy step so
+     a mid-setup failure persists the state and a re-run RESUMEES instead of
+     being refused.
+  3. Load the COA template via ``CoaService.load_template`` (fuzzy match) —
+     skipped when accounts already exist (resume).
+  4. Create bank accounts via ``BankService`` — skipped when any bank
+     account already exists (resume).
+  5. Ensure the Formance ledger exists via ``formance_client.create_ledger``
+     (tolerated; ALWAYS attempted — idempotent on the Formance side).
+  6. Build the F4 ``opening-balances`` constructor facts from the request,
      run the REAL constructor, resolve codes via ``CoaService``, and create a
      DRAFT transaction via ``TransactionService.create_transaction`` — never
-     posted here.  Approval happens through the orchestrator approve route.
+     posted here.  Skipped when a draft transaction already exists (resume).
+     Approval happens through the orchestrator approve route.
+
+On success ``setup_state='complete'`` is committed.  Partial data is never
+deleted on failure.
 """
 
 from __future__ import annotations
@@ -27,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.constructors import CONSTRUCTORS, ConstructorError, resolve_from_coa
 from src.constructors.facts import OpeningBalanceItem, OpeningBalancesFacts
 from src.models.account import Account
+from src.models.bank_account import BankAccount
 from src.models.transaction import Transaction
 from src.services.bank_service import BankService
 from src.services.coa_service import CoaService
@@ -60,6 +71,22 @@ class SetupError(Exception):
 async def _account_count(db: AsyncSession) -> int:
     """Number of rows in the global chart of accounts."""
     result = await db.execute(select(func.count()).select_from(Account))
+    return int(result.scalar_one_or_none() or 0)
+
+
+async def _bank_count(db: AsyncSession) -> int:
+    """Number of bank account rows (any row, active or not)."""
+    result = await db.execute(select(func.count()).select_from(BankAccount))
+    return int(result.scalar_one_or_none() or 0)
+
+
+async def _draft_count(db: AsyncSession) -> int:
+    """Number of draft transactions."""
+    result = await db.execute(
+        select(func.count())
+        .select_from(Transaction)
+        .where(Transaction.status == "draft")
+    )
     return int(result.scalar_one_or_none() or 0)
 
 
@@ -135,46 +162,58 @@ async def setup_entity(
         Union[SetupOpeningBalances, list[SetupOpeningBalances]]
     ] = None,
 ) -> SetupResult:
-    """Set up the initial ledger for an entity.
+    """Set up the initial ledger for an entity — resumable after failure.
 
     Raises EntityNotFoundError (404) for unknown entities and SetupError
-    (409) when the entity is already set up (idempotency = refuse, never
-    duplicate).
+    (409) when the entity is already fully set up.  On any mid-setup failure
+    the state remains ``in_progress``: a re-run resumes (COA / bank /
+    opening-balance steps skip cleanly) instead of being refused.  Partial
+    data is never deleted.
     """
     entity = await EntityService.get_entity(db, entity_id)
     if entity is None:
         raise EntityNotFoundError(entity_id)
 
-    # GUARD — refuse before touching the COA: idempotency is refusal.
-    if await _account_count(db) > 0:
-        raise SetupError(
-            f"Entity '{entity_id}' is already set up — accounts already exist"
-        )
+    # GUARD — refuse only a COMPLETED setup; partial setups resume.
+    if entity.setup_state == "complete":
+        raise SetupError(f"Entity '{entity_id}' is already set up")
+
+    # Mark in-progress and COMMIT before any heavy step so a failure below
+    # leaves 'in_progress' persisted (the resume entry point).
+    if entity.setup_state != "in_progress":
+        entity.setup_state = "in_progress"
+        await db.commit()
 
     # 2. Chart of accounts (fuzzy *_vat / *_no_vat match inside CoaService).
-    coa_accounts = await CoaService.load_template(db, template_name)
+    #    Skipped on resume when accounts already exist.
+    coa_accounts: list = []
+    if await _account_count(db) == 0:
+        coa_accounts = await CoaService.load_template(db, template_name)
 
-    # 3. Bank accounts.
+    # 3. Bank accounts — skipped on resume when any bank account exists.
     bank_account_ids: list[uuid.UUID] = []
-    for ba in bank_accounts or []:
-        created = await BankService.create_account(
-            db,
-            BankAccountCreate(
-                name=ba.name,
-                sort_code=ba.sort_code,
-                account_number=ba.account_number,
-                opening_balance=ba.opening_balance,
-            ),
-        )
-        bank_account_ids.append(created.id)
+    if await _bank_count(db) == 0:
+        for ba in bank_accounts or []:
+            created = await BankService.create_account(
+                db,
+                BankAccountCreate(
+                    name=ba.name,
+                    sort_code=ba.sort_code,
+                    account_number=ba.account_number,
+                    opening_balance=ba.opening_balance,
+                ),
+            )
+            bank_account_ids.append(created.id)
 
-    # 4. Formance ledger — tolerated; Formance may be started later.
+    # 4. Formance ledger — ALWAYS attempted (idempotent on Formance's side);
+    #    tolerated; Formance may be started later.
     await formance_client.create_ledger(entity.ledger_name)
 
     # 5. Opening balances -> F4 constructor -> DRAFT transaction(s).
+    #    Skipped on resume when a draft transaction already exists.
     opening_ids: list[uuid.UUID] = []
     draft_total = 0
-    if opening_balances is not None:
+    if opening_balances is not None and await _draft_count(db) == 0:
         sets = (
             opening_balances
             if isinstance(opening_balances, list)
@@ -184,6 +223,9 @@ async def setup_entity(
             transaction = await _create_opening_draft(db, ob)
             opening_ids.append(transaction.id)
             draft_total += sum(p.debit_amount for p in transaction.postings)
+
+    entity.setup_state = "complete"
+    await db.commit()
 
     return SetupResult(
         entity_id=entity_id,
@@ -221,7 +263,7 @@ async def get_entity_status(db: AsyncSession, entity_id: uuid.UUID) -> EntitySta
             formance_status, parity = "unreachable", "na"
         else:
             formance_status = "reachable"
-            report = await verify_parity(db)
+            report = await verify_parity(db, ledger=entity.ledger_name)
             parity = "ok" if report.ok else "drift"
 
     return EntityStatus(

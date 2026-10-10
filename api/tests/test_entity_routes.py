@@ -16,8 +16,10 @@ from fastapi.testclient import TestClient
 from src.index import app
 from src.models.entity import Entity
 from src.models.user import User
+from src.services.coa_service import CoaServiceError, TemplateNotFoundError
 from src.services.entity_service import (
     DuplicateEntityNameError,
+    DuplicateLedgerNameError,
     EntityNotFoundError,
     EntityServiceError,
 )
@@ -194,6 +196,94 @@ def test_create_entity_with_setup_runs_setup(client: TestClient) -> None:
     assert mock_setup.await_args.args[2] == "uk_limited_company_vat"
 
 
+def test_create_with_setup_template_not_found_returns_404(
+    client: TestClient,
+) -> None:
+    """F12 regression: a setup failure inside POST / must surface the mapped
+    404 {type:'coa_error'} — never a 500 pydantic ValidationError."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.EntityService.create_entity",
+        new_callable=AsyncMock,
+    ) as mock_create, patch(
+        "src.routes.entities.setup_entity",
+        new_callable=AsyncMock,
+    ) as mock_setup:
+        mock_create.return_value = make_entity()
+        mock_setup.side_effect = TemplateNotFoundError("nonexistent")
+        resp = client.post(
+            "/api/v1/entities",
+            json={
+                "name": "Acme Holdings Ltd",
+                "setup": {"template_name": "nonexistent"},
+            },
+        )
+
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["type"] == "coa_error"
+    assert "nonexistent" in body["message"]
+    # The entity row was committed before setup ran — it remains created.
+    assert mock_create.await_count == 1
+
+
+def test_create_with_setup_setup_error_returns_409(client: TestClient) -> None:
+    """F12 regression: a SetupError inside POST / maps to 409
+    {type:'setup_error'} instead of a 500 ValidationError."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.EntityService.create_entity",
+        new_callable=AsyncMock,
+    ) as mock_create, patch(
+        "src.routes.entities.setup_entity",
+        new_callable=AsyncMock,
+    ) as mock_setup:
+        mock_create.return_value = make_entity()
+        mock_setup.side_effect = SetupError("already set up")
+        resp = client.post(
+            "/api/v1/entities",
+            json={
+                "name": "Acme Holdings Ltd",
+                "setup": {"template_name": "uk_limited_company_vat"},
+            },
+        )
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["type"] == "setup_error"
+    assert "already set up" in body["message"]
+    assert mock_create.await_count == 1
+
+
+def test_create_with_setup_success_still_201(client: TestClient) -> None:
+    """F12 regression guard: a successful setup still embeds the SetupResult
+    in the 201 EntitySetupResponse."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.EntityService.create_entity",
+        new_callable=AsyncMock,
+    ) as mock_create, patch(
+        "src.routes.entities.setup_entity",
+        new_callable=AsyncMock,
+    ) as mock_setup:
+        mock_create.return_value = make_entity()
+        mock_setup.return_value = make_setup_result()
+        resp = client.post(
+            "/api/v1/entities",
+            json={
+                "name": "Acme Holdings Ltd",
+                "setup": {"template_name": "uk_limited_company_vat"},
+            },
+        )
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["entity"]["name"] == "Acme Holdings Ltd"
+    assert body["setup"]["entity_id"] == str(ENTITY_ID)
+    assert body["setup"]["coa_count"] == 65
+    assert mock_setup.await_count == 1
+
+
 def test_create_entity_duplicate_name_409(client: TestClient) -> None:
     """Duplicate entity name -> 409."""
     _override_auth(make_user("owner"))
@@ -313,6 +403,79 @@ def test_setup_unknown_entity_404(client: TestClient) -> None:
         )
 
     assert resp.status_code == 404
+
+
+def test_setup_template_not_found_404_coa_error(client: TestClient) -> None:
+    """F12: a missing COA template is a 404 {type:'coa_error'} — never a 500."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.setup_entity",
+        new_callable=AsyncMock,
+    ) as mock_setup:
+        mock_setup.side_effect = TemplateNotFoundError("uk_nope")
+        resp = client.post(
+            f"/api/v1/entities/{ENTITY_ID}/setup",
+            json={"template_name": "uk_nope"},
+        )
+
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["type"] == "coa_error"
+    assert "uk_nope" in body["message"]
+
+
+def test_setup_coa_service_error_404_coa_error(client: TestClient) -> None:
+    """Any CoaServiceError maps to 404 {type:'coa_error'}."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.setup_entity",
+        new_callable=AsyncMock,
+    ) as mock_setup:
+        mock_setup.side_effect = CoaServiceError("COA exploded", status_code=400)
+        resp = client.post(
+            f"/api/v1/entities/{ENTITY_ID}/setup",
+            json={"template_name": "uk_limited_company_vat"},
+        )
+
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["type"] == "coa_error"
+    assert body["message"] == "COA exploded"
+
+
+def test_create_entity_duplicate_ledger_name_409(client: TestClient) -> None:
+    """F12: a duplicate ledger_name is a 409 {type:'duplicate_ledger_name'}."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.EntityService.create_entity",
+        new_callable=AsyncMock,
+    ) as mock_create:
+        mock_create.side_effect = DuplicateLedgerNameError("entity-abc123")
+        resp = client.post("/api/v1/entities", json={"name": "Acme Holdings Ltd"})
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["type"] == "duplicate_ledger_name"
+    assert "entity-abc123" in body["message"]
+
+
+def test_setup_already_set_up_409_body_shape(client: TestClient) -> None:
+    """F12: the already-set-up conflict is a 409 {type:'setup_error'}."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.setup_entity",
+        new_callable=AsyncMock,
+    ) as mock_setup:
+        mock_setup.side_effect = SetupError("Entity already set up")
+        resp = client.post(
+            f"/api/v1/entities/{ENTITY_ID}/setup",
+            json={"template_name": "uk_limited_company_vat"},
+        )
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["type"] == "setup_error"
+    assert "already set up" in body["message"]
 
 
 # ---------------------------------------------------------------------------

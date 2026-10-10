@@ -1,19 +1,24 @@
-"""Contract F11 end-to-end — entity setup through the real async ORM.
+"""Contract F11/F12 end-to-end — entity setup through the real async ORM.
 
-Drives EntityService + SetupService + TransactionService through a real
-SQLAlchemy async session against in-memory SQLite (the
-``test_transaction_orm_reversal`` DDL + ``gen_random_uuid`` shim pattern,
-extended with the users/entities/bank_accounts tables).  A scripted fake
-Formance records every mirror and serves the recorded mirrors back through
+Drives EntityService + SetupService + TransactionService + the F6
+orchestrator through a real SQLAlchemy async session against in-memory
+SQLite (the ``test_transaction_orm_reversal`` DDL + ``gen_random_uuid`` shim
+pattern, extended with the users/entities/bank_accounts tables).  A scripted
+fake Formance records every mirror (including the LEDGER NAME each mirror
+was written to) and serves the recorded mirrors back through
 ``list_transactions`` / ``get_balances``.
 
 Flow:
   create user (owner) → create entity → setup (uk_limited_company_vat +
   bank account + £10,000 opening capital) → COA loaded (65 accounts),
   balanced DRAFT legs (Dr 1000 1,000,000 / Cr 3000 1,000,000), no Formance
-  mirror yet (drafts are never posted by setup) → double setup refused →
-  approve via ``TransactionService.post_transaction`` (mirror recorded) →
-  ``verify_parity`` ok → status snapshot shows posted + parity.
+  mirror yet (drafts are never posted by setup) → double setup refused
+  (setup_state == complete) → approve via ``orchestrator.approve_entry`` —
+  the mirror is recorded against the ENTITY's ledger (entity-<hex>), not
+  "main" → ``verify_parity`` on that ledger ok → status snapshot shows
+  posted + parity.  A second test covers resumability: a mid-setup failure
+  leaves ``setup_state='in_progress'`` with the COA loaded, and a re-run
+  resumes without duplicating accounts/banks/drafts.
 """
 
 from __future__ import annotations
@@ -25,16 +30,21 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from src.config.database import Base
+from src.models.account import Account
+from src.models.bank_account import BankAccount
+from src.models.transaction import Transaction
 from src.models.user import User
+from src.services.bank_service import BankService
 from src.services.entity_service import EntityService
 from src.services.formance_client import formance_client
 from src.services.ledger_parity import verify_parity
+from src.services.orchestrator import approve_entry
 from src.services.setup_service import (
     SetupError,
     get_entity_status,
@@ -43,6 +53,7 @@ from src.services.setup_service import (
 from src.services.transaction_service import TransactionService
 from src.validators.entity import (
     EntityCreate,
+    EntityUpdate,
     SetupBankAccount,
     SetupOpeningBalanceItem,
     SetupOpeningBalances,
@@ -73,6 +84,7 @@ _SQLITE_SCHEMA = [
         vat_scheme VARCHAR(10),
         currency VARCHAR(3) NOT NULL DEFAULT 'GBP',
         ledger_name VARCHAR(64) NOT NULL UNIQUE,
+        setup_state VARCHAR(16) NOT NULL DEFAULT 'none',
         created_by CHAR(36) NOT NULL REFERENCES users(id),
         is_active BOOLEAN NOT NULL DEFAULT 1,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -184,6 +196,7 @@ class FakeFormance:
         self.transactions.append(
             {
                 "txid": txid,
+                "ledger": kwargs.get("ledger"),
                 "reference": kwargs.get("reference"),
                 "timestamp": kwargs.get("timestamp"),
                 "metadata": kwargs.get("metadata") or {},
@@ -249,6 +262,11 @@ async def test_entity_setup_e2e(monkeypatch) -> None:
         await db.commit()
 
         fake = FakeFormance()
+        parity_client = MagicMock()
+        parity_client.list_transactions = AsyncMock(
+            side_effect=fake.list_transactions
+        )
+        parity_client.get_balances = AsyncMock(side_effect=fake.get_balances)
         with (
             patch.object(
                 formance_client,
@@ -261,6 +279,7 @@ async def test_entity_setup_e2e(monkeypatch) -> None:
             patch.object(
                 formance_client, "health_check", AsyncMock(return_value=True)
             ),
+            patch("src.services.ledger_parity.formance_client", parity_client),
         ):
             # ---- create entity (created_by = the admin owner) ----
             entity = await EntityService.create_entity(
@@ -307,6 +326,7 @@ async def test_entity_setup_e2e(monkeypatch) -> None:
             assert len(result.bank_account_ids) == 1
             assert len(result.opening_transaction_ids) == 1
             assert result.opening_draft_total_pence == 1000000
+            assert entity.setup_state == "complete"
 
             # ---- idempotency: a second setup is refused ----
             with pytest.raises(SetupError, match="already set up"):
@@ -332,34 +352,249 @@ async def test_entity_setup_e2e(monkeypatch) -> None:
             # ---- drafts are NEVER mirrored by setup ----
             assert fake.transactions == []
 
-            # ---- approve via TransactionService.post_transaction ----
-            posted = await TransactionService.post_transaction(db, draft.id)
-            assert posted.status == "posted"
-            assert posted.reference == "JE-2026-0001"
+            # ---- approve via the orchestrator (entity present): the mirror
+            #      goes to the ENTITY's ledger, not "main" ----
+            approval = await approve_entry(db, draft.id)
+            assert approval.transaction.status == "posted"
+            assert approval.transaction.reference == "JE-2026-0001"
+            assert approval.parity_ok is True, approval.parity_report.summary
             assert len(fake.transactions) == 1
+            assert fake.transactions[0]["ledger"] == entity.ledger_name
+            assert fake.transactions[0]["ledger"].startswith("entity-")
 
-            # ---- parity: Formance is a faithful image of Postgres ----
-            parity_client = MagicMock()
-            parity_client.list_transactions = AsyncMock(
-                side_effect=fake.list_transactions
+            # ---- parity: Formance is a faithful image of Postgres on the
+            #      entity's own ledger ----
+            report = await verify_parity(db, ledger=entity.ledger_name)
+            assert report.ok is True, report.summary
+
+            # ---- status endpoint data reflects posted + parity ----
+            status = await get_entity_status(db, entity.id)
+            assert status.entity.id == entity.id
+            assert status.has_coa is True
+            assert status.account_count == 65
+            assert len(status.bank_accounts) == 1
+            assert status.pending_opening_transactions == []
+            assert status.ledger_name == entity.ledger_name
+            assert status.formance == "reachable"
+            assert status.parity == "ok"
+    finally:
+        await db.close()
+        await engine.dispose()
+
+
+async def test_entity_setup_resumes_after_partial_failure(monkeypatch) -> None:
+    """F12 resumability: a mid-setup failure persists 'in_progress' + the COA;
+    a re-run resumes — no duplicate accounts/banks/drafts — and completes."""
+    monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
+    engine = create_async_engine("sqlite+aiosqlite://", poolclass=StaticPool)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _register_gen_random_uuid(dbapi_conn, _record) -> None:
+        dbapi_conn.create_function("gen_random_uuid", 0, lambda: uuid.uuid4().hex)
+
+    async with engine.begin() as conn:
+        try:
+            await conn.run_sync(Base.metadata.create_all)
+        except SQLAlchemyError:
+            for ddl in _SQLITE_SCHEMA:
+                await conn.execute(text(ddl))
+
+    session_factory = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
+    db = session_factory()
+    try:
+        now = datetime.now(UTC)
+        owner = User(
+            id=uuid.uuid4(),
+            email="owner2@acme.test",
+            hashed_password="h",
+            display_name="Owner 2",
+            role="owner",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(owner)
+        await db.commit()
+
+        fake = FakeFormance()
+        with (
+            patch.object(
+                formance_client,
+                "create_transaction",
+                AsyncMock(side_effect=fake.create_transaction),
+            ),
+            patch.object(
+                formance_client, "create_ledger", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                formance_client, "health_check", AsyncMock(return_value=True)
+            ),
+        ):
+            entity = await EntityService.create_entity(
+                db,
+                EntityCreate(
+                    name="Resume Holdings Ltd",
+                    legal_type="limited_company",
+                ),
+                created_by=owner.id,
             )
-            parity_client.get_balances = AsyncMock(side_effect=fake.get_balances)
-            with patch(
-                "src.services.ledger_parity.formance_client", parity_client
-            ):
-                report = await verify_parity(db)
-                assert report.ok is True, report.summary
+            assert entity.setup_state == "none"
 
-                # ---- status endpoint data reflects posted + parity ----
-                status = await get_entity_status(db, entity.id)
-                assert status.entity.id == entity.id
-                assert status.has_coa is True
-                assert status.account_count == 65
-                assert len(status.bank_accounts) == 1
-                assert status.pending_opening_transactions == []
-                assert status.ledger_name == entity.ledger_name
-                assert status.formance == "reachable"
-                assert status.parity == "ok"
+            bank_accounts = [
+                SetupBankAccount(name="Barclays Business", opening_balance=1000)
+            ]
+            opening = SetupOpeningBalances(
+                opening_date=date(2026, 4, 6),
+                equity_account_code="3000",
+                assets=[
+                    SetupOpeningBalanceItem(
+                        code="1000",
+                        name="Bank Current Account",
+                        balance_pence=1000000,
+                    )
+                ],
+            )
+
+            # ---- simulate a mid-setup failure: the bank step blows up once
+            calls = {"n": 0}
+            real_create = BankService.create_account
+
+            async def flaky_create(db_session, data):
+                if calls["n"] == 0:
+                    calls["n"] += 1
+                    raise RuntimeError("bank service unavailable")
+                return await real_create(db_session, data)
+
+            monkeypatch.setattr(
+                BankService, "create_account", staticmethod(flaky_create)
+            )
+
+            with pytest.raises(RuntimeError, match="bank service unavailable"):
+                await setup_entity(
+                    db,
+                    entity.id,
+                    "uk_limited_company_vat",
+                    bank_accounts=bank_accounts,
+                    opening_balances=opening,
+                )
+
+            # ---- failure leaves 'in_progress' persisted + the COA loaded
+            refreshed = await EntityService.get_entity(db, entity.id)
+            assert refreshed is not None
+            assert refreshed.setup_state == "in_progress"
+            account_count = (
+                await db.execute(select(func.count()).select_from(Account))
+            ).scalar_one()
+            assert account_count == 65
+
+            # ---- re-run RESUMES: no duplicate COA / banks / drafts
+            result = await setup_entity(
+                db,
+                entity.id,
+                "uk_limited_company_vat",
+                bank_accounts=bank_accounts,
+                opening_balances=opening,
+            )
+            assert result.coa_count == 0  # COA skipped on resume
+            assert len(result.bank_account_ids) == 1
+            assert len(result.opening_transaction_ids) == 1
+            assert result.opening_draft_total_pence == 1000000
+
+            refreshed = await EntityService.get_entity(db, entity.id)
+            assert refreshed.setup_state == "complete"
+
+            bank_count = (
+                await db.execute(select(func.count()).select_from(BankAccount))
+            ).scalar_one()
+            assert bank_count == 1
+            draft_count = (
+                await db.execute(
+                    select(func.count())
+                    .select_from(Transaction)
+                    .where(Transaction.status == "draft")
+                )
+            ).scalar_one()
+            assert draft_count == 1
+
+            # ---- a completed setup still refuses a third run ----
+            with pytest.raises(SetupError, match="already set up"):
+                await setup_entity(
+                    db,
+                    entity.id,
+                    "uk_limited_company_vat",
+                    bank_accounts=bank_accounts,
+                    opening_balances=opening,
+                )
+    finally:
+        await db.close()
+        await engine.dispose()
+
+
+async def test_get_active_ledger_resolution_with_real_orm(monkeypatch) -> None:
+    """get_active_ledger against the real ORM: single active entity wins;
+    inactive-only or multiple-active resolves to 'main'."""
+    engine = create_async_engine("sqlite+aiosqlite://", poolclass=StaticPool)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _register_gen_random_uuid(dbapi_conn, _record) -> None:
+        dbapi_conn.create_function("gen_random_uuid", 0, lambda: uuid.uuid4().hex)
+
+    async with engine.begin() as conn:
+        try:
+            await conn.run_sync(Base.metadata.create_all)
+        except SQLAlchemyError:
+            for ddl in _SQLITE_SCHEMA:
+                await conn.execute(text(ddl))
+
+    session_factory = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
+    db = session_factory()
+    try:
+        now = datetime.now(UTC)
+        owner = User(
+            id=uuid.uuid4(),
+            email="owner3@acme.test",
+            hashed_password="h",
+            display_name="Owner 3",
+            role="owner",
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(owner)
+        await db.commit()
+
+        from src.services.entity_service import get_active_ledger
+
+        # No entities at all -> "main".
+        assert await get_active_ledger(db) == "main"
+
+        active = await EntityService.create_entity(
+            db,
+            EntityCreate(name="Active Holdings Ltd"),
+            created_by=owner.id,
+        )
+        # One active entity -> its ledger.
+        assert await get_active_ledger(db) == active.ledger_name
+
+        retired = await EntityService.create_entity(
+            db,
+            EntityCreate(name="Retired Holdings Ltd"),
+            created_by=owner.id,
+        )
+        # Two active entities -> deterministic "main".
+        assert await get_active_ledger(db) == "main"
+
+        # Deactivate one -> the single active entity's ledger wins again.
+        await EntityService.update_entity(db, retired.id, EntityUpdate(is_active=False))
+        assert await get_active_ledger(db) == active.ledger_name
+
+        # Deactivate the last one -> "main".
+        await EntityService.update_entity(db, active.id, EntityUpdate(is_active=False))
+        assert await get_active_ledger(db) == "main"
     finally:
         await db.close()
         await engine.dispose()

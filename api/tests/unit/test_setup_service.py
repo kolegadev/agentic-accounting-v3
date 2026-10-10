@@ -1,4 +1,10 @@
-"""Unit tests for SetupService (Contract F11) with mocked DB/Formance."""
+"""Unit tests for SetupService (Contract F11/F12) with mocked DB/Formance.
+
+F12 semantics: ``setup_state`` lifecycle (none → in_progress → complete).
+Refusal only for COMPLETE setups; partial setups resume with clean step
+skips (COA when accounts exist, banks when a bank exists, opening balances
+when a draft exists).  ``create_ledger`` is always attempted.
+"""
 
 from __future__ import annotations
 
@@ -42,22 +48,24 @@ def mock_db() -> AsyncMock:
     return db
 
 
-def make_entity() -> Entity:
-    return Entity(
-        id=ENTITY_ID,
-        name="Acme Holdings Ltd",
-        legal_type="limited_company",
-        framework="uk-gaap",
-        fiscal_year_start="04-06",
-        vat_registered=True,
-        vat_scheme="standard",
-        currency="GBP",
-        ledger_name="entity-acme123",
-        created_by=uuid.uuid4(),
-        is_active=True,
-        created_at=NOW,
-        updated_at=NOW,
-    )
+def make_entity(**overrides) -> Entity:
+    kwargs = {
+        "id": ENTITY_ID,
+        "name": "Acme Holdings Ltd",
+        "legal_type": "limited_company",
+        "framework": "uk-gaap",
+        "fiscal_year_start": "04-06",
+        "vat_registered": True,
+        "vat_scheme": "standard",
+        "currency": "GBP",
+        "ledger_name": "entity-acme123",
+        "created_by": uuid.uuid4(),
+        "is_active": True,
+        "created_at": NOW,
+        "updated_at": NOW,
+    }
+    kwargs.update(overrides)
+    return Entity(**kwargs)
 
 
 def make_account_response(code: str, name: str, category: str, type_: str) -> AccountResponse:
@@ -111,17 +119,23 @@ async def _fake_create_transaction(db, data):
 
 @pytest.fixture
 def setup_patches(mock_db: AsyncMock):
-    """Patch the collaborators setup_entity calls."""
+    """Patch the collaborators setup_entity calls.
+
+    DB execute calls in order: account count (COA skip check), bank count
+    (bank skip check), draft count (opening skip check), then the
+    all-accounts query inside ``_create_opening_draft``.
+    """
     bank_1000 = make_orm_account("1000", "Bank Current Account", "Asset", "Bank")
     equity_3000 = make_orm_account("3000", "Share Capital", "Equity", "Equity")
 
-    # Guard passes (0 accounts); the all-accounts query returns the COA rows.
     call_index = {"n": 0}
+    counts = {"accounts": 0, "banks": 0, "drafts": 0}
 
     def _execute(stmt, *args, **kwargs):
         call_index["n"] += 1
-        if call_index["n"] == 1:
-            return count_result(0)
+        if call_index["n"] <= 3:
+            values = [counts["accounts"], counts["banks"], counts["drafts"]]
+            return count_result(values[call_index["n"] - 1])
         return accounts_result([bank_1000, equity_3000])
 
     mock_db.execute.side_effect = _execute
@@ -183,6 +197,8 @@ def setup_patches(mock_db: AsyncMock):
             "ledger": mock_ledger,
             "create_tx": mock_create_tx,
             "coa_responses": coa_responses,
+            "counts": counts,
+            "entity": entity,
         }
 
 
@@ -209,29 +225,44 @@ async def test_setup_unknown_entity_404(mock_db: AsyncMock) -> None:
 
 
 @pytest.mark.asyncio
-async def test_setup_refuses_when_coa_already_loaded(mock_db: AsyncMock) -> None:
-    """Existing accounts -> SetupError, and load_template is NEVER called."""
-    entity = make_entity()
-    mock_db.execute.return_value = count_result(3)
+async def test_setup_refuses_only_when_state_complete(
+    setup_patches, mock_db: AsyncMock
+) -> None:
+    """A COMPLETE entity refuses (409) before touching the COA."""
+    setup_patches["entity"].setup_state = "complete"
 
-    with patch(
-        "src.services.setup_service.EntityService.get_entity",
-        AsyncMock(return_value=entity),
-    ):
-        with patch(
-            "src.services.setup_service.CoaService.load_template",
-            AsyncMock(),
-        ) as mock_load_template:
-            with pytest.raises(SetupError, match="already set up") as excinfo:
-                await setup_entity(mock_db, ENTITY_ID, "uk_limited_company_vat")
+    with pytest.raises(SetupError, match="already set up") as excinfo:
+        await setup_entity(mock_db, ENTITY_ID, "uk_limited_company_vat")
 
     assert excinfo.value.status_code == 409
-    mock_load_template.assert_not_awaited()
+    setup_patches["load_template"].assert_not_awaited()
+    setup_patches["ledger"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_resume_skips_coa_when_accounts_exist(
+    setup_patches, mock_db: AsyncMock
+) -> None:
+    """Accounts already exist + state not complete → COA load SKIPPED, setup
+    continues (banks/ledger still run) and finishes complete."""
+    setup_patches["counts"]["accounts"] = 65
+
+    result = await setup_entity(
+        mock_db,
+        ENTITY_ID,
+        "uk_limited_company_vat",
+        bank_accounts=[SetupBankAccount(name="Barclays", opening_balance=1000)],
+    )
+
+    setup_patches["load_template"].assert_not_awaited()
+    assert result.coa_count == 0
+    assert result.bank_account_ids == [BANK_ACCOUNT_ID]
+    assert setup_patches["entity"].setup_state == "complete"
 
 
 @pytest.mark.asyncio
 async def test_double_setup_refused(setup_patches, mock_db: AsyncMock) -> None:
-    """First setup succeeds; a second run refuses before touching the COA."""
+    """First setup succeeds (state → complete); a second run refuses."""
     result = await setup_entity(
         mock_db,
         ENTITY_ID,
@@ -240,14 +271,103 @@ async def test_double_setup_refused(setup_patches, mock_db: AsyncMock) -> None:
         opening_balances=OPENING,
     )
     assert result.coa_count == 2
-
-    # Second call: the guard sees accounts > 0.
-    mock_db.execute.side_effect = [count_result(2)]
+    assert setup_patches["entity"].setup_state == "complete"
 
     with pytest.raises(SetupError, match="already set up"):
         await setup_entity(mock_db, ENTITY_ID, "uk_limited_company_vat")
 
     assert setup_patches["load_template"].await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Resumability — step skips and state transitions
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resume_skips_banks_when_bank_exists(
+    setup_patches, mock_db: AsyncMock
+) -> None:
+    """A bank account already exists → create_account NOT called again."""
+    setup_patches["counts"]["banks"] = 1
+
+    result = await setup_entity(
+        mock_db,
+        ENTITY_ID,
+        "uk_limited_company_vat",
+        bank_accounts=[SetupBankAccount(name="Barclays", opening_balance=1000)],
+    )
+
+    setup_patches["create_bank"].assert_not_awaited()
+    assert result.bank_account_ids == []
+    assert setup_patches["entity"].setup_state == "complete"
+
+
+@pytest.mark.asyncio
+async def test_resume_skips_opening_when_draft_exists(
+    setup_patches, mock_db: AsyncMock
+) -> None:
+    """A draft transaction already exists → opening balances NOT recreated."""
+    setup_patches["counts"]["drafts"] = 1
+
+    result = await setup_entity(
+        mock_db, ENTITY_ID, "uk_limited_company_vat", opening_balances=OPENING
+    )
+
+    setup_patches["create_tx"].assert_not_awaited()
+    assert result.opening_transaction_ids == []
+    assert result.opening_draft_total_pence == 0
+    assert setup_patches["entity"].setup_state == "complete"
+
+
+@pytest.mark.asyncio
+async def test_create_ledger_always_attempted_even_on_full_resume(
+    setup_patches, mock_db: AsyncMock
+) -> None:
+    """create_ledger is idempotent and ALWAYS called — even when every
+    other step is skipped on resume."""
+    setup_patches["counts"]["accounts"] = 65
+    setup_patches["counts"]["banks"] = 1
+    setup_patches["counts"]["drafts"] = 1
+    setup_patches["entity"].setup_state = "in_progress"
+
+    result = await setup_entity(
+        mock_db,
+        ENTITY_ID,
+        "uk_limited_company_vat",
+        bank_accounts=[SetupBankAccount(name="Barclays", opening_balance=1000)],
+        opening_balances=OPENING,
+    )
+
+    setup_patches["ledger"].assert_awaited_once_with("entity-acme123")
+    setup_patches["load_template"].assert_not_awaited()
+    setup_patches["create_bank"].assert_not_awaited()
+    setup_patches["create_tx"].assert_not_awaited()
+    assert result.coa_count == 0
+    assert setup_patches["entity"].setup_state == "complete"
+
+
+@pytest.mark.asyncio
+async def test_in_progress_state_committed_before_heavy_steps(
+    mock_db: AsyncMock,
+) -> None:
+    """The in_progress transition is COMMITTED first — a failure in a later
+    step leaves in_progress persisted (resume, not refusal)."""
+    entity = make_entity()
+    mock_db.execute.side_effect = [count_result(0)]
+
+    with patch(
+        "src.services.setup_service.EntityService.get_entity",
+        AsyncMock(return_value=entity),
+    ):
+        with patch(
+            "src.services.setup_service.CoaService.load_template",
+            AsyncMock(side_effect=RuntimeError("template load failed")),
+        ):
+            with pytest.raises(RuntimeError, match="template load failed"):
+                await setup_entity(mock_db, ENTITY_ID, "uk_limited_company_vat")
+
+    assert entity.setup_state == "in_progress"
+    assert mock_db.commit.await_count >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +435,10 @@ async def test_opening_balance_facts_produce_balanced_draft(
         "src.services.setup_service.TransactionService.post_transaction",
         AsyncMock(),
     ) as mock_post:
+        setup_patches["entity"].setup_state = "none"  # fresh lifecycle
         mock_db.execute.side_effect = [
+            count_result(0),
+            count_result(0),
             count_result(0),
             accounts_result([bank_1000, equity_3000]),
         ]

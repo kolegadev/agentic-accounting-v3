@@ -458,6 +458,10 @@ async def test_approve_posts_mirrors_and_runs_parity(
             "src.services.orchestrator.verify_parity",
             AsyncMock(return_value=parity),
         ) as mock_parity,
+        patch(
+            "src.services.orchestrator.get_active_ledger",
+            AsyncMock(return_value="main"),
+        ),
     ):
         result = await approve_entry(mock_db, draft.id)
 
@@ -504,6 +508,10 @@ async def test_approve_parity_drift_flagged_but_result_returned(
         patch(
             "src.services.orchestrator.verify_parity",
             AsyncMock(return_value=drift),
+        ),
+        patch(
+            "src.services.orchestrator.get_active_ledger",
+            AsyncMock(return_value="main"),
         ),
     ):
         result = await approve_entry(mock_db, draft.id)
