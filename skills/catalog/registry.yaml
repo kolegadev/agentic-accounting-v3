@@ -1,0 +1,65 @@
+# Transaction-type skill catalog registry — Contract F3.
+# Every transaction skill under transactions/<id>/SKILL.md MUST be listed
+# here; every path listed here MUST exist. Bidirectionality is validated by
+# api/tests/test_skill_catalog.py. The MCP tool registry skills/registry.yaml
+# is a separate file and is NOT part of this catalog.
+- id: supplier-invoice
+  name: Purchase on credit (with & without VAT variants)
+  category: transaction
+  frameworks: [uk-gaap, ifrs]
+  status: v0
+  path: transactions/supplier-invoice/SKILL.md
+- id: supplier-payment
+  name: Pay an AP balance from bank
+  category: transaction
+  frameworks: [uk-gaap, ifrs]
+  status: v0
+  path: transactions/supplier-payment/SKILL.md
+- id: sales-invoice
+  name: Sale on credit (with & without VAT variants)
+  category: transaction
+  frameworks: [uk-gaap, ifrs]
+  status: v0
+  path: transactions/sales-invoice/SKILL.md
+- id: customer-receipt
+  name: Receive an AR balance into bank
+  category: transaction
+  frameworks: [uk-gaap, ifrs]
+  status: v0
+  path: transactions/customer-receipt/SKILL.md
+- id: bank-transfer
+  name: Transfer between own bank accounts
+  category: transaction
+  frameworks: [uk-gaap, ifrs]
+  status: v0
+  path: transactions/bank-transfer/SKILL.md
+- id: journal-accrual
+  name: Accrued expense / provision journal
+  category: transaction
+  frameworks: [uk-gaap, ifrs]
+  status: v0
+  path: transactions/journal-accrual/SKILL.md
+- id: prepayment
+  name: Prepaid expense & deferred income
+  category: transaction
+  frameworks: [uk-gaap, ifrs]
+  status: v0
+  path: transactions/prepayment/SKILL.md
+- id: depreciation
+  name: Monthly straight-line depreciation
+  category: transaction
+  frameworks: [uk-gaap, ifrs]
+  status: v0
+  path: transactions/depreciation/SKILL.md
+- id: payroll
+  name: Net pay + PAYE/NIC liabilities
+  category: transaction
+  frameworks: [uk-gaap, ifrs]
+  status: v0
+  path: transactions/payroll/SKILL.md
+- id: opening-balances
+  name: Initial capital, assets, liabilities
+  category: transaction
+  frameworks: [uk-gaap, ifrs]
+  status: v0
+  path: transactions/opening-balances/SKILL.md
