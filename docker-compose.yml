@@ -95,6 +95,9 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_URI: postgresql://${DB_USER:-accounting}:${DB_PASSWORD:-accounting}@formance-postgres:5432/formance?sslmode=disable
+    ports:
+      # Host access for the F14 live e2e suite (curl/_info, tests/live).
+      - "${FORNANCE_PORT:-3068}:3068"
     depends_on:
       formance-postgres:
         condition: service_healthy
