@@ -2,7 +2,7 @@
 id: supplier-invoice
 name: Purchase on credit (with & without VAT variants)
 category: transaction
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -162,5 +162,12 @@ Debits 25000 == credits 25000. One Formance posting:
   discounted (IFRS 9 §5.1.3). Inventory purchases follow IAS 2 versus
   FRS 102 §13 — the debit leg class (Expense vs Asset) must match the
   entity's inventory policy.
-- us-gaap: TODO — US sales/use tax on purchases may be non-recoverable and
-  capitalised into cost; there is no input/output VAT split.
+- us-gaap (ASC 330): no VAT — there is no input/output split and no
+  `2220` input-VAT recovery account. State and local sales tax charged by
+  the vendor is excluded from cost only when the purchase qualifies for a
+  resale or direct-use exemption certificate; otherwise the tax is part
+  of the item's cost (ASC 330-10-30 includes acquisition taxes in
+  inventory cost), so the debit leg grows instead of being recovered.
+  Where the vendor collects no tax, the buyer self-assesses use tax at
+  the local rate and books Dr expense/asset / Cr sales-and-use-tax
+  payable — a liability remitted to the state, never a VAT reclaim.

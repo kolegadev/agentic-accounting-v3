@@ -2,7 +2,7 @@
 id: balance-sheet
 name: Statement of financial position (balance sheet)
 category: report
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -87,9 +87,17 @@ of posted/reversed postings, integer pence (see Formance interaction).
   balance sheet (fewer line items, minimal notes); iXBRL tagging to the
   FRS 102 / FRS 105 taxonomies (HMRC CT600; Companies House structured
   filing from April 2027).
-- us-gaap: TODO — ASC 210-10 presents current assets first (decreasing
-  liquidity); deferred taxes presented separately under ASC 740; no
-  Companies-Act-style formats.
+- us-gaap (ASC 210-10): classified balance sheet with current assets
+  FIRST in decreasing liquidity, then non-current assets, then
+  liabilities, then equity — the mirror image of IFRS's permitted
+  non-current-first ordering, and no Companies-Act-style "net assets"
+  presentation (A = L + E is the format). Current classification turns on
+  the one-year/operating-cycle rule (ASC 210-10-45-5). Deferred tax
+  assets and liabilities are ALWAYS non-current under ASC 740-10-45-4
+  regardless of expected reversal timing — a classification IAS 1 does
+  not force. Leases keep ASC 842's operating/finance dual model (no
+  IFRS 16 single model), so lease accounts remain a client-created COA
+  concern, not a framework difference in the line recipe.
 
 ## Formance interaction
 

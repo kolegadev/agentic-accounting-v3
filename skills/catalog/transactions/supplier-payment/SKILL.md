@@ -2,7 +2,7 @@
 id: supplier-payment
 name: Pay an AP balance from bank
 category: transaction
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -115,6 +115,13 @@ Debits 60000 == credits 60000. One Formance posting:
   derecognition when the obligation is discharged; posting identical.
 - IFRS (IFRS 9 §3.2): same derecognition outcome for a settled trade
   payable; no measurement gain/loss arises on a GBP-to-GBP settlement.
-- us-gaap: TODO — posting mechanics identical (ASC 405), but US entities
-  track sales/use tax rather than VAT; check the liability account mapped
-  in the chart of accounts.
+- us-gaap (ASC 405 / ASC 605-50 / ASC 606): the settlement DR/CR shape is
+  identical — ASC 405 derecognises the payable when it is discharged.
+  What differs is the surrounding treatment. A prompt-payment discount
+  the supplier grants is a reduction of the purchase price (ASC 606's
+  consideration framework; ASC 605-50's customer-payments-and-incentives
+  guidance for legacy arrangements) — taken against cost, never booked as
+  income. The sales-tax element mirrors the output side: tax is never an
+  expense of the buyer — an exempt purchase keeps it out of cost, and a
+  self-assessed use-tax remittance to the state is Dr use-tax payable /
+  Cr bank. There is no input-VAT credit chain to settle.

@@ -2,7 +2,7 @@
 id: payroll
 name: Net pay + PAYE/NIC liabilities
 category: transaction
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -205,7 +205,15 @@ Debits 7500 == credits 7500. One Formance posting:
   rendered, with an accrual for unpaid wages and holiday pay at period end
   — IAS 19's accrued-holiday requirement is explicit, FRS 102 §28 achieves
   the same via the accrual skill; the payroll posting itself is identical.
-- us-gaap: TODO — ASC 710 governs compensation; there is no PAYE/NIC
-  concept — US entities withhold federal/state income tax and FICA
-  (Social Security/Medicare), mapped to equivalent liability accounts;
-  401(k) matching replaces auto-enrolment pension contributions.
+- us-gaap (ASC 710): gross pay is expensed as the employee renders
+  service — the posting shape is identical, but every tax differs from
+  PAYE/NIC. FICA: Social Security 6.2% + Medicare 1.45%, each charged to
+  BOTH employee (withheld from gross) and employer (employer-expense),
+  plus a 0.9% employee-only Medicare surtax above the high-earner
+  threshold. FUTA (federal unemployment) is employer-only — 6.0% on the
+  first $7,000 of wages, 0.6% effective with the standard state credit;
+  SUTA (state unemployment) is employer-only at state-set rates. Federal
+  and state income tax are withheld from gross. All withheld amounts are
+  liabilities remitted on Form 941 (quarterly) and Form 940 (annual);
+  401(k) deferrals replace auto-enrolment pensions — the `2030` PAYE/NIC
+  account is a UK construct with no US equivalent.

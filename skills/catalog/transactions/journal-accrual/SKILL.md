@@ -2,7 +2,7 @@
 id: journal-accrual
 name: Accrued expense / provision journal
 category: transaction
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -145,6 +145,13 @@ supplier-invoice skill.
   measurement thresholds can differ from FRS 102 §21 (e.g. constructive
   obligations, restructuring provisions). The accrual shape itself is
   framework-neutral.
-- us-gaap: TODO — ASC 450 loss contingencies use a "probable" threshold
-  that is higher than IAS 37's "more likely than not" in some cases, which
-  changes WHETHER a provision is recognised, not the DR/CR shape.
+- us-gaap (ASC 450 / ASC 720): two different accrual families. Ordinary
+  expense accruals (utilities, fees, wages owed) follow ASC 720 — expensed
+  as incurred once the amount is estimable. Loss contingencies follow
+  ASC 450-20: accrue only when the loss is PROBABLE (likely to occur) AND
+  reasonably estimable; disclose when reasonably possible; no accrual for
+  remote or merely possible losses. "Probable" is a higher bar than
+  IAS 37's "more likely than not", so some provisions a UK/IFRS reporter
+  recognises are disclosure-only in the US — and the US model has no
+  constructive-obligation concept. The DR/CR shape is identical; the
+  recognition trigger is not.

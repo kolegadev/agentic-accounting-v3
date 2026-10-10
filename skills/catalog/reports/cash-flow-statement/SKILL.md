@@ -2,7 +2,7 @@
 id: cash-flow-statement
 name: Cash flow statement (indirect method)
 category: report
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -85,10 +85,18 @@ integer pence; ΔX = closing balance − opening balance.
   separately (policy: operating or financing). FRS 102 §1A small
   entities and FRS 105 micro-entities are NOT required to prepare a
   cash flow statement at all.
-- us-gaap: TODO — ASC 230 ENCOURAGES the direct method (major classes
-  of gross operating receipts and payments); interest paid, interest
-  received and income taxes are classified operating; dividends paid
-  financing; three years of cash flow statements vs two under IFRS.
+- us-gaap (ASC 230): operating/investing/financing classification is
+  mandatory and the indirect method is near-universal in practice, though
+  ASC 230-10-45-25 ENCOURAGES the direct method (gross major classes of
+  operating receipts and payments). Unlike IAS 7's policy choice,
+  interest paid, interest received, dividends received and income taxes
+  paid are classified OPERATING (dividends paid are financing) — no
+  discretion. Regardless of method, ASC 230-10-50-2 REQUIRES supplemental
+  disclosure of interest paid and income taxes paid, and non-cash
+  investing/financing activity must be disclosed (ASC 230-10-50-3) — an
+  interest-paid mandate IAS 7 does not have. Public companies present
+  three years of statements of cash flows; IFRS requires one comparative
+  year.
 
 ## Formance interaction
 

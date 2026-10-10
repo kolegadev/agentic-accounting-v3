@@ -2,7 +2,7 @@
 id: trial-balance
 name: Trial balance (debits equal credits)
 category: report
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -65,12 +65,18 @@ ledger is broken and no other report may be produced.
 ## Framework variants
 
 - The trial balance is a framework-agnostic internal control report:
-  neither FRS 102 nor IFRS prescribes its format. It feeds the financial
-  statements and the iXBRL tagging layer (FRS 102 / FRS 105 taxonomies
-  for HMRC and Companies House filings).
-- us-gaap: TODO — same internal artifact with no standard format; US
-  audit practice uses "working trial balances" with adjustment columns
-  (not modelled here).
+  neither FRS 102, IFRS nor US GAAP prescribes its format (no ASC topic
+  governs it). It feeds the financial statements and the filing layer —
+  the iXBRL tagging layer (FRS 102 / FRS 105 taxonomies for HMRC and
+  Companies House filings) or SEC XBRL for US registrants.
+- us-gaap: the same artifact, named the working trial balance in US audit
+  practice, which distinguishes unadjusted, adjusted and post-closing
+  columns: the unadjusted TB comes straight from the ledger, adjustment
+  columns carry audit/AJE entries, and the post-closing TB (P&L accounts
+  closed to retained earnings, as in the worked example) is the tie-out
+  to the final ASC 210-10 balance sheet and ASC 220 income statement and
+  to the audit lead schedules. None of that changes the debits-equal-
+  credits identity.
 
 ## Formance interaction
 

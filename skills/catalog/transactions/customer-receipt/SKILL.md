@@ -2,7 +2,7 @@
 id: customer-receipt
 name: Receive an AR balance into bank
 category: transaction
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -106,6 +106,14 @@ Debits 60000 == credits 60000. One Formance posting:
   identical.
 - IFRS (IFRS 9 §3.2): same derecognition outcome for a settled trade
   receivable; no gain/loss arises on a GBP-to-GBP settlement.
-- us-gaap: TODO — posting mechanics identical (ASC 310), but note the US
-  allowance-for-credit-losses model (CECL) affects the receivable's
-  carrying value, not the receipt entry itself.
+- us-gaap (ASC 310-10): the receipt entry is identical — Dr bank / Cr the
+  receivable at its carrying amount. What differs is the surrounding US
+  receivable model: an allowance for doubtful accounts sits against the
+  receivable, estimated by aging schedule or another expected-credit-loss
+  method (ASC 310-10-35, and the current-expected-credit-loss model of
+  ASC 326-20 for most entities), so the receipt settles a net-carrying-
+  value receivable and bad-debt write-offs move the allowance, never the
+  receipt entry. The collected sales-tax element follows the remittance
+  cycle: the receipt clears the receivable in full, while Dr sales-tax
+  payable / Cr bank pays the state on its monthly or quarterly filing —
+  two separate, P&L-neutral cash flows.

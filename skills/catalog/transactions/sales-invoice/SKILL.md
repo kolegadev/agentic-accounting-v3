@@ -2,7 +2,7 @@
 id: sales-invoice
 name: Sale on credit (with & without VAT variants)
 category: transaction
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -164,6 +164,14 @@ Debits 25000 == credits 25000. One Formance posting:
   coincide with FRS 102; multi-element contracts or distinct service
   obligations may defer revenue where FRS 102 would not — for v0 the
   day-to-day posting is identical, but flag multi-element invoices.
-- us-gaap: TODO — ASC 606 mirrors IFRS 15 with additional industry
-  guidance; US entities book sales tax as a liability rather than output
-  VAT, and sales tax is excluded from revenue on the income statement.
+- us-gaap (ASC 606): five-step model — (1) identify the contract with a
+  customer, (2) identify the performance obligations, (3) determine the
+  transaction price, (4) allocate the price to the obligations, and
+  (5) recognise revenue when (or as) each obligation is satisfied.
+  Point-in-time goods sales post identically to IFRS 15, but US GAAP sets
+  the "probable" collectibility bar higher (~75–80%) and offers a policy
+  election to exclude sales taxes from the transaction price. Sales tax
+  charged to the customer is collected on behalf of the state (ASC
+  606-10-32-2A): Cr sales-tax payable, never revenue — the `2210` output
+  VAT account is a UK construct. The receivable is an ASC 310-10
+  financial asset at the invoice amount.

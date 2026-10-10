@@ -2,7 +2,7 @@
 id: profit-and-loss
 name: Income statement (profit and loss)
 category: report
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -96,9 +96,17 @@ Identity: Σ revenue − Σ expense = profit, exact in pence.
   depreciation as separate lines — this COA's layout is by nature).
   FRS 102 §1A small entities may file abbreviated accounts; FRS 105
   micro-entities do not file a P&L at all.
-- us-gaap: TODO — ASC 205/220 prescribe no single format: single-step or
-  multiple-step; SEC Regulation S-X 5-03 line items apply to public
-  filers; three years of income statements vs two under IFRS.
+- us-gaap (ASC 220 / ASC 205): no IFRS 18-style five-category mandate —
+  US GAAP prescribes no single income-statement format: single-step or
+  multiple-step (operating and non-operating separated) is acceptable;
+  this COA's by-nature layout fits either. SEC registrants must present
+  the Regulation S-X Rule 5-03 line items (net sales, cost of sales,
+  SG&A, income-tax expense, per-share amounts) — public-company only.
+  Income from discontinued operations is presented separately, net of
+  tax, below income from continuing operations (ASC 205-20), and there is
+  no extraordinary-items category (deleted by ASU 2015-01). Public
+  companies present three years of income statements; IFRS requires one
+  comparative year.
 
 ## Formance interaction
 

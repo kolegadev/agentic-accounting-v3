@@ -2,7 +2,7 @@
 id: prepayment
 name: Prepaid expense & deferred income
 category: transaction
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -198,6 +198,14 @@ Debits 10000 == credits 10000. One Formance posting:
   follow the matching principle — day-to-day postings are identical, but
   IFRS 15 requires assessing distinct performance obligations for the
   deferred-income release pattern.
-- us-gaap: TODO — ASC 340-10 governs prepaid expenses; ASC 606 contract
-  liabilities mirror IFRS 15; the DR/CR shape is the same but the release
-  pattern follows US GAAP's performance-obligation analysis.
+- us-gaap (ASC 340-10 / ASC 606): expense prepayments follow ASC 340-10 —
+  a prepaid expense is an asset until the benefit is consumed (insurance,
+  rent), released on the matching pattern; day-to-day posting identical.
+  Customer prepayments are contract liabilities under ASC 606-10-45-2:
+  revenue is recognised only as each performance obligation is satisfied,
+  using the same five-step analysis as the sales-invoice skill. The
+  release pattern follows the US performance-obligation assessment, which
+  can differ from FRS 102's looser matching — e.g. a refundable deposit
+  can stay a liability under ASC 606 where FRS 102 would release it.
+  Terminology: "deferred revenue" and "contract liability" are the same
+  balance.

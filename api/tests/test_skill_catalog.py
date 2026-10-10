@@ -67,7 +67,7 @@ REQUIRED_SECTIONS = [
     "Framework variants",
 ]
 
-VALID_FRAMEWORKS = {"uk-gaap", "ifrs"}
+VALID_FRAMEWORKS = {"uk-gaap", "ifrs", "us-gaap"}
 
 FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 SECTION_RE = re.compile(r"^## (.+?)\s*$", re.MULTILINE)
@@ -510,3 +510,44 @@ def test_accounting_ground_truth_postings() -> None:
             ("3000", 150000): 1,
         }
     ), "opening balances: Cr equity 3000 must absorb the residual"
+
+
+# ---------------------------------------------------------------------------
+# Check 9 (F16): US GAAP completeness across the whole catalog
+# ---------------------------------------------------------------------------
+
+ASC_RE = re.compile(r"ASC \d{3}")
+
+
+def test_us_gaap_catalog_complete() -> None:
+    """Contract F16: no TODO literal anywhere in skills/catalog/; every
+    SKILL.md's Framework variants section carries at least one ASC ddd
+    citation; frontmatter frameworks includes us-gaap and matches the
+    registry entry."""
+    for path in sorted(CATALOG_DIR.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(CATALOG_DIR)
+        assert "TODO" not in path.read_text(encoding="utf-8"), (
+            f"{rel}: TODO literal found in the catalog"
+        )
+
+    registry = {entry["id"]: entry for entry in _registry()}
+    for path in sorted(CATALOG_DIR.rglob("SKILL.md")):
+        skill_id = path.parent.name
+        text = path.read_text(encoding="utf-8")
+        section = _section_text(text, "Framework variants")
+        assert ASC_RE.search(section), (
+            f"{skill_id}: Framework variants section lacks an 'ASC ddd' "
+            "citation"
+        )
+        fm = _frontmatter(text)
+        assert "us-gaap" in fm["frameworks"], (
+            f"{skill_id}: frontmatter frameworks missing us-gaap"
+        )
+        assert skill_id in registry, f"{skill_id}: missing from registry"
+        assert registry[skill_id]["frameworks"] == fm["frameworks"], (
+            f"{skill_id}: registry frameworks {registry[skill_id]['frameworks']} "
+            f"!= frontmatter {fm['frameworks']}"
+        )
+

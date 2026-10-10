@@ -2,7 +2,7 @@
 id: depreciation
 name: Monthly straight-line depreciation
 category: transaction
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -114,7 +114,14 @@ Debits 5000 == credits 5000. One Formance posting:
   separately), annual review of useful life and residual, and a revaluation
   model option — the monthly charge shape is the same, but the input
   (component lives) differs for larger assets.
-- us-gaap: TODO — ASC 360-10 uses similar straight-line mechanics but
-  different component conventions and no annual useful-life review
-  requirement mirroring IAS 16; book depreciation also diverges from
-  MACRS tax depreciation, which is never booked to the ledger.
+- us-gaap (ASC 360-10): book depreciation is straight-line or another
+  systematic method over useful life — the monthly shape matches. US
+  differences: component depreciation is permitted where parts have
+  materially different lives but is not mandated the way IAS 16's
+  componentisation is; there is no revaluation model (US GAAP forbids
+  upward revaluation — cost model only); no annual useful-life review is
+  required. Impairment follows ASC 360-10's recoverability test: an
+  impaired asset is written down to fair value, and the write-down is
+  PERMANENT — US GAAP forbids reversal where IAS 36 allows it. MACRS is
+  tax depreciation only and is never booked to the ledger; the book/tax
+  timing difference is a deferred-tax item under ASC 740.

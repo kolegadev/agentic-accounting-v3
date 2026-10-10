@@ -9,90 +9,90 @@
 - id: supplier-invoice
   name: Purchase on credit (with & without VAT variants)
   category: transaction
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/supplier-invoice/SKILL.md
 - id: supplier-payment
   name: Pay an AP balance from bank
   category: transaction
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/supplier-payment/SKILL.md
 - id: sales-invoice
   name: Sale on credit (with & without VAT variants)
   category: transaction
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/sales-invoice/SKILL.md
 - id: customer-receipt
   name: Receive an AR balance into bank
   category: transaction
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/customer-receipt/SKILL.md
 - id: bank-transfer
   name: Transfer between own bank accounts
   category: transaction
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/bank-transfer/SKILL.md
 - id: journal-accrual
   name: Accrued expense / provision journal
   category: transaction
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/journal-accrual/SKILL.md
 - id: prepayment
   name: Prepaid expense & deferred income
   category: transaction
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/prepayment/SKILL.md
 - id: depreciation
   name: Monthly straight-line depreciation
   category: transaction
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/depreciation/SKILL.md
 - id: payroll
   name: Net pay + PAYE/NIC liabilities
   category: transaction
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/payroll/SKILL.md
 - id: opening-balances
   name: Initial capital, assets, liabilities
   category: transaction
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/opening-balances/SKILL.md
 - id: profit-and-loss
   name: Income statement (profit and loss)
   category: report
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: reports/profit-and-loss/SKILL.md
 - id: balance-sheet
   name: Statement of financial position (balance sheet)
   category: report
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: reports/balance-sheet/SKILL.md
 - id: trial-balance
   name: Trial balance (debits equal credits)
   category: report
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: reports/trial-balance/SKILL.md
 - id: cash-flow-statement
   name: Cash flow statement (indirect method)
   category: report
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: reports/cash-flow-statement/SKILL.md
 - id: funds-statement
   name: Statement of sources and application of funds
   category: report
-  frameworks: [uk-gaap, ifrs]
+  frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: reports/funds-statement/SKILL.md

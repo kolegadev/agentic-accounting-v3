@@ -2,7 +2,7 @@
 id: bank-transfer
 name: Transfer between own bank accounts
 category: transaction
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -97,10 +97,12 @@ Debits 50000 == credits 50000. One Formance posting:
 
 ## Framework variants
 
-- uk-gaap (FRS 102) and IFRS (IAS 1): the posting is framework-neutral.
-  Presentation-only difference: where an entity has a legally enforceable
-  right of offset, a bank overdraft may be netted against a positive
-  balance with the same bank under IAS 1.71 / FRS 102 equivalent — this
-  affects balance-sheet presentation, not the journal.
-- us-gaap: TODO — posting identical; US practice around offsetting (ASC
-  210-20) is stricter than IAS 1.71 in some cases.
+- uk-gaap (FRS 102), IFRS (IAS 1.71) and us-gaap (ASC 210-20): the posting
+  is framework-neutral — a transfer between own bank accounts is never a
+  P&L event under any framework. Presentation-only difference: where an
+  entity holds a legally enforceable right of offset, an overdraft may be
+  netted against a positive balance at the same bank. IAS 1.71 / FRS 102
+  permit netting when the right is enforceable; ASC 210-20 adds stricter
+  conditions — the right must be unconditional AND the entity must intend
+  to set off (simultaneous settlement or intended setoff) — so US balance
+  sheets net less often. Affects presentation only, never the journal.

@@ -2,7 +2,7 @@
 id: funds-statement
 name: Statement of sources and application of funds
 category: report
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -76,8 +76,15 @@ Mix of PERIOD FLOWS (long-term items) and BALANCES at `period_start` /
 - IFRS: no equivalent standard; IAS 7 cash flows is the required
   statement. An IFRS reporter preparing a funds statement does so as a
   management report, not a primary statement.
-- us-gaap: TODO — no US equivalent since SFAS 95 (1988) replaced funds
-  statements with ASC 230 cash flows.
+- us-gaap: no funds statement. SFAS 95 (FASB Statement of Financial
+  Accounting Standards No. 95, issued November 1987, effective for
+  fiscal years ending after 15 July 1988) superseded APB Opinion No. 19
+  and eliminated the statement of changes in financial position from US
+  GAAP; SFAS 95 was codified as ASC 230 in 2009. A US GAAP reporter
+  issues the statement of cash flows instead. If a funds statement is
+  prepared anyway (e.g. for a credit memorandum), it is a management
+  report outside the GAAP financial statements — not a primary
+  statement, never audited as GAAP.
 
 ## Formance interaction
 

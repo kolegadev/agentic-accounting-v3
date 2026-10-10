@@ -2,7 +2,7 @@
 id: opening-balances
 name: Initial capital, assets, liabilities
 category: transaction
-frameworks: [uk-gaap, ifrs]
+frameworks: [uk-gaap, ifrs, us-gaap]
 version: 0.1.0
 status: v0
 ---
@@ -130,5 +130,14 @@ the six-posting list above matches this entry exactly).
 - IFRS (IFRS 1): first-time adoption uses the same mechanics with an
   opening IFRS statement of financial position and reconciliation of
   equity; the journal shape is framework-neutral.
-- us-gaap: TODO — ASC 250 / fresh-start reporting: same DR/CR mechanics;
-  US entities have no VAT liability accounts (sales tax payable instead).
+- us-gaap (ASC 250): opening entries must reconcile to the prior period's
+  closing balance sheet — the DR/CR mechanics are framework-neutral. The
+  US-specific rule is error correction: a material prior-period error is
+  corrected by RESTATING the prior-period statements (retrospective
+  restatement through opening retained earnings), while an immaterial
+  error is corrected in the current period — a two-track rule FRS 102
+  §10.21 approximates but applies with a different materiality practice.
+  ASC 805 (business combinations — push-down or acquisition-date values)
+  and ASC 830 (functional-currency translation) matter only as pointers
+  for entities with those events. A US opening entry carries no VAT
+  liability account — sales-tax payable replaces `2210` output VAT.
