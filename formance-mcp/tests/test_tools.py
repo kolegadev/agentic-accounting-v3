@@ -1,4 +1,11 @@
-"""Unit tests for the Formance MCP tools with mocked httpx."""
+"""Unit tests for the Formance MCP tools with mocked httpx.
+
+Pins the REAL wire contract (observed against ``ghcr.io/formancehq/ledger``
+v2.3.21 — see docs/live-e2e.md): Numscript bodies with minor-unit integer
+amounts and unbounded overdraft, the data-list-inside-``cursor`` envelope,
+minor->major normalisation, cursor-only follow-ups and the 204/400
+create-ledger tolerance.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +25,14 @@ POSTING = {
     "amount": "12.34",
     "asset": "USD/2",
 }
+
+# The exact Numscript the client must emit for POSTING (12.34 -> 1234 minor).
+POSTING_SCRIPT = (
+    "send [USD/2 1234] (\n"
+    "\tsource = @world allowing unbounded overdraft\n"
+    "\tdestination = @alice\n"
+    ")"
+)
 
 
 def make_client(handler: Callable[[httpx.Request], httpx.Response]) -> FormanceClient:
@@ -63,7 +78,7 @@ async def test_health(mock):
 
 
 # ---------------------------------------------------------------------------
-# create_transaction
+# create_transaction — real wire format: Numscript + minor-unit ints
 # ---------------------------------------------------------------------------
 
 
@@ -76,7 +91,7 @@ async def test_create_transaction_happy_path(mock):
         captured["body"] = json_body(request)
         captured["headers"] = request.headers
         return httpx.Response(
-            200, json={"data": {"txid": 1, "postings": [POSTING]}}
+            200, json={"data": [{"txid": 1, "postings": [POSTING]}]}
         )
 
     mock(handler)
@@ -88,10 +103,12 @@ async def test_create_transaction_happy_path(mock):
         metadata={"note": "hello"},
         idempotency_key="idem-1",
     )
-    assert result == {"data": {"txid": 1, "postings": [POSTING]}}
+    # The real envelope {"data": [{txid, ...}]} collapses to {"txid": N}.
+    assert result == {"txid": 1}
     assert captured["method"] == "POST"
     assert captured["path"] == "/main/transactions"
-    assert captured["body"]["postings"] == [POSTING]
+    assert captured["body"]["script"] == {"plain": POSTING_SCRIPT}
+    assert "postings" not in captured["body"]
     assert captured["body"]["reference"] == "JE-1"
     assert captured["body"]["timestamp"] == "2026-10-10T10:00:00Z"
     assert captured["body"]["metadata"] == {"note": "hello"}
@@ -104,28 +121,107 @@ async def test_create_transaction_omits_optional_fields(mock):
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json_body(request)
         captured["headers"] = request.headers
-        return httpx.Response(200, json={"data": {"txid": 2}})
+        return httpx.Response(200, json={"data": [{"txid": 2}]})
 
     mock(handler)
-    await server_mod.create_transaction("main", [POSTING])
-    assert captured["body"] == {"postings": [POSTING]}
+    result = await server_mod.create_transaction("main", [POSTING])
+    assert result == {"txid": 2}
+    assert captured["body"] == {"script": {"plain": POSTING_SCRIPT}}
     assert captured["headers"].get("Idempotency-Key") is None
 
 
-@pytest.mark.parametrize("amount", ["0", "1", "1.5", "0.01", "1234.56", "100"])
-async def test_create_transaction_accepts_valid_amounts(mock, amount):
+async def test_create_transaction_numscript_exact_shape(mock):
+    """The Numscript body is byte-identical to the F14 API client's."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json_body(request)
+        return httpx.Response(200, json={"data": [{"txid": 9}]})
+
+    mock(handler)
+    await server_mod.create_transaction(
+        "main",
+        [
+            {"source": "3000", "destination": "1000", "amount": "20000.00", "asset": "GBP/2"},
+            {"source": "1000", "destination": "6500", "amount": "100.00", "asset": "GBP/2"},
+        ],
+    )
+    script = captured["body"]["script"]["plain"]
+    assert script == (
+        "send [GBP/2 2000000] (\n"
+        "\tsource = @3000 allowing unbounded overdraft\n"
+        "\tdestination = @1000\n"
+        ")\n"
+        "send [GBP/2 10000] (\n"
+        "\tsource = @1000 allowing unbounded overdraft\n"
+        "\tdestination = @6500\n"
+        ")"
+    )
+
+
+@pytest.mark.parametrize(
+    "amount,minor",
+    [
+        ("0", 0),
+        ("1", 100),
+        ("1.5", 150),
+        ("0.01", 1),
+        ("1234.56", 123456),
+        ("100", 10000),
+    ],
+)
+async def test_create_transaction_converts_amounts_to_minor_units_exactly(
+    mock, amount, minor
+):
     sent: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         sent.append(json_body(request))
-        return httpx.Response(200, json={"data": {"txid": 9}})
+        return httpx.Response(200, json={"data": [{"txid": 9}]})
 
     mock(handler)
     result = await server_mod.create_transaction(
         "main", [dict(POSTING, amount=amount)]
     )
-    assert sent[0]["postings"][0]["amount"] == amount
-    assert result == {"data": {"txid": 9}}
+    assert result == {"txid": 9}
+    assert sent[0]["script"]["plain"] == (
+        f"send [USD/2 {minor}] (\n"
+        "\tsource = @world allowing unbounded overdraft\n"
+        "\tdestination = @alice\n"
+        ")"
+    )
+
+
+async def test_create_transaction_respects_asset_precision(mock):
+    """GBP/4 -> 4 minor units per major unit (12.34 -> 123400)."""
+    sent: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json_body(request))
+        return httpx.Response(200, json={"data": [{"txid": 9}]})
+
+    mock(handler)
+    await server_mod.create_transaction(
+        "main", [dict(POSTING, amount="12.34", asset="GBP/4")]
+    )
+    assert "send [GBP/4 123400] (" in sent[0]["script"]["plain"]
+
+
+async def test_create_transaction_unrepresentable_amount_is_structured_error(mock):
+    """1.55 in a GBP/1 asset (1 minor unit per major unit) cannot be
+    represented exactly — a structured tool error, never a float rounding."""
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(500, json={})
+
+    mock(handler)
+    with pytest.raises(FormanceToolError, match="not representable"):
+        await server_mod.create_transaction(
+            "main", [dict(POSTING, amount="1.55", asset="GBP/1")]
+        )
+    assert sent == []
 
 
 @pytest.mark.parametrize(
@@ -186,7 +282,7 @@ async def test_create_transaction_rejects_empty_postings(mock):
 
 
 # ---------------------------------------------------------------------------
-# get_transaction
+# get_transaction — real envelope + minor->major normalisation
 # ---------------------------------------------------------------------------
 
 
@@ -195,12 +291,40 @@ async def test_get_transaction_happy(mock):
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["path"] = request.url.path
-        return httpx.Response(200, json={"data": {"txid": 42, "postings": [POSTING]}})
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "txid": 42,
+                    "reference": "JE-1",
+                    "timestamp": "2026-10-10T10:00:00Z",
+                    "metadata": {"transaction_id": "t1"},
+                    "postings": [
+                        {
+                            "source": "world",
+                            "destination": "alice",
+                            "amount": 1234,
+                            "asset": "USD/2",
+                        }
+                    ],
+                }
+            },
+        )
 
     mock(handler)
     result = await server_mod.get_transaction("main", 42)
     assert captured["path"] == "/main/transactions/42"
-    assert result == {"data": {"txid": 42, "postings": [POSTING]}}
+    assert result["data"]["txid"] == 42
+    assert result["data"]["reference"] == "JE-1"
+    assert result["data"]["metadata"] == {"transaction_id": "t1"}
+    assert result["data"]["postings"] == [
+        {
+            "source": "world",
+            "destination": "alice",
+            "amount": "12.34",
+            "asset": "USD/2",
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -244,51 +368,67 @@ async def test_connection_error_maps_to_structured_tool_error(mock):
 
 
 # ---------------------------------------------------------------------------
-# list_transactions (cursor pagination)
+# list_transactions — real envelope: data inside cursor, cursor-only follow-ups
 # ---------------------------------------------------------------------------
+
+
+def _tx(txid: int, minor: int = 1234) -> dict[str, Any]:
+    return {
+        "txid": txid,
+        "reference": f"R{txid}",
+        "timestamp": "2026-10-10T10:00:00Z",
+        "metadata": {},
+        "postings": [
+            {
+                "source": "world",
+                "destination": "alice",
+                "amount": minor,
+                "asset": "USD/2",
+            }
+        ],
+    }
 
 
 async def test_list_transactions_follows_cursor(mock):
     calls: list[Optional[str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.params.get("after"))
-        assert request.url.params["pageSize"] == "100"
+        calls.append(request.url.params.get("cursor"))
         if len(calls) == 1:
+            assert request.url.params.get("pageSize") == "100"
+            assert "after" not in request.url.params
             return httpx.Response(
                 200,
-                json={
-                    "cursor": {"hasMore": True, "next": "10"},
-                    "data": [{"txid": 10, "postings": [POSTING]}],
-                },
+                json={"cursor": {"pageSize": 100, "hasMore": True, "next": "10",
+                                 "data": [_tx(10)]}},
             )
+        assert request.url.params.get("pageSize") is None
+        assert "after" not in request.url.params
         return httpx.Response(
             200,
-            json={
-                "cursor": {"hasMore": False, "next": None},
-                "data": [{"txid": 20, "postings": [POSTING]}],
-            },
+            json={"cursor": {"pageSize": 100, "hasMore": False, "next": None,
+                             "data": [_tx(20)]}},
         )
 
     mock(handler)
     result = await server_mod.list_transactions("main")
     assert calls == [None, "10"]
     assert [tx["txid"] for tx in result["data"]] == [10, 20]
+    assert result["data"][0]["postings"][0]["amount"] == "12.34"
     assert result["cursor"] == {"hasMore": False, "next": None}
 
 
-async def test_list_transactions_passes_page_size_and_after(mock):
+async def test_list_transactions_passes_after_as_cursor_alone(mock):
     calls: list[Optional[str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.params.get("after"))
-        assert request.url.params["pageSize"] == "25"
+        calls.append(request.url.params.get("cursor"))
+        assert "pageSize" not in request.url.params
+        assert "after" not in request.url.params
         return httpx.Response(
             200,
-            json={
-                "cursor": {"hasMore": False, "next": None},
-                "data": [{"txid": 5}],
-            },
+            json={"cursor": {"pageSize": 25, "hasMore": False, "next": None,
+                             "data": [_tx(5)]}},
         )
 
     mock(handler)
@@ -301,10 +441,11 @@ async def test_list_transactions_stops_when_cursor_does_not_advance(mock):
     calls: list[Optional[str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request.url.params.get("after"))
+        calls.append(request.url.params.get("cursor"))
         return httpx.Response(
             200,
-            json={"cursor": {"hasMore": True, "next": "10"}, "data": [{"txid": 1}]},
+            json={"cursor": {"pageSize": 100, "hasMore": True, "next": "10",
+                             "data": [_tx(1)]}},
         )
 
     mock(handler)
@@ -313,38 +454,155 @@ async def test_list_transactions_stops_when_cursor_does_not_advance(mock):
     assert len(result["data"]) == 2
 
 
-# ---------------------------------------------------------------------------
-# get_balances
-# ---------------------------------------------------------------------------
-
-
-async def test_get_balances_preserves_structure(mock):
-    captured: list[Optional[str]] = []
-    payload = {
-        "data": {"alice": {"USD/2": "12.34"}, "bob": {"EUR/2": "5.00", "USD/2": "7.00"}}
-    }
+async def test_list_transactions_normalises_top_level_data_fallback(mock):
+    """Without a cursor dict, a top-level data list is still normalised."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request.url.params.get("address"))
-        return httpx.Response(200, json=payload)
+        return httpx.Response(
+            200,
+            json={"data": [_tx(7, minor=1000000)]},
+        )
+
+    mock(handler)
+    result = await server_mod.list_transactions("main")
+    assert [tx["txid"] for tx in result["data"]] == [7]
+    assert result["data"][0]["postings"][0]["amount"] == "10000.00"
+    assert result["cursor"]["hasMore"] is False
+
+
+# ---------------------------------------------------------------------------
+# get_balances — real envelope + per-address/per-asset normalisation
+# ---------------------------------------------------------------------------
+
+
+async def test_get_balances_normalises_envelope(mock):
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={
+                "cursor": {
+                    "pageSize": 1000,
+                    "hasMore": False,
+                    "data": [
+                        {"alice": {"USD/2": 1234}},
+                        {"bob": {"EUR/2": 500, "USD/2": 700}},
+                    ],
+                }
+            },
+        )
 
     mock(handler)
     result = await server_mod.get_balances("main")
-    assert captured == [None]
-    assert result == payload
+    assert captured["params"] == {"pageSize": "1000"}
+    assert result == {
+        "data": [
+            {"address": "alice", "balances": {"USD/2": "12.34"}},
+            {"address": "bob", "balances": {"EUR/2": "5.00", "USD/2": "7.00"}},
+        ]
+    }
+
+
+async def test_get_balances_converts_negative_minor_units(mock):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "cursor": {
+                    "pageSize": 1000,
+                    "hasMore": False,
+                    "data": [{"4000": {"GBP/2": -10000}}],
+                }
+            },
+        )
+
+    mock(handler)
+    result = await server_mod.get_balances("main")
+    assert result == {"data": [{"address": "4000", "balances": {"GBP/2": "-100.00"}}]}
 
 
 async def test_get_balances_filters_by_address(mock):
-    captured: list[Optional[str]] = []
+    captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request.url.params.get("address"))
-        return httpx.Response(200, json={"data": {"alice": {"USD/2": "12.34"}}})
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={"cursor": {"pageSize": 1000, "hasMore": False,
+                             "data": [{"alice": {"USD/2": 1234}}]}},
+        )
 
     mock(handler)
     result = await server_mod.get_balances("main", address="alice")
-    assert captured == ["alice"]
-    assert result == {"data": {"alice": {"USD/2": "12.34"}}}
+    assert captured["params"] == {"pageSize": "1000", "address": "alice"}
+    assert result == {"data": [{"address": "alice", "balances": {"USD/2": "12.34"}}]}
+
+
+# ---------------------------------------------------------------------------
+# create_ledger — 204 new, 400 LEDGER_ALREADY_EXISTS duplicate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "status,body",
+    [
+        (204, None),
+        (200, {"data": {"name": "main"}}),
+        (201, {}),
+        (409, {"errorCode": "LEDGER_ALREADY_EXISTS"}),
+    ],
+)
+async def test_create_ledger_idempotent_success(mock, status, body):
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        captured["path"] = request.url.path
+        return httpx.Response(status, json=body)
+
+    mock(handler)
+    result = await server_mod.create_ledger("main")
+    assert captured["path"] == "/v2/main"
+    assert result == {"ledger": "main", "created": True}
+
+
+async def test_create_ledger_tolerates_400_ledger_already_exists(mock):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"errorCode": "LEDGER_ALREADY_EXISTS",
+                  "errorMessage": "ledger already exists"},
+        )
+
+    mock(handler)
+    result = await server_mod.create_ledger("main")
+    assert result == {"ledger": "main", "created": True}
+
+
+async def test_create_ledger_other_4xx_raises_structured_error(mock):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"errorCode": "VALIDATION", "errorMessage": "bad name"}
+        )
+
+    mock(handler)
+    with pytest.raises(FormanceToolError) as excinfo:
+        await server_mod.create_ledger("main")
+    err = excinfo.value
+    assert err.status == 400
+    assert "VALIDATION" in str(err)
+
+
+async def test_create_ledger_connection_error_raises_structured_error(mock):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    mock(handler)
+    with pytest.raises(FormanceToolError) as excinfo:
+        await server_mod.create_ledger("main")
+    assert excinfo.value.status is None
 
 
 # ---------------------------------------------------------------------------

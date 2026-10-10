@@ -23,6 +23,7 @@ ALL_TOOLS = {
     "get_transaction",
     "list_transactions",
     "get_balances",
+    "create_ledger",
     "list_ledgers",
     "run_script",
 }

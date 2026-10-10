@@ -1,15 +1,18 @@
-# Live Formance e2e — runbook and findings (Contract F14)
+# Live Formance e2e — runbook and findings (Contracts F14 + F15)
 
 This document records how to run the v3 pipeline against the REAL Formance
 ledger (first time, on a Docker host), what the real HTTP payloads look like,
-and the empirical verdicts on the F13 residuals **I3** (trailing-zero >2dp
-amount strings) and **I4** (zero-volume addresses omitted from balances).
+the empirical verdicts on the F13 residuals **I3** (trailing-zero >2dp
+amount strings) and **I4** (zero-volume addresses omitted from balances),
+and the F15 fix that brought the Formance MCP service onto the same wire
+contract.
 
 **Result: the live suite PASSES (5/5) against `ghcr.io/formancehq/ledger`
 v2.3.21 on thebrick, 2026-10-10. I3 and I4 are NOT observed — the F13
 strict-parsing assumptions hold and `ledger_parity.py` needed no changes.
 `formance_client.py` was reworked as the single wire-format adapter (details
-below), with its unit tests updated.**
+below), with its unit tests updated. The F15 MCP live round-trip also PASSES
+(1/1) against the same ledger — see the F15 section.**
 
 ## How to run
 
@@ -125,11 +128,15 @@ balances (−200 probe confirmed — no floor at zero).
 - The data list is **inside `cursor`**, not top-level (the shape the client,
   parity and reports originally assumed).
 - Amounts are minor-unit integers.
-- **Pagination**: follow-up pages must send `cursor=<cursor.next>` ALONE.
-  Passing the old `after` param with an opaque cursor 500s ("expected numeric
-  value, got string"), and `pageSize` must not accompany `cursor`. The client
-  maps its `after` argument to `cursor=` and omits `pageSize` on follow-ups.
-  (`pageSize=500` on the first page is honoured; max is 1000.)
+- **Pagination**: follow-up pages send `cursor=<cursor.next>` ALONE. The
+  legacy `after` param — numeric or opaque — 500s with `INTERNAL` ("Internal
+  error. Consult logs/traces to have more details."), so the client maps its
+  `after` argument to `cursor=` and omits `pageSize` on follow-ups (the
+  simplest correct form). `pageSize` is honoured on the first page (500
+  verified) and values above 1000 clamp to 1000 (2000/5000/100000 all answer
+  `pageSize: 1000`). F15 correction: the earlier claim that `pageSize` must
+  not accompany `cursor` was wrong — a follow-up `cursor=<next>&pageSize=100`
+  is accepted and the companion size overrides the encoded one.
 - `metadata` passes through unchanged (parity keys off
   `metadata.transaction_id`).
 
@@ -184,15 +191,73 @@ correct, no `ledger_parity` change.
    contract (Numscript bodies, minor units, cursor envelope, normalisation,
    duplicate-400 create ledger).
 
+## Contract F15 — Formance MCP wire fix + live MCP round-trip
+
+The F14 run left `formance-mcp/src/formance_mcp/client.py` **out of F14
+scope** (see the F14 contract boundaries); it shipped with the same
+pre-existing wire bug as the pre-F14 API client — plain decimal-string
+postings, which the real ledger rejects with 400 `VALIDATION` (and
+credit-nature sources with 400 `INSUFFICIENT_FUND`). F15 removes that gap:
+the MCP client now speaks the SAME wire contract as the F14 API client,
+self-contained (no `api/` imports), while the MCP tools' public shapes are
+unchanged (decimal strings in, decimal strings out — conversion happens on
+the wire only).
+
+What changed in `formance-mcp/`:
+
+- `create_transaction` builds Numscript — one `send [<asset> <minor-int>]`
+  per posting, `source = @<source> allowing unbounded overdraft` on every
+  source — with amounts converted from decimal strings to minor-unit ints
+  EXACTLY (`Decimal*100 -> int`, never floats). Idempotency-Key, reference,
+  timestamp and metadata ride alongside `{"script": {"plain": ...}}`; the
+  real response envelope `{"data": [{"txid": N, ...}]}` collapses to
+  `{"txid": N}`.
+- `list_transactions` normalises the cursor-embedded envelope
+  (`{cursor:{pageSize,hasMore,next,data}}` → flat `{cursor, data}`) and
+  converts minor-unit amounts back to exact major-unit decimal strings;
+  follow-up pages send `cursor=<next>` alone.
+- `get_balances` normalises `{address: {asset: minor-int}}` rows to
+  `{"data": [{"address": ..., "balances": {asset: major-str}}]}` and
+  requests `pageSize=1000`.
+- `create_ledger` (new client method + new tool): tolerates 204 and 400
+  `LEDGER_ALREADY_EXISTS` (and legacy 409) as idempotent success.
+- Errors keep surfacing as structured tool errors (status + body).
+
+**Result: the live MCP suite PASSES (1/1) against
+`ghcr.io/formancehq/ledger` v2.3.21 on thebrick, 2026-10-10.** The
+round-trip: create a fresh `mcp-live-<rand>` ledger, then
+`create_transaction` source @4000 → destination @1000 for £100.00 through
+the REAL tools; `get_balances` shows `+100.00` on 1000 and `-100.00` on
+4000 (raw wire: minor-unit `+10000`/`-10000`); `list_transactions` returns
+the transaction with decimal-string amounts and the flat cursor envelope.
+
+Run the MCP live suite (on thebrick, from `/tmp/aa-live/formance-mcp`):
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -q -e '.[dev]' pytest-timeout
+FORNANCE_LEDGER_URL=http://127.0.0.1:3068 .venv/bin/python -m pytest \
+    tests/live -v --timeout=120
+```
+
+The F14 pagination section above carries the corrected `pageSize` findings
+(pageSize accompanies cursor fine and clamps at 1000).
+
 ## Local behaviour
 
-On hosts without a real ledger the live module skips cleanly:
-`FORNANCE_LEDGER_URL` unset → all 5 tests skipped, local suite unaffected.
-Local full-suite run after F14:
+On hosts without a real ledger the live modules skip cleanly:
+`FORNANCE_LEDGER_URL` unset → api's 5 live tests and the MCP live test all
+skip, local suites unaffected.
+Local full-suite runs after F15:
 
 ```
 cd api && .venv/bin/python -m pytest tests/ -q --no-header -p no:cacheprovider --timeout=30
 ```
 
-→ 0 failed, ≥ 1165 passed, live tests skipped. (The final number is
-reported in the F14 hand-off.)
+→ 0 failed, 1171 passed, live tests skipped.
+
+```
+cd formance-mcp && .venv/bin/python -m pytest -q
+```
+
+→ 0 failed, 59 passed, 1 skipped (the live MCP test skips on hosts without
+a ledger).

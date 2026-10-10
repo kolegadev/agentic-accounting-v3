@@ -142,9 +142,11 @@ async def create_transaction(
 
     ``postings`` is a list of objects, each with ``source``, ``destination``,
     ``amount`` (a DECIMAL STRING like "12.34" — floats are rejected) and
-    ``asset``.  When ``idempotency_key`` is provided it is sent as the
-    ``Idempotency-Key`` header.  Returns the committed transaction as
-    reported by Formance (includes the txid).
+    ``asset``.  Amounts are converted to minor-unit integers exactly and the
+    transaction is submitted as Numscript (one ``send`` per posting, every
+    source allowed to overdraw).  When ``idempotency_key`` is provided it is
+    sent as the ``Idempotency-Key`` header.  Returns ``{"txid": N}`` from the
+    real response envelope.
     """
     _validate_postings(postings)
     return await get_client().create_transaction(
@@ -170,7 +172,8 @@ async def list_transactions(
     """List transactions in a ledger, following cursor pagination to the end.
 
     Returns ``{"data": [...], "cursor": {"hasMore": false, "next": null}}``
-    after exhausting every page.  Pass ``after`` to resume from a cursor.
+    after exhausting every page; each transaction carries major-unit decimal
+    string amounts.  Pass ``after`` to resume from an opaque cursor.
     """
     return await get_client().list_transactions_all(
         ledger, page_size=page_size, after=after
@@ -183,9 +186,22 @@ async def get_balances(
 ) -> dict[str, Any]:
     """Get account balances for a ledger, optionally filtered by ``address``.
 
-    Preserves Formance's per-address/per-asset structure — no lossy merging.
+    Returns ``{"data": [{"address": ..., "balances": {asset: major-str}}]}``
+    with decimal-string amounts — no lossy merging.
     """
     return await get_client().get_balances(ledger, address=address)
+
+
+@_map_errors
+async def create_ledger(ledger: str) -> dict[str, Any]:
+    """Create a Formance v2 ledger (POST /v2/{ledger}).
+
+    Idempotent: 200/201/204 (created) and 400 LEDGER_ALREADY_EXISTS / 409
+    (duplicate) all report ``created: true``.  Other 4xx/5xx and connection
+    failures surface as structured tool errors.
+    """
+    created = await get_client().create_ledger(ledger)
+    return {"ledger": ledger, "created": created}
 
 
 @_map_errors
@@ -219,6 +235,7 @@ def _register_tools(server: MCPServer) -> None:
     server.tool()(get_transaction)
     server.tool()(list_transactions)
     server.tool()(get_balances)
+    server.tool()(create_ledger)
     server.tool()(list_ledgers)
     server.tool()(run_script)
 
