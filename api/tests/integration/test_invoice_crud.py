@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -252,7 +252,10 @@ class TestFullInvoiceLifecycle:
         count_mock.scalar_one.return_value = 0
         db_send.execute = AsyncMock(return_value=count_mock)
 
-        sent = await InvoiceService.send_invoice(db_send, inv_id)
+        # The GL posting side-effect needs live accounts/transactions, which
+        # the mocked DB cannot provide — mock it at the service boundary.
+        with patch.object(InvoiceService, "_post_invoice_to_gl", new=AsyncMock()):
+            sent = await InvoiceService.send_invoice(db_send, inv_id)
         assert sent.status == "sent"
         assert sent.sent_at is not None
         assert sent.reference == f"INV-{TODAY.year}-0001"
@@ -486,7 +489,10 @@ class TestStatusTransitions:
         count_mock.scalar_one.return_value = 0
         db.execute = AsyncMock(return_value=count_mock)
 
-        result = await InvoiceService.send_invoice(db, invoice.id)
+        # The GL posting side-effect needs live accounts/transactions, which
+        # the mocked DB cannot provide — mock it at the service boundary.
+        with patch.object(InvoiceService, "_post_invoice_to_gl", new=AsyncMock()):
+            result = await InvoiceService.send_invoice(db, invoice.id)
         assert result.status == "sent"
 
         # sent → viewed

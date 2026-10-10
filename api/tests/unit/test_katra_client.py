@@ -48,16 +48,63 @@ def _make_rpc_error(code: int, message: str) -> dict:
     }
 
 
-def _mock_httpx_post(json_response: dict) -> AsyncMock:
-    """Create a mocked AsyncClient whose post returns the given JSON-RPC response."""
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.raise_for_status = MagicMock()
-    mock_response.json.return_value = json_response
+SSE_ENDPOINT_EVENT = 'event: endpoint\ndata: {"uri": "/message"}\n\n'
 
-    mock_client = AsyncMock()
-    mock_client.__aenter__.return_value.post.return_value = mock_response
-    return mock_client
+
+class _FakeStreamResponse:
+    """Minimal stand-in for httpx's streaming response during the MCP SSE handshake."""
+
+    def __init__(self) -> None:
+        self._chunks = [SSE_ENDPOINT_EVENT]
+
+    async def __aenter__(self) -> "_FakeStreamResponse":
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def aiter_text(self):
+        async def _gen():
+            for chunk in self._chunks:
+                yield chunk
+        return _gen()
+
+
+class _FakeAsyncClient:
+    """Minimal fake httpx.AsyncClient: post() returns the canned JSON-RPC
+    response (or raises post_error), stream() drives the MCP SSE handshake."""
+
+    def __init__(
+        self,
+        json_response: Optional[dict] = None,
+        post_error: Optional[Exception] = None,
+    ) -> None:
+        self.post = AsyncMock()
+        if post_error is not None:
+            self.post.side_effect = post_error
+        else:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = json_response
+            self.post.return_value = mock_response
+
+    async def __aenter__(self) -> "_FakeAsyncClient":
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    def stream(self, *args: object, **kwargs: object) -> _FakeStreamResponse:
+        return _FakeStreamResponse()
+
+
+def _mock_httpx_post(json_response: dict) -> _FakeAsyncClient:
+    """Create a fake AsyncClient whose post returns the given JSON-RPC response."""
+    return _FakeAsyncClient(json_response=json_response)
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +139,8 @@ async def test_store_conversation_event_sends_correct_payload(client: KatraClien
 
     assert event_id == "evt-abc123"
 
-    call_args = mock_client.__aenter__.return_value.post.call_args
-    assert call_args[0][0] == "http://katra:3113/mcp"
+    call_args = mock_client.post.call_args
+    assert call_args[0][0] == "http://katra:3113/message"
 
     body = call_args[1]["json"]
     assert body["method"] == "tools/call"
@@ -149,7 +196,7 @@ async def test_store_session_context(client: KatraClient) -> None:
             context={"contact_id": "abc", "ledger": "main"},
         )
 
-    call_args = mock_client.__aenter__.return_value.post.call_args
+    call_args = mock_client.post.call_args
     body = call_args[1]["json"]
     assert body["params"]["name"] == "add_semantic_fact"
 
@@ -194,7 +241,7 @@ async def test_search_relevant_context(client: KatraClient) -> None:
     assert results[0]["score"] == 0.92
     assert results[1]["id"] == "mem-2"
 
-    call_args = mock_client.__aenter__.return_value.post.call_args
+    call_args = mock_client.post.call_args
     body = call_args[1]["json"]
     assert body["params"]["name"] == "vector_search"
     assert body["params"]["arguments"]["query"] == "office supplies expense"
@@ -231,7 +278,7 @@ async def test_get_recent_events(client: KatraClient) -> None:
     assert events[0]["role"] == "user"
     assert events[1]["content"] == "Hi there"
 
-    call_args = mock_client.__aenter__.return_value.post.call_args
+    call_args = mock_client.post.call_args
     body = call_args[1]["json"]
     assert body["params"]["name"] == "temporal_recall"
     assert body["params"]["arguments"]["session_id"] == "sess-001"
@@ -253,7 +300,7 @@ async def test_health_check_success(client: KatraClient) -> None:
 
     assert result is True
 
-    call_args = mock_client.__aenter__.return_value.post.call_args
+    call_args = mock_client.post.call_args
     body = call_args[1]["json"]
     assert body["method"] == "initialize"
 
@@ -266,8 +313,7 @@ async def test_health_check_success(client: KatraClient) -> None:
 @pytest.mark.asyncio
 async def test_health_check_failure(client: KatraClient) -> None:
     """Mock httpx raises exception, returns False."""
-    mock_client = AsyncMock()
-    mock_client.__aenter__.return_value.post.side_effect = Exception("Connection refused")
+    mock_client = _FakeAsyncClient(post_error=Exception("Connection refused"))
 
     with patch("src.services.katra_client.httpx.AsyncClient", return_value=mock_client):
         result = await client.health_check()
@@ -304,10 +350,7 @@ async def test_katra_error_raised_on_mcp_error(client: KatraClient) -> None:
 @pytest.mark.asyncio
 async def test_graceful_degradation_store_returns_empty(client: KatraClient) -> None:
     """When httpx raises, store returns "" without crashing."""
-    mock_client = AsyncMock()
-    mock_client.__aenter__.return_value.post.side_effect = httpx.ConnectError(
-        "Connection refused"
-    )
+    mock_client = _FakeAsyncClient(post_error=httpx.ConnectError("Connection refused"))
 
     with patch("src.services.katra_client.httpx.AsyncClient", return_value=mock_client):
         result = await client.store_conversation_event(
@@ -322,10 +365,7 @@ async def test_graceful_degradation_store_returns_empty(client: KatraClient) -> 
 @pytest.mark.asyncio
 async def test_graceful_degradation_search_returns_empty(client: KatraClient) -> None:
     """When httpx raises, search returns [] without crashing."""
-    mock_client = AsyncMock()
-    mock_client.__aenter__.return_value.post.side_effect = httpx.TimeoutException(
-        "Timeout"
-    )
+    mock_client = _FakeAsyncClient(post_error=httpx.TimeoutException("Timeout"))
 
     with patch("src.services.katra_client.httpx.AsyncClient", return_value=mock_client):
         results = await client.search_relevant_context("test query")

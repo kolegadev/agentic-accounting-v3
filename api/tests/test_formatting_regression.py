@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import socket
 import subprocess
 
+import pytest
 import websockets
 
 
@@ -27,10 +30,23 @@ TIMEOUT = 15
 HTML_TAGS = ("<strong>", "<br", "<b>", "<em>", "<i>")
 
 
+def _port_open(host: str, port: int) -> bool:
+    """Return True if a TCP connection to host:port can be established."""
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────
 # WebSocket (chat‑ui bridge) formatting regression test
 # ─────────────────────────────────────────────────────────────────────
 
+@pytest.mark.skipif(
+    not _port_open("localhost", 3002),
+    reason="Chat-UI WS bridge not reachable at localhost:3002 — live-infrastructure integration test",
+)
 async def test_ws_formatting_regression() -> None:
     """Connect to the chat‑ui WebSocket bridge, send a request, and assert
     every response is free of raw HTML tags while at least one uses markdown.
@@ -92,6 +108,10 @@ async def test_ws_formatting_regression() -> None:
 # REST API formatting regression test (via Docker internal network)
 # ─────────────────────────────────────────────────────────────────────
 
+@pytest.mark.skipif(
+    shutil.which("docker") is None,
+    reason="docker not available — REST formatting test runs inside the dockerised gateway",
+)
 def test_api_rest_formatting() -> None:
     """Post to the REST chat endpoint via Docker exec and verify no HTML,
     only markdown.  Uses Docker internal network to bypass host port 8000

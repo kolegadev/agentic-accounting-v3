@@ -500,7 +500,7 @@ async def test_resume_template_past_date(mock_db: AsyncMock) -> None:
     mock_db.get = AsyncMock(return_value=template)
 
     result = await RecurringService.resume_template(mock_db, template_id)
-    assert result.next_run_date == TODAY
+    assert result.next_run_date == date.today()
 
 
 @pytest.mark.asyncio

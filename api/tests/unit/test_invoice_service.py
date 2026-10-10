@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -350,7 +350,10 @@ class TestSendInvoice:
         # Mock reference count
         mock_db.execute.return_value = _mock_result(None)
 
-        result = await InvoiceService.send_invoice(mock_db, invoice.id)
+        # The GL posting side-effect needs live accounts/transactions, which
+        # the mocked DB cannot provide — mock it at the service boundary.
+        with patch.object(InvoiceService, "_post_invoice_to_gl", new=AsyncMock()):
+            result = await InvoiceService.send_invoice(mock_db, invoice.id)
 
         assert result.status == "sent"
         assert result.sent_at is not None

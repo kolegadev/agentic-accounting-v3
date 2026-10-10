@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import json
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.services.chat_service import ChatService
+from src.services.formatting import format_pence, render_table
+from src.services.llm_router import LLMRouter
+from src.services.tool_executor import ToolExecutor
+
+
+class _FakeKatra:
+    """Stand-in for the Katra client with memory persistence disabled."""
+
+    enabled = False
 
 
 @pytest.fixture
@@ -22,9 +31,10 @@ def mock_redis() -> AsyncMock:
 
 @pytest.fixture
 def chat_service(mock_redis: AsyncMock) -> ChatService:
-    """Return a ChatService with mocked Redis."""
+    """Return a ChatService with mocked Redis and disabled Katra."""
     svc = ChatService()
     svc._redis = mock_redis
+    svc._katra = _FakeKatra()
     return svc
 
 
@@ -70,7 +80,7 @@ async def test_save_conversation_state(chat_service: ChatService, mock_redis: As
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_process_message_routes_and_formats(chat_service: ChatService, mock_redis: AsyncMock) -> None:
-    """Full pipeline: route → format → save."""
+    """Full pipeline: route → execute tool → format → save."""
     mock_redis.get.return_value = json.dumps({
         "session_id": "s1",
         "persona": "professional",
@@ -78,13 +88,25 @@ async def test_process_message_routes_and_formats(chat_service: ChatService, moc
         "context": {},
     })
 
-    result = await chat_service.process_message("s1", "Paid £50 for office supplies at Tesco")
+    route_results = [
+        {"tool": "gl.record_expense", "params": {"description": "Office supplies", "amount": 5000}},
+        {"response": "Recorded."},
+    ]
+    with (
+        patch.object(LLMRouter, "route", AsyncMock(side_effect=route_results)),
+        patch.object(
+            ToolExecutor,
+            "execute",
+            AsyncMock(return_value={"success": True, "result": {"formatted": "Recorded **£50.00** expense."}}),
+        ),
+    ):
+        result = await chat_service.process_message("s1", "Paid £50 for office supplies at Tesco")
     assert result["session_id"] == "s1"
     assert result["tool_call"]["skill_id"] == "gl.record_expense"
     assert result["tool_call"]["params"].get("amount") == 5000
     assert "text" in result["message"]
-    # History should have 2 entries (user + assistant)
-    assert len(result["history"]) == 2
+    # History should have 3 entries (user + tool result + assistant)
+    assert len(result["history"]) == 3
     mock_redis.set.assert_called()
 
 
@@ -98,44 +120,55 @@ async def test_process_message_with_context(chat_service: ChatService, mock_redi
         "context": {"contact_id": "abc-123"},
     })
 
-    result = await chat_service.process_message("s2", "Create invoice for this client")
+    route_mock = AsyncMock(side_effect=[
+        {"tool": "invoice.create", "params": {"contact_id": "abc-123"}},
+        {"response": "Invoice created."},
+    ])
+    with (
+        patch.object(LLMRouter, "route", route_mock),
+        patch.object(
+            ToolExecutor,
+            "execute",
+            AsyncMock(return_value={"success": True, "result": {"formatted": "Invoice **created**."}}),
+        ),
+    ):
+        result = await chat_service.process_message("s2", "Create invoice for this client")
     assert result["tool_call"]["skill_id"] == "invoice.create"
     # contact_id should be injected
     assert result["tool_call"]["params"].get("contact_id") == "abc-123"
+    # The context from previous turns must be passed into routing
+    context_arg = route_mock.call_args_list[0].args[2]
+    assert context_arg.get("contact_id") == "abc-123"
 
 
 # ---------------------------------------------------------------------------
-# Persona formatting
+# Formatting helpers (current API — src/services/formatting.py)
 # ---------------------------------------------------------------------------
-class TestFormatResponse:
-    """Tests for persona-specific response formatting."""
+class TestFormattingHelpers:
+    """Tests for the formatting helpers that replaced ChatService.format_response."""
 
-    def setup_method(self) -> None:
-        self.svc = ChatService()
+    def test_format_pence_pounds(self) -> None:
+        assert format_pence(5000) == "£50.00"
+        assert format_pence(120000) == "£1,200.00"
 
-    def test_professional_persona(self) -> None:
-        result = {"skill_id": "gl.record_expense", "params": {"description": "Office supplies", "amount": 5000},
-                   "skill": {"name": "Record Expense"}}
-        formatted = self.svc.format_response(result, "professional")
-        assert "Action:" in formatted["text"]
-        assert "£50.00" in formatted["text"]
-        assert formatted["persona"] == "professional"
-        assert "further details" in formatted["text"]
+    def test_format_pence_negative_and_none(self) -> None:
+        assert format_pence(-1500) == "-£15.00"
+        assert format_pence(None) == ""
 
-    def test_friendly_persona(self) -> None:
-        result = {"skill_id": "gl.record_income", "params": {"description": "Consulting fee", "amount": 120000},
-                   "skill": {"name": "Record Income"}}
-        formatted = self.svc.format_response(result, "friendly")
-        assert "help you" in formatted["text"]
-        assert "£1,200.00" in formatted["text"]
-        assert formatted["persona"] == "friendly"
+    def test_render_table_markdown(self) -> None:
+        rows = [
+            {"code": "1000", "name": "Bank Current Account"},
+            {"code": "4000", "name": "Sales"},
+        ]
+        out = render_table(rows, [("code", "Code"), ("name", "Name")])
+        assert out["count"] == 2
+        assert out["truncated"] is False
+        assert "| Code | Name |" in out["formatted"]
+        assert "| 1000 | Bank Current Account |" in out["formatted"]
+        assert "| 4000 | Sales |" in out["formatted"]
 
-    def test_minimal_persona(self) -> None:
-        result = {"skill_id": "coa.list", "params": {},
-                   "skill": {"name": "List Chart of Accounts"}}
-        formatted = self.svc.format_response(result, "minimal")
-        assert formatted["text"].startswith("•")
-        assert "List Chart of Accounts" in formatted["text"]
-        assert formatted["persona"] == "minimal"
-        # Minimal persona should NOT have prefix/suffix fluff
-        assert "further details" not in formatted["text"]
+    def test_render_table_empty(self) -> None:
+        out = render_table([], [("code", "Code")])
+        assert out["count"] == 0
+        assert out["truncated"] is False
+        assert "No results found." in out["formatted"]
