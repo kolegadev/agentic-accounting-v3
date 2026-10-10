@@ -582,6 +582,63 @@ async def test_idempotency_key_returns_existing(
 
 
 # ---------------------------------------------------------------------------
+# discard_draft
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_discard_draft_success(
+    mock_db: AsyncMock,
+    sample_transaction: Transaction,
+) -> None:
+    """Should delete a Draft transaction and commit the deletion."""
+    mock_db.execute.return_value = _mock_result(sample_transaction)
+
+    await TransactionService.discard_draft(mock_db, sample_transaction.id)
+
+    mock_db.delete.assert_called_once_with(sample_transaction)
+    mock_db.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_discard_draft_not_found(mock_db: AsyncMock) -> None:
+    """Should raise TransactionNotFoundError for an unknown id."""
+    mock_db.execute.return_value = _mock_result(None)
+
+    with pytest.raises(TransactionNotFoundError) as exc_info:
+        await TransactionService.discard_draft(mock_db, uuid.uuid4())
+    assert exc_info.value.status_code == 404
+    mock_db.delete.assert_not_called()
+    mock_db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_discard_draft_posted_raises(mock_db: AsyncMock) -> None:
+    """Posted rows are append-only — never deleted."""
+    tx_id = uuid.uuid4()
+    posted_tx = Transaction(id=tx_id, status="posted")
+    mock_db.execute.return_value = _mock_result(posted_tx)
+
+    with pytest.raises(TransactionNotDraftError) as exc_info:
+        await TransactionService.discard_draft(mock_db, tx_id)
+    assert exc_info.value.status_code == 422
+    mock_db.delete.assert_not_called()
+    mock_db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_discard_draft_reversed_raises(mock_db: AsyncMock) -> None:
+    """Reversed rows are append-only — never deleted."""
+    tx_id = uuid.uuid4()
+    reversed_tx = Transaction(id=tx_id, status="reversed")
+    mock_db.execute.return_value = _mock_result(reversed_tx)
+
+    with pytest.raises(TransactionNotDraftError) as exc_info:
+        await TransactionService.discard_draft(mock_db, tx_id)
+    assert "reversed" in exc_info.value.message
+    mock_db.delete.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # get_transaction
 # ---------------------------------------------------------------------------
 

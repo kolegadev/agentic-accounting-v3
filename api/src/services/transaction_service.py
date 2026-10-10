@@ -422,6 +422,29 @@ class TransactionService:
         return transaction
 
     @staticmethod
+    async def discard_draft(
+        db: AsyncSession,
+        transaction_id: uuid.UUID,
+    ) -> None:
+        """Delete a Draft transaction — the only state a transaction may ever
+        be deleted in.  Posted/reversed rows are append-only.
+
+        Raises TransactionNotFoundError if the transaction does not exist,
+        or TransactionNotDraftError if it is not in draft status.
+        """
+        stmt = select(Transaction).where(Transaction.id == transaction_id)
+        result = await db.execute(stmt)
+        transaction = result.scalar_one_or_none()
+
+        if transaction is None:
+            raise TransactionNotFoundError(transaction_id)
+        if transaction.status != "draft":
+            raise TransactionNotDraftError(transaction_id, transaction.status)
+
+        await db.delete(transaction)
+        await db.commit()
+
+    @staticmethod
     async def get_transaction(
         db: AsyncSession,
         transaction_id: uuid.UUID,
