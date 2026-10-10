@@ -67,9 +67,13 @@ the FLOW, not the closing balance. All amounts integer pence.
   under FRS 102.
 - Finance costs — debit flow, positive: `6410` Loan Interest.
 - Profit before tax (subtotal) = operating profit − finance costs.
-- Corporation tax — charge for the period = closing balance of `2040`
-  Corporation Tax Payable − opening balance + tax PAID in the period
-  (debit postings to `2040`). Positive charge reduces profit.
+- Corporation tax — the charge = the GROSS credit flow on `2040`
+  Corporation Tax Payable (= closing balance − opening balance + tax
+  PAID in the period, i.e. debit postings to `2040`). Positive charge
+  reduces profit. The provision entry MUST pair Dr `3020` Retained
+  Earnings (equity) / Cr `2040` — debiting an expense account for the
+  provision double-counts the charge in the P&L and breaks the
+  cash-flow identity (the engine raises).
 - Profit for the period = revenue − ALL expense lines above. One single
   profit figure; it must equal the movement in `3020` Retained Earnings
   plus dividends paid (`3030` Dividends Paid).
@@ -197,4 +201,10 @@ before tax 19000000 (20000000 − 1000000); profit 15390000 (19000000 −
   negative profits, not a P&L input.
 - Overdrawn bank and zero-cash periods do not change the recipe (bank
   never appears in the P&L).
+- Corporation-tax provision: the charge is the gross credit flow on
+  `2040` (== closing − opening + tax paid). The provision entry MUST
+  pair Dr `3020` Retained Earnings (equity) / Cr `2040` Corporation
+  Tax Payable. Debiting an expense account for the provision
+  double-counts the charge in the P&L and breaks the cash-flow
+  identity — the engine raises instead of producing a broken report.
 - Multi-currency: out of scope (asset `GBP/2` only).

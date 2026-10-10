@@ -50,7 +50,11 @@ integer pence; ΔX = closing balance − opening balance.
   - Δ`2010` Accruals > 0 → ADD
   - Δ`2020` Deferred Income > 0 → ADD
   - Δ`2040` Corporation Tax Payable > 0 → ADD (tax charged but not yet
-    paid)
+    paid). The charge = the GROSS credit flow on `2040` (= closing −
+    opening + tax paid); the provision entry MUST pair Dr `3020`
+    (equity) / Cr `2040` — debiting an expense account for the
+    provision double-counts in the P&L and breaks the cash-flow
+    identity (the engine raises).
   - Δ`2030` PAYE / NI Payable > 0 → ADD (analogous)
   - VAT (`2210`/`2220`/`2200`/`2230`): quarterly settlements move VAT
     through the bank within the period — netted through the bank-driven
@@ -177,6 +181,12 @@ exact.
 - First period: opening bank 0; no opening balances for deltas.
 - VAT-only movement: settled VAT nets through the bank reconciliation;
   only unsettled net VAT movements appear as adjustments.
+- Tax provision convention: the corporation-tax charge is the gross
+  credit flow on `2040` (= closing − opening + paid); the provision
+  entry MUST pair Dr `3020` (equity) / Cr `2040`. Debiting an expense
+  account for the provision double-counts the charge in the P&L and
+  breaks the operating + investing + financing == change-in-bank
+  identity — the engine raises.
 - Negative equity: irrelevant here (the statement is about cash, not
   net worth).
 - Direct method: out of scope v0 (indirect only).
