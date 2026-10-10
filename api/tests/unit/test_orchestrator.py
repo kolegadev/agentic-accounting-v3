@@ -22,6 +22,7 @@ from src.models.account import Account
 from src.models.transaction import Posting, Transaction
 from src.services.ledger_parity import ParityReport
 from src.services.orchestrator import (
+    EntityScopeError,
     LLMError,
     approve_entry,
     build_system_prompt,
@@ -462,10 +463,6 @@ async def test_approve_posts_mirrors_and_runs_parity(
             "src.services.orchestrator.verify_parity",
             AsyncMock(return_value=parity),
         ) as mock_parity,
-        patch(
-            "src.services.orchestrator.get_active_ledger",
-            AsyncMock(return_value="main"),
-        ),
     ):
         result = await approve_entry(mock_db, draft.id)
 
@@ -512,10 +509,6 @@ async def test_approve_parity_drift_flagged_but_result_returned(
         patch(
             "src.services.orchestrator.verify_parity",
             AsyncMock(return_value=drift),
-        ),
-        patch(
-            "src.services.orchestrator.get_active_ledger",
-            AsyncMock(return_value="main"),
         ),
     ):
         result = await approve_entry(mock_db, draft.id)
@@ -596,6 +589,84 @@ async def test_reject_missing_transaction_raises(mock_db: AsyncMock) -> None:
         await reject_entry(mock_db, uuid.uuid4())
 
     mock_db.delete.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# reject_entry — entity ownership (Contract F20)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reject_entry_matching_entity_scope_discards(
+    mock_db: AsyncMock,
+) -> None:
+    """An entity-scoped reject discards a draft stamped with the SAME
+    entity — ownership passes, the discard proceeds."""
+    entity_id = uuid.uuid4()
+    draft = _draft_transaction()
+    draft.entity_id = entity_id
+    mock_db.execute.return_value = _result(scalar=draft)
+
+    result = await reject_entry(mock_db, draft.id, entity_id=entity_id)
+
+    assert result.transaction_id == draft.id
+    assert result.status == "discarded"
+    mock_db.delete.assert_called_once_with(draft)
+    mock_db.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reject_entry_cross_entity_refused(mock_db: AsyncMock) -> None:
+    """A draft stamped with a DIFFERENT entity is refused with
+    EntityScopeError (404) — never a cross-entity discard."""
+    scope_a = uuid.uuid4()
+    scope_b = uuid.uuid4()
+    draft = _draft_transaction()
+    draft.entity_id = scope_b
+    mock_db.execute.return_value = _result(scalar=draft)
+
+    with pytest.raises(EntityScopeError) as excinfo:
+        await reject_entry(mock_db, draft.id, entity_id=scope_a)
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.error_type == "entity_mismatch"
+    assert str(scope_b) in excinfo.value.message
+    mock_db.delete.assert_not_called()
+    mock_db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reject_entry_null_scoped_draft_refused_from_entity(
+    mock_db: AsyncMock,
+) -> None:
+    """A NULL-scoped (legacy) draft is invisible within an entity scope —
+    an entity-scoped reject refuses it (404) instead of discarding."""
+    scope_a = uuid.uuid4()
+    draft = _draft_transaction()
+    draft.entity_id = None
+    mock_db.execute.return_value = _result(scalar=draft)
+
+    with pytest.raises(EntityScopeError) as excinfo:
+        await reject_entry(mock_db, draft.id, entity_id=scope_a)
+
+    assert excinfo.value.status_code == 404
+    mock_db.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reject_entry_null_scope_legacy_unchanged(
+    mock_db: AsyncMock,
+) -> None:
+    """entity_id=None keeps the legacy discard path — no ownership query."""
+    draft = _draft_transaction()
+    draft.entity_id = uuid.uuid4()  # even a stamped draft discards unscoped
+    mock_db.execute.return_value = _result(scalar=draft)
+
+    result = await reject_entry(mock_db, draft.id)
+
+    assert result.status == "discarded"
+    assert mock_db.execute.call_count == 1  # only discard_draft's load
+    mock_db.delete.assert_called_once_with(draft)
 
 
 # ---------------------------------------------------------------------------

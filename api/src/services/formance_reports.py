@@ -1155,6 +1155,7 @@ async def verify_against_postgres(
     db: AsyncSession,
     report_dict: dict[str, Any],
     report_type: str,
+    entity_id: Optional[uuid.UUID] = None,
 ) -> list[dict[str, Any]]:
     """Compare a Formance-derived report with the Postgres ``ReportService``.
 
@@ -1162,6 +1163,11 @@ async def verify_against_postgres(
     "postgres", "delta"}``); an empty list means exact agreement. Only
     P&L, BS and TB have Postgres-side equivalents; ``"cash_flow"`` and
     ``"funds"`` return an empty list.
+
+    ``entity_id`` (Contract F20) passes the report scope through to the
+    Postgres engine so both sides of the cross-check read the SAME
+    entity's rows — two entities with posted data never produce false
+    cross-entity drift.  ``None`` keeps the legacy global comparison.
     """
     from src.services.report_service import ReportService
     from src.validators.report import ReportRunRequest
@@ -1188,8 +1194,9 @@ async def verify_against_postgres(
             template_name="profit_and_loss",
             start_date=period["start"],
             end_date=period["end"],
+            entity_id=entity_id,
         )
-        pg = await ReportService.run_pl(db, req)
+        pg = await ReportService.run_pl(db, req, entity_id=entity_id)
         totals = report_dict["totals"]
         diff("revenue", totals["revenue"], pg.revenue.subtotal)
         diff("direct_costs", totals["direct_costs"], pg.direct_costs.subtotal)
@@ -1200,9 +1207,12 @@ async def verify_against_postgres(
     if rt in ("bs", "balance_sheet"):
         as_at = report_dict["as_at"]
         req = ReportRunRequest(
-            template_name="balance_sheet", start_date=as_at, end_date=as_at
+            template_name="balance_sheet",
+            start_date=as_at,
+            end_date=as_at,
+            entity_id=entity_id,
         )
-        pg = await ReportService.run_bs(db, req)
+        pg = await ReportService.run_bs(db, req, entity_id=entity_id)
         totals = report_dict["totals"]
         sections = report_dict["sections"]
         engine_ca = sum(line["amount"] for line in sections["bank"]) + sum(
@@ -1228,9 +1238,12 @@ async def verify_against_postgres(
     if rt in ("tb", "trial_balance"):
         as_at = report_dict["as_at"]
         req = ReportRunRequest(
-            template_name="trial_balance", start_date=date.min, end_date=as_at
+            template_name="trial_balance",
+            start_date=date.min,
+            end_date=as_at,
+            entity_id=entity_id,
         )
-        pg = await ReportService.run_tb(db, req)
+        pg = await ReportService.run_tb(db, req, entity_id=entity_id)
         engine_rows = {
             row["code"]: row["balance"] for row in report_dict["accounts"]
         }

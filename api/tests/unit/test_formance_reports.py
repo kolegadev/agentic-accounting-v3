@@ -1387,3 +1387,136 @@ def test_static_binding_line_item_groups_match_construction_rules() -> None:
                 f"{report_id}/{group}: undocumented engine-only codes "
                 f"{sorted(extra)} (documented extras: {sorted(allowed)})"
             )
+
+
+# ---------------------------------------------------------------------------
+# verify_against_postgres — entity scope pass-through (Contract F20)
+# ---------------------------------------------------------------------------
+
+
+class _ScopeProbe:
+    """Stub ReportService output — subtotals/profits as plain ints."""
+
+    def __init__(self, **values) -> None:
+        self._values = values
+
+    def __getattr__(self, name):
+        if name in self._values:
+            return self._values[name]
+        raise AttributeError(name)
+
+
+async def test_verify_against_postgres_passes_entity_scope_to_postgres_engine(
+    monkeypatch,
+) -> None:
+    """Every cross-check call forwards the resolved entity_id to the
+    Postgres ReportService (and stamps the ReportRunRequest) — the two
+    engines read the SAME entity's rows."""
+    from unittest.mock import AsyncMock, patch
+
+    entity_id = uuid.uuid4()
+    db = AsyncMock()
+
+    class _Subtotal(_ScopeProbe):
+        subtotal = 0
+
+    pg_pl = _ScopeProbe(
+        revenue=_Subtotal(),
+        direct_costs=_Subtotal(),
+        expenses=_Subtotal(),
+        net_profit=0,
+    )
+    pg_bs = _ScopeProbe(
+        current_assets=_Subtotal(),
+        fixed_assets=_Subtotal(),
+        current_liabilities=_Subtotal(),
+        long_term_liabilities=_Subtotal(),
+        equity=_Subtotal(),
+        total_assets=0,
+        total_liabilities=0,
+    )
+    pg_tb = _ScopeProbe(accounts=[])
+
+    pl = {
+        "report": "profit_and_loss",
+        "period": {"start": date(2026, 1, 1), "end": date(2026, 12, 31)},
+        "totals": {"revenue": 0, "direct_costs": 0, "expenses": 0},
+        "profit": 0,
+    }
+    bs = {
+        "report": "balance_sheet",
+        "as_at": date(2026, 12, 31),
+        "sections": {
+            "bank": [],
+            "current_assets": [],
+            "fixed_assets": [],
+            "accumulated_depreciation": [],
+            "current_liabilities": [],
+            "long_term_liabilities": [],
+            "equity": [],
+        },
+        "totals": {"assets": 0, "liabilities": 0},
+    }
+    tb = {
+        "report": "trial_balance",
+        "as_at": date(2026, 12, 31),
+        "accounts": [],
+    }
+
+    with (
+        patch(
+            "src.services.report_service.ReportService.run_pl",
+            new_callable=AsyncMock,
+            return_value=pg_pl,
+        ) as run_pl,
+        patch(
+            "src.services.report_service.ReportService.run_bs",
+            new_callable=AsyncMock,
+            return_value=pg_bs,
+        ) as run_bs,
+        patch(
+            "src.services.report_service.ReportService.run_tb",
+            new_callable=AsyncMock,
+            return_value=pg_tb,
+        ) as run_tb,
+    ):
+        assert await verify_against_postgres(db, pl, "pl", entity_id=entity_id) == []
+        assert await verify_against_postgres(db, bs, "bs", entity_id=entity_id) == []
+        assert await verify_against_postgres(db, tb, "tb", entity_id=entity_id) == []
+
+    run_pl.assert_awaited_once()
+    assert run_pl.await_args.kwargs["entity_id"] == entity_id
+    assert run_pl.await_args.args[1].entity_id == entity_id
+    run_bs.assert_awaited_once()
+    assert run_bs.await_args.kwargs["entity_id"] == entity_id
+    run_tb.assert_awaited_once()
+    assert run_tb.await_args.kwargs["entity_id"] == entity_id
+
+
+async def test_verify_against_postgres_null_scope_keeps_legacy_engine(monkeypatch) -> None:
+    """entity_id=None keeps the legacy global cross-check — the Postgres
+    engine is called WITHOUT an entity scope."""
+    from unittest.mock import AsyncMock, patch
+
+    db = AsyncMock()
+
+    class _Subtotal(_ScopeProbe):
+        subtotal = 0
+
+    pg_tb = _ScopeProbe(accounts=[])
+    tb = {
+        "report": "trial_balance",
+        "as_at": date(2026, 12, 31),
+        "accounts": [],
+    }
+
+    with patch(
+        "src.services.report_service.ReportService.run_tb",
+        new_callable=AsyncMock,
+        return_value=pg_tb,
+    ) as run_tb:
+        assert await verify_against_postgres(db, tb, "tb") == []
+
+    run_tb.assert_awaited_once()
+    assert run_tb.await_args.kwargs["entity_id"] is None
+    assert run_tb.await_args.args[1].entity_id is None

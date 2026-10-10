@@ -24,8 +24,14 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.database import get_db
-from src.services.entity_service import AmbiguousEntityError, resolve_entity_scope
+from src.services.entity_service import (
+    AmbiguousEntityError,
+    EntityNotFoundError,
+    require_active_entity,
+    resolve_entity_scope,
+)
 from src.services.orchestrator import (
+    EntityScopeError,
     approve_entry,
     orchestrate_message,
     reject_entry,
@@ -61,7 +67,7 @@ class TransactionRef(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Entity scope resolution (Contract F19)
+# Entity scope resolution (Contract F19 + F20)
 # ---------------------------------------------------------------------------
 
 
@@ -69,7 +75,14 @@ async def _resolve_scope(
     db: AsyncSession,
     entity_id: Optional[uuid.UUID],
 ) -> Optional[uuid.UUID]:
-    """Explicit > single-active > NULL legacy; ambiguous → the exception."""
+    """Explicit > single-active > NULL legacy; ambiguous → the exception.
+
+    Contract F20: an explicit ``entity_id`` must exist AND be active —
+    else :class:`EntityNotFoundError` (the routes answer 404
+    {type: entity_not_found}) instead of silently degrading to 'main'.
+    """
+    if entity_id is not None:
+        await require_active_entity(db, entity_id)
     return await resolve_entity_scope(db, entity_id)
 
 
@@ -77,6 +90,16 @@ def _ambiguous_response(exc: AmbiguousEntityError) -> JSONResponse:
     return JSONResponse(
         status_code=409,
         content={"type": exc.error_type or "ambiguous_entity", "message": exc.message},
+    )
+
+
+def _entity_not_found_response(exc: EntityNotFoundError) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "type": exc.error_type or "entity_not_found",
+            "message": exc.message,
+        },
     )
 
 
@@ -106,6 +129,8 @@ async def message(
         scope_id = await _resolve_scope(db, data.entity_id)
     except AmbiguousEntityError as exc:
         return _ambiguous_response(exc)
+    except EntityNotFoundError as exc:
+        return _entity_not_found_response(exc)
 
     result = await orchestrate_message(
         db, data.message, history=data.history, entity_id=scope_id
@@ -178,6 +203,8 @@ async def approve(
         scope_id = await _resolve_scope(db, entity_id)
     except AmbiguousEntityError as exc:
         return _ambiguous_response(exc)
+    except EntityNotFoundError as exc:
+        return _entity_not_found_response(exc)
     try:
         result = await approve_entry(db, data.transaction_id, entity_id=scope_id)
     except TransactionNotFoundError as exc:
@@ -215,17 +242,32 @@ async def reject(
     ),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Discard the draft. Posted rows are append-only — never deleted."""
+    """Discard the draft. Posted rows are append-only — never deleted.
+
+    The resolved entity scope passes through to ``reject_entry``: a draft
+    stamped with a different entity is refused (404 entity_mismatch) —
+    never a cross-entity discard (Contract F20).
+    """
     try:
-        await _resolve_scope(db, entity_id)
+        scope_id = await _resolve_scope(db, entity_id)
     except AmbiguousEntityError as exc:
         return _ambiguous_response(exc)
+    except EntityNotFoundError as exc:
+        return _entity_not_found_response(exc)
     try:
-        result = await reject_entry(db, data.transaction_id)
+        result = await reject_entry(db, data.transaction_id, entity_id=scope_id)
     except TransactionNotFoundError as exc:
         raise HTTPException(status_code=404, detail=exc.message)
     except TransactionNotDraftError as exc:
         raise HTTPException(status_code=422, detail=exc.message)
+    except EntityScopeError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "type": exc.error_type or "entity_mismatch",
+                "message": exc.message,
+            },
+        )
     return {"status": result.status, "transaction_id": str(result.transaction_id)}
 
 
@@ -252,6 +294,8 @@ async def pending(
         scope_id = await _resolve_scope(db, entity_id)
     except AmbiguousEntityError as exc:
         return _ambiguous_response(exc)
+    except EntityNotFoundError as exc:
+        return _entity_not_found_response(exc)
     transactions, total = await TransactionService.list_transactions(
         db, status="draft", entity_id=scope_id
     )

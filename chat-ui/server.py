@@ -966,20 +966,26 @@ def _get_upstream_client() -> httpx.AsyncClient:
     return _upstream_client
 
 
-async def _forward_orchestrator(action: str, body: dict | None) -> JSONResponse:
+async def _forward_orchestrator(
+    action: str,
+    body: dict | None,
+    params: dict | None = None,
+) -> JSONResponse:
     """Forward one orchestrator call to the accounting API.
 
     Status code and JSON body pass through untouched; upstream
-    connection failures become a 502 JSON error.
+    connection failures become a 502 JSON error.  ``params`` carries the
+    browser's query string (e.g. ``entity_id`` — Contract F20) through to
+    the upstream route untouched.
     """
     spec = _ORCHESTRATOR_ROUTES[action]
     url = f"{API_BASE_URL}{spec['path']}"
     try:
         client = _get_upstream_client()
         if spec["method"] == "GET":
-            resp = await client.get(url)
+            resp = await client.get(url, params=params)
         else:
-            resp = await client.post(url, json=body)
+            resp = await client.post(url, json=body, params=params)
     except httpx.HTTPError as exc:
         return JSONResponse(
             status_code=502,
@@ -1003,21 +1009,60 @@ async def orchestrator_message(data: dict):
 
 
 @app.post("/api/orchestrator/approve")
-async def orchestrator_approve(data: dict):
+async def orchestrator_approve(data: dict, request: Request):
     """POST → /api/v1/orchestrator/approve (post the approved draft)."""
-    return await _forward_orchestrator("approve", data)
+    return await _forward_orchestrator(
+        "approve", data, params=dict(request.query_params)
+    )
 
 
 @app.post("/api/orchestrator/reject")
-async def orchestrator_reject(data: dict):
+async def orchestrator_reject(data: dict, request: Request):
     """POST → /api/v1/orchestrator/reject (discard the draft)."""
-    return await _forward_orchestrator("reject", data)
+    return await _forward_orchestrator(
+        "reject", data, params=dict(request.query_params)
+    )
 
 
 @app.get("/api/orchestrator/pending")
-async def orchestrator_pending():
+async def orchestrator_pending(request: Request):
     """GET → /api/v1/orchestrator/pending (drafts awaiting approval)."""
-    return await _forward_orchestrator("pending", None)
+    return await _forward_orchestrator(
+        "pending", None, params=dict(request.query_params)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entities forwarding (Contract F20) — real pipeline only, NO mock fallback.
+#
+# GET /api/entities proxies to the accounting API's /api/v1/entities so the
+# UI's entity switcher is fed by the real multi-entity list.  Status and
+# JSON pass through untouched; an unreachable upstream is a 502 JSON.
+# Reuses the same injectable _upstream_client test seam as the F7 routes.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/entities")
+async def entities():
+    """GET → /api/v1/entities (list accounting entities for the switcher)."""
+    url = f"{API_BASE_URL}/api/v1/entities"
+    try:
+        client = _get_upstream_client()
+        resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "type": "upstream_unreachable",
+                "message": f"Accounting API unreachable: {exc}",
+            },
+        )
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=payload)
 
 
 # ---------------------------------------------------------------------------

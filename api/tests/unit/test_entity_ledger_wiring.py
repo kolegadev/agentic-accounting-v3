@@ -305,7 +305,7 @@ async def test_approve_entry_never_consults_get_active_ledger(
             AsyncMock(return_value=parity),
         ) as mock_parity,
         patch(
-            "src.services.orchestrator.get_active_ledger",
+            "src.services.entity_service.get_active_ledger",
             AsyncMock(return_value="entity-abc123"),
         ) as mock_resolve,
     ):

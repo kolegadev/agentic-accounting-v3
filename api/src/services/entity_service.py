@@ -35,7 +35,11 @@ class EntityNotFoundError(EntityServiceError):
     """Entity not found."""
 
     def __init__(self, entity_id: uuid.UUID) -> None:
-        super().__init__(f"Entity '{entity_id}' not found", status_code=404)
+        super().__init__(
+            f"Entity '{entity_id}' not found",
+            status_code=404,
+            error_type="entity_not_found",
+        )
 
 
 class DuplicateEntityNameError(EntityServiceError):
@@ -276,6 +280,10 @@ async def resolve_entity_scope(
     lookup failures (e.g. a pre-F11 schema without the ``entities`` table)
     degrade to ``None`` so the no-entity system keeps behaving exactly as
     before.
+
+    NOTE (Contract F20): this pure resolver does NOT validate an explicit
+    id — callers that must refuse unknown/inactive explicit ids (the
+    orchestrator + report routes) run :func:`require_active_entity` first.
     """
     if entity_id is not None:
         return entity_id
@@ -291,3 +299,20 @@ async def resolve_entity_scope(
         )
         return None
     return active.id if active is not None else None
+
+
+async def require_active_entity(
+    db: AsyncSession,
+    entity_id: uuid.UUID,
+) -> Entity:
+    """Validate an explicit ``entity_id`` (Contract F20): must exist AND be
+    active, else :class:`EntityNotFoundError` (404, ``entity_not_found``).
+
+    Used by the orchestrator + report routes' ``_resolve_scope`` so an
+    unknown explicit id is refused loudly instead of silently degrading to
+    the legacy ``"main"`` scope.
+    """
+    entity = await EntityService.get_entity(db, entity_id)
+    if entity is None or not entity.is_active:
+        raise EntityNotFoundError(entity_id)
+    return entity

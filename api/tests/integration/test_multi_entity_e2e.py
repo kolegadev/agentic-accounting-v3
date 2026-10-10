@@ -47,7 +47,9 @@ from src.routes.orchestrator import (
     TransactionRef,
     approve as approve_route,
     pending as pending_route,
+    reject as reject_route,
 )
+from src.routes.formance_reports import formance_report as formance_report_route
 from src.services.bank_service import BankService
 from src.services.coa_service import CoaService
 from src.services.entity_service import (
@@ -1081,6 +1083,239 @@ async def test_f19_cross_entity_posting_refused(monkeypatch) -> None:
             assert excinfo.value.status_code == 422
             assert excinfo.value.error_type == "entity_mismatch"
             assert str(acc_b.id) in excinfo.value.message
+    finally:
+        await db.close()
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# F20 — entity-scoped cross-check (no false drift), reject ownership,
+#       unknown entity_id 404
+# ---------------------------------------------------------------------------
+
+
+async def test_f20_report_route_cross_check_no_false_drift(monkeypatch) -> None:
+    """F20: two entities BOTH with posted data — the report route for A
+    scopes BOTH engines (the Postgres cross-check included) and returns
+    EMPTY cross_check diffs (the F19 verifier's measured false-drift case:
+    unscoped, B's posted opening balance leaked into A's cross-check)."""
+    monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
+    engine = _make_session_factory()
+    db, owner = await _f19_session(engine)
+    try:
+        fake = LedgerAwareFormance()
+        report_client = MagicMock()
+        report_client.list_transactions = AsyncMock(
+            side_effect=fake.list_transactions
+        )
+        report_client.get_balances = AsyncMock(side_effect=fake.get_balances)
+        with (
+            patch.object(
+                formance_client,
+                "create_transaction",
+                AsyncMock(side_effect=fake.create_transaction),
+            ),
+            patch.object(
+                formance_client, "create_ledger", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                formance_client, "health_check", AsyncMock(return_value=True)
+            ),
+            patch("src.services.formance_reports.formance_client", report_client),
+        ):
+            entity_a = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Alpha Holdings Ltd"),
+                created_by=owner.id,
+            )
+            entity_b = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Beta Trading", legal_type="sole_trader"),
+                created_by=owner.id,
+            )
+            res_a = await setup_entity(
+                db, entity_a.id, "uk_limited_company_vat",
+                opening_balances=_opening(1000000),
+            )
+            res_b = await setup_entity(
+                db, entity_b.id, "uk_sole_trader_vat",
+                opening_balances=_opening(500000, day=7),
+            )
+            draft_a = await TransactionService.get_transaction(
+                db, res_a.opening_transaction_ids[0]
+            )
+            draft_b = await TransactionService.get_transaction(
+                db, res_b.opening_transaction_ids[0]
+            )
+            await TransactionService.post_transaction(db, draft_a.id)
+            await TransactionService.post_transaction(db, draft_b.id)
+
+            # A's scoped report: both engines read ONLY A's rows — the
+            # cross-check agrees exactly (previously: false drift from B).
+            resp = await formance_report_route(
+                report_type="balance-sheet",
+                as_at=date(2026, 12, 31),
+                entity_id=entity_a.id,
+                db=db,
+            )
+            assert resp.status_code == 200, resp.body
+            body = json.loads(resp.body)
+            assert body["report"]["identity_ok"] is True
+            assert body["cross_check"]["ok"] is True
+            assert body["cross_check"]["diffs"] == []
+
+            # B's scoped report agrees too.
+            resp_b = await formance_report_route(
+                report_type="balance-sheet",
+                as_at=date(2026, 12, 31),
+                entity_id=entity_b.id,
+                db=db,
+            )
+            assert resp_b.status_code == 200, resp_b.body
+            assert json.loads(resp_b.body)["cross_check"]["diffs"] == []
+
+            # Unscoped with two active entities stays fail-loud (409).
+            resp = await formance_report_route(
+                report_type="balance-sheet",
+                as_at=date(2026, 12, 31),
+                entity_id=None,
+                db=db,
+            )
+            assert resp.status_code == 409
+            assert json.loads(resp.body)["type"] == "ambiguous_entity"
+    finally:
+        await db.close()
+        await engine.dispose()
+
+
+async def test_f20_reject_cross_entity_refused(monkeypatch) -> None:
+    """F20: the reject route refuses a draft stamped with a DIFFERENT
+    entity (404 entity_mismatch, nothing discarded) and discards it
+    through its OWN entity scope."""
+    monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
+    engine = _make_session_factory()
+    db, owner = await _f19_session(engine)
+    try:
+        with (
+            patch.object(
+                formance_client, "create_ledger", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                formance_client, "health_check", AsyncMock(return_value=True)
+            ),
+        ):
+            entity_a = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Alpha Holdings Ltd"),
+                created_by=owner.id,
+            )
+            entity_b = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Beta Trading", legal_type="sole_trader"),
+                created_by=owner.id,
+            )
+            await setup_entity(
+                db, entity_a.id, "uk_limited_company_vat",
+                opening_balances=_opening(1000000),
+            )
+            res_b = await setup_entity(
+                db, entity_b.id, "uk_sole_trader_vat",
+                opening_balances=_opening(500000, day=7),
+            )
+            draft_b = await TransactionService.get_transaction(
+                db, res_b.opening_transaction_ids[0]
+            )
+            assert draft_b is not None and draft_b.entity_id == entity_b.id
+
+            # A's scope refuses B's draft — never a cross-entity discard.
+            resp = await reject_route(
+                TransactionRef(transaction_id=draft_b.id),
+                entity_id=entity_a.id,
+                db=db,
+            )
+            assert resp.status_code == 404
+            body = json.loads(resp.body)
+            assert body["type"] == "entity_mismatch"
+            still = await TransactionService.get_transaction(db, draft_b.id)
+            assert still is not None and still.status == "draft"
+
+            # B's own scope discards it.
+            resp = await reject_route(
+                TransactionRef(transaction_id=draft_b.id),
+                entity_id=entity_b.id,
+                db=db,
+            )
+            assert resp["status"] == "discarded"
+            assert resp["transaction_id"] == str(draft_b.id)
+            assert await TransactionService.get_transaction(db, draft_b.id) is None
+    finally:
+        await db.close()
+        await engine.dispose()
+
+
+async def test_f20_unknown_entity_id_404(monkeypatch) -> None:
+    """F20: an explicit entity_id that does not exist (or is inactive)
+    gets 404 {type: entity_not_found} on the orchestrator + report routes
+    — never a silent 'main' degradation."""
+    monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
+    engine = _make_session_factory()
+    db, owner = await _f19_session(engine)
+    try:
+        with (
+            patch.object(
+                formance_client, "create_ledger", AsyncMock(return_value=True)
+            ),
+            patch.object(
+                formance_client, "health_check", AsyncMock(return_value=True)
+            ),
+        ):
+            entity_a = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Alpha Holdings Ltd"),
+                created_by=owner.id,
+            )
+            entity_b = await EntityService.create_entity(
+                db,
+                EntityCreate(name="Beta Trading", legal_type="sole_trader"),
+                created_by=owner.id,
+            )
+            res_a = await setup_entity(
+                db, entity_a.id, "uk_limited_company_vat",
+                opening_balances=_opening(1000000),
+            )
+            draft_a = await TransactionService.get_transaction(
+                db, res_a.opening_transaction_ids[0]
+            )
+            unknown = uuid.uuid4()
+
+            resp = await pending_route(entity_id=unknown, db=db)
+            assert resp.status_code == 404
+            assert json.loads(resp.body)["type"] == "entity_not_found"
+
+            resp = await reject_route(
+                TransactionRef(transaction_id=draft_a.id),
+                entity_id=unknown,
+                db=db,
+            )
+            assert resp.status_code == 404
+            assert json.loads(resp.body)["type"] == "entity_not_found"
+
+            resp = await formance_report_route(
+                report_type="trial-balance",
+                as_at=date(2026, 12, 31),
+                entity_id=unknown,
+                db=db,
+            )
+            assert resp.status_code == 404
+            assert json.loads(resp.body)["type"] == "entity_not_found"
+
+            # An INACTIVE entity is refused the same way (exists != usable).
+            await EntityService.update_entity(
+                db, entity_b.id, EntityUpdate(is_active=False)
+            )
+            resp = await pending_route(entity_id=entity_b.id, db=db)
+            assert resp.status_code == 404
+            assert json.loads(resp.body)["type"] == "entity_not_found"
     finally:
         await db.close()
         await engine.dispose()

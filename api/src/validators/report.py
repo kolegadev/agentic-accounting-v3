@@ -44,6 +44,12 @@ class ReportRunRequest(BaseModel):
         False,
         description="Include prior period comparison if True",
     )
+    entity_id: Optional[uuid.UUID] = Field(
+        default=None,
+        description="Optional entity scope (Contract F20) — filters the "
+        "report's Postgres queries to one entity's rows; None = legacy "
+        "unfiltered",
+    )
     parameters: dict[str, Any] = Field(
         default_factory=dict,
         description="Additional report-specific parameters",

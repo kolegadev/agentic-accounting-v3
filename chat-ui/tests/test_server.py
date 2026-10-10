@@ -125,6 +125,42 @@ def test_pending_forwards_get_without_body(client: TestClient, upstream) -> None
     assert req.url.path == "/api/v1/orchestrator/pending"
 
 
+def test_pending_forwards_entity_id_query_param(
+    client: TestClient, upstream
+) -> None:
+    """Contract F20: the browser's ?entity_id= passes through to the
+    upstream orchestrator route untouched."""
+    resp = client.get(
+        "/api/orchestrator/pending",
+        params={"entity_id": "8f0b3c9a-2222-4a2b-9c3d-000000000002"},
+    )
+
+    assert resp.status_code == 200
+    assert upstream[0].url.path == "/api/v1/orchestrator/pending"
+    assert (
+        upstream[0].url.params.get("entity_id")
+        == "8f0b3c9a-2222-4a2b-9c3d-000000000002"
+    )
+
+
+def test_approve_forwards_entity_id_query_param(
+    client: TestClient, upstream
+) -> None:
+    resp = client.post(
+        "/api/orchestrator/approve",
+        json=TX_BODY,
+        params={"entity_id": "8f0b3c9a-3333-4a2b-9c3d-000000000003"},
+    )
+
+    assert resp.status_code == 200
+    assert upstream[0].url.path == "/api/v1/orchestrator/approve"
+    assert (
+        upstream[0].url.params.get("entity_id")
+        == "8f0b3c9a-3333-4a2b-9c3d-000000000003"
+    )
+    assert json.loads(upstream[0].content) == TX_BODY
+
+
 # ---------------------------------------------------------------------------
 # Pass-through of upstream error status + JSON (no mock fallback)
 # ---------------------------------------------------------------------------
@@ -273,3 +309,54 @@ def test_reports_upstream_unreachable_returns_502(
     assert body["status"] == "error"
     assert body["type"] == "upstream_unreachable"
     assert "connection refused" in body["message"]
+
+
+# ---------------------------------------------------------------------------
+# Entities forwarding (Contract F20) — GET → /api/v1/entities, no mock
+# ---------------------------------------------------------------------------
+
+
+def test_entities_forwards_path_and_json(client: TestClient, upstream) -> None:
+    resp = client.get("/api/entities")
+
+    assert resp.status_code == 200
+    echo = resp.json()
+    assert echo["method"] == "GET"
+    assert echo["path"] == "/api/v1/entities"
+    req = upstream[0]
+    assert req.method == "GET"
+    assert req.url.path == "/api/v1/entities"
+
+
+def test_entities_upstream_error_status_and_json_passthrough(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500, json={"type": "internal", "message": "entities table missing"}
+        )
+
+    _set_transport(monkeypatch, handler)
+    resp = client.get("/api/entities")
+
+    assert resp.status_code == 500
+    assert resp.json() == {"type": "internal", "message": "entities table missing"}
+
+
+def test_entities_upstream_unreachable_returns_502(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _set_transport(monkeypatch, handler)
+    resp = client.get("/api/entities")
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "upstream_unreachable"
+    assert "connection refused" in body["message"]
+    # NO mock fallback — an unreachable backend is a hard 502, never
+    # fabricated company/entity data.
+    assert "companies" not in body

@@ -26,6 +26,8 @@ from src.models.entity import Entity
 from src.models.transaction import Posting, Transaction
 from src.services.entity_service import (
     AmbiguousEntityError,
+    EntityNotFoundError,
+    require_active_entity,
     resolve_entity_scope,
 )
 from src.services.ledger_parity import ParityReport, verify_parity
@@ -239,6 +241,69 @@ async def test_resolve_entity_scope_lookup_failure_degrades_to_none() -> None:
 
 
 # ---------------------------------------------------------------------------
+# require_active_entity — explicit-id validation (Contract F20)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_require_active_entity_returns_active_entity() -> None:
+    entity = make_entity()
+    db = AsyncMock()
+    db.execute.return_value = make_result(scalar=entity)
+    assert await require_active_entity(db, entity.id) is entity
+
+
+@pytest.mark.asyncio
+async def test_require_active_entity_unknown_id_raises_404() -> None:
+    db = AsyncMock()
+    db.execute.return_value = make_result(scalar=None)
+
+    with pytest.raises(EntityNotFoundError) as excinfo:
+        await require_active_entity(db, ENTITY_A)
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.error_type == "entity_not_found"
+
+
+@pytest.mark.asyncio
+async def test_require_active_entity_inactive_raises_404() -> None:
+    entity = make_entity(is_active=False)
+    db = AsyncMock()
+    db.execute.return_value = make_result(scalar=entity)
+
+    with pytest.raises(EntityNotFoundError) as excinfo:
+        await require_active_entity(db, entity.id)
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.error_type == "entity_not_found"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_resolve_scope_unknown_explicit_id_raises() -> None:
+    """The route's _resolve_scope validates an explicit id FIRST — an
+    unknown id raises EntityNotFoundError before any resolution."""
+    from src.routes.orchestrator import _resolve_scope
+
+    db = AsyncMock()
+    db.execute.return_value = make_result(scalar=None)
+
+    with pytest.raises(EntityNotFoundError):
+        await _resolve_scope(db, ENTITY_A)
+
+
+@pytest.mark.asyncio
+async def test_formance_reports_resolve_scope_unknown_explicit_id_raises() -> None:
+    """Same validation on the report route's _resolve_scope."""
+    from src.routes.formance_reports import _resolve_scope as report_resolve
+
+    db = AsyncMock()
+    db.execute.return_value = make_result(scalar=None)
+
+    with pytest.raises(EntityNotFoundError):
+        await report_resolve(db, ENTITY_A)
+
+
+# ---------------------------------------------------------------------------
 # orchestrate_message — entity scope resolution + draft stamping
 # ---------------------------------------------------------------------------
 
@@ -358,7 +423,7 @@ async def test_approve_entry_uses_tx_entity_ledger_and_scoped_parity(
             AsyncMock(return_value=parity),
         ) as mock_parity,
         patch(
-            "src.services.orchestrator.get_active_ledger",
+            "src.services.entity_service.get_active_ledger",
             AsyncMock(return_value="main"),
         ) as mock_active_ledger,
     ):
@@ -705,6 +770,11 @@ def test_message_route_passes_entity_id_through(client: TestClient) -> None:
     result = OrchestrateResult.failure("clarification", "which bank account?")
     with (
         patch(
+            "src.routes.orchestrator.require_active_entity",
+            new_callable=AsyncMock,
+            return_value=make_entity(ENTITY_A),
+        ),
+        patch(
             "src.routes.orchestrator.resolve_entity_scope",
             new_callable=AsyncMock,
             return_value=ENTITY_A,
@@ -780,6 +850,11 @@ def test_report_route_passes_explicit_entity_id_to_engine(
     client: TestClient,
 ) -> None:
     with (
+        patch(
+            "src.routes.formance_reports.require_active_entity",
+            new_callable=AsyncMock,
+            return_value=make_entity(ENTITY_A),
+        ),
         patch(
             "src.routes.formance_reports.get_ledger_for_entity",
             new_callable=AsyncMock,
@@ -911,6 +986,11 @@ def test_report_route_explicit_entity_skips_active_lookup(
         patch(
             "src.services.entity_service.get_active_entity", new_callable=AsyncMock
         ) as mock_active,
+        patch(
+            "src.routes.formance_reports.require_active_entity",
+            new_callable=AsyncMock,
+            return_value=make_entity(ENTITY_A),
+        ),
         patch(
             "src.routes.formance_reports.get_ledger_for_entity",
             new_callable=AsyncMock,

@@ -50,6 +50,17 @@ REPORT_ENDPOINTS = [
     "/api/reports/formance/",
 ]
 
+# Contract F20 — the entity switcher: stable DOM ids, the entity list
+# endpoint, and the entity_id query wiring in the JS.
+ENTITY_DOM_IDS = [
+    "entity-select",
+    "entity-label",
+]
+
+ENTITY_ENDPOINTS = [
+    "/api/entities",
+]
+
 
 @pytest.fixture(scope="module")
 def html() -> str:
@@ -75,3 +86,19 @@ def test_required_report_dom_id_present(html: str, dom_id: str) -> None:
 @pytest.mark.parametrize("endpoint", REPORT_ENDPOINTS)
 def test_js_references_report_endpoint(html: str, endpoint: str) -> None:
     assert endpoint in html
+
+
+@pytest.mark.parametrize("dom_id", ENTITY_DOM_IDS)
+def test_required_entity_dom_id_present(html: str, dom_id: str) -> None:
+    assert f'id="{dom_id}"' in html
+
+
+@pytest.mark.parametrize("endpoint", ENTITY_ENDPOINTS)
+def test_js_references_entities_endpoint(html: str, endpoint: str) -> None:
+    assert endpoint in html
+
+
+def test_entity_id_query_wiring_present(html: str) -> None:
+    """The JS wires ?entity_id=<selected> into the orchestrator/report
+    calls when an entity is selected."""
+    assert "entity_id=" in html

@@ -275,6 +275,19 @@
   .co-name { font-size:13.5px; font-weight:600; white-space:nowrap; }
   .co-meta { font-size:10.5px; color:var(--text-dim3); white-space:nowrap; }
   .co-chevron { color:var(--text-dim3); font-size:11px; margin-left:4px; }
+  .entity-switcher { display:flex; align-items:center; gap:7px; }
+  .entity-label {
+    font-size:10.5px; font-weight:600; color:var(--text-dim3);
+    text-transform:uppercase; letter-spacing:.05em; white-space:nowrap;
+    max-width:150px; overflow:hidden; text-overflow:ellipsis;
+  }
+  .entity-select {
+    background:var(--surface4); color:var(--text);
+    border:1px solid var(--border5); border-radius:8px;
+    font-size:12.5px; padding:6px 8px; max-width:210px; cursor:pointer;
+    font-family:inherit;
+  }
+  .entity-select:hover { background:#1a1d22; }
   .co-dropdown {
     position:absolute; top:52px; left:0; width:288px;
     background:var(--surface3); border:1px solid var(--border5);
@@ -728,6 +741,13 @@
       </div>
     </div>
 
+    <div class="entity-switcher" title="Accounting entity — every draft and report is scoped to this entity">
+      <label class="entity-label" id="entity-label" for="entity-select">Entity</label>
+      <select class="entity-select" id="entity-select" onchange="switchEntity(this.value)">
+        <option value="">All (legacy)</option>
+      </select>
+    </div>
+
     <div class="topbar-spacer"></div>
 
     <span class="topbar-pill mono hide-mobile" id="period-pill">VAT Q1 · Apr–Jun 2026</span>
@@ -1071,7 +1091,8 @@ var AppState = {
   companyId: 'brightwork',
   menuOpen: false,
   reportKey: null,
-  adminOpen: false
+  adminOpen: false,
+  entityId: null
 };
 
 // ═══════════════════════════════════════════
@@ -1143,6 +1164,76 @@ async function loadReportFromAPI(companyId, reportType) {
     if (data.title && data.sections) return data;
   } catch(e) {}
   return null;
+}
+
+// ═══════════════════════════════════════════
+//  ENTITY SWITCHER (Contract F20)
+//  Fed from /api/entities (the accounting API's multi-entity list).
+//  When an entity is selected, EVERY orchestrator call (message /
+//  approve / reject / pending) and report fetch carries it via
+//  ?entity_id=<selected> — the reports pane and preview pane re-fetch
+//  on switch.  No entities → legacy NULL scope, byte-identical.
+// ═══════════════════════════════════════════
+var _apiEntitiesCache = null;
+
+function entityParam() {
+  return AppState.entityId ? 'entity_id=' + encodeURIComponent(AppState.entityId) : '';
+}
+
+function entityUrl(path) {
+  var qs = entityParam();
+  return path + (qs ? '?' + qs : '');
+}
+
+async function loadEntitiesFromAPI() {
+  try {
+    var resp = await fetch('/api/entities');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    var data = await resp.json();
+    var items = Array.isArray(data) ? data : (data.entities || []);
+    if (items && items.length) {
+      _apiEntitiesCache = items;
+      renderEntitySelect(items);
+      var known = items.some(function(e) { return String(e.id) === String(AppState.entityId); });
+      if (!AppState.entityId || !known) AppState.entityId = String(items[0].id);
+      syncEntitySelect();
+      debug('Entities loaded from API (' + items.length + '), scope: ' + AppState.entityId);
+      return items;
+    }
+  } catch(e) { debug('loadEntities API: ' + e.message); }
+  return null;
+}
+
+function renderEntitySelect(items) {
+  var sel = document.getElementById('entity-select');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">All (legacy)</option>' + items.map(function(e) {
+    return '<option value="' + esc(String(e.id)) + '">' + esc(e.name) + '</option>';
+  }).join('');
+}
+
+function syncEntitySelect() {
+  var sel = document.getElementById('entity-select');
+  var label = document.getElementById('entity-label');
+  if (!sel) return;
+  sel.value = AppState.entityId || '';
+  var found = null;
+  if (_apiEntitiesCache && AppState.entityId) {
+    found = _apiEntitiesCache.find(function(e) { return String(e.id) === String(AppState.entityId); });
+  }
+  if (label) label.textContent = found ? found.name : 'Entity';
+}
+
+async function switchEntity(entityId) {
+  AppState.entityId = entityId || null;
+  syncEntitySelect();
+  // The preview + pending panes belong to the entity scope: clear the
+  // current draft preview and re-fetch pending + the open report.
+  renderPreview(null);
+  setPreviewStatus('Entity scope changed — drafts and reports reloaded.', 'ready');
+  loadPendingDrafts();
+  loadFormanceReport();
+  _log('state_change', 'switchEntity', {entityId: AppState.entityId});
 }
 
 // ═══════════════════════════════════════════
@@ -2207,6 +2298,13 @@ function closeAdmin() {
   // ── Initial load: try API first, fall back to local ──
   (async function init() {
     await loadCompaniesFromAPI();
+    var ents = await loadEntitiesFromAPI();
+    if (ents && ents.length) {
+      // Entity scope established (default = first entity) — the pending
+      // and reports panes re-fetch under the new scope (Contract F20).
+      loadPendingDrafts();
+      loadFormanceReport();
+    }
     var data = await loadDashboardFromAPI(AppState.companyId);
     renderDashboard(data);
     var c = activeCompany();
@@ -2308,10 +2406,12 @@ function renderPreview(data) {
 async function requestOrchestratorPreview(text) {
   try {
     setPreviewStatus('Classifying & constructing draft…', 'working');
+    var body = { message: text };
+    if (AppState.entityId) body.entity_id = AppState.entityId;
     var resp = await fetch('/api/orchestrator/message', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text })
+      body: JSON.stringify(body)
     });
     var data = await resp.json();
     if (resp.status === 422) {
@@ -2343,7 +2443,7 @@ async function approvePreview() {
   if (btn) btn.disabled = true;
   setPreviewStatus('Posting to the ledger & mirroring to Formance…', 'working');
   try {
-    var resp = await fetch('/api/orchestrator/approve', {
+    var resp = await fetch(entityUrl('/api/orchestrator/approve'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ transaction_id: OrchState.transactionId })
@@ -2373,7 +2473,7 @@ async function rejectPreview() {
   var btn = document.getElementById('preview-reject');
   if (btn) btn.disabled = true;
   try {
-    var resp = await fetch('/api/orchestrator/reject', {
+    var resp = await fetch(entityUrl('/api/orchestrator/reject'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ transaction_id: OrchState.transactionId })
@@ -2399,7 +2499,7 @@ async function loadPendingDrafts() {
   var list = document.getElementById('pending-drafts');
   if (!list) return;
   try {
-    var resp = await fetch('/api/orchestrator/pending');
+    var resp = await fetch(entityUrl('/api/orchestrator/pending'));
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     var data = await resp.json();
     var items = (data && data.transactions) || data || [];
@@ -2422,7 +2522,7 @@ async function loadPendingDrafts() {
 
 async function loadPendingDraft(transactionId) {
   try {
-    var resp = await fetch('/api/orchestrator/pending');
+    var resp = await fetch(entityUrl('/api/orchestrator/pending'));
     var data = await resp.json();
     var items = (data && data.transactions) || data || [];
     var t = null;
@@ -2589,6 +2689,8 @@ async function loadFormanceReport() {
     var aa = document.getElementById('report-as-at').value;
     if (aa) qs.push('as_at=' + encodeURIComponent(aa));
   }
+  var eqs = entityParam();
+  if (eqs) qs.push(eqs);
   var url = '/api/reports/formance/' + encodeURIComponent(type) + (qs.length ? '?' + qs.join('&') : '');
   var out = document.getElementById('report-output');
   var ccEl = document.getElementById('report-crosscheck');

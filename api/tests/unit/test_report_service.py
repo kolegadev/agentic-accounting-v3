@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -856,3 +856,163 @@ class TestRunDispatch:
         result = await ReportService.run(db, data)
 
         assert result.report_type == "aged_ap"
+
+
+
+# ---------------------------------------------------------------------------
+# Entity scoping (Contract F20) — the Postgres queries filter entity_id only
+# when one is provided; None keeps the legacy unfiltered SQL.
+# ---------------------------------------------------------------------------
+
+
+class TestEntityScopedQueries:
+    """Statement-capture tests: run_pl/run_bs/run_tb bind the entity filter
+    when entity_id is set and never when it is None."""
+
+    @staticmethod
+    def _capturing_db() -> tuple[AsyncMock, list[dict]]:
+        params: list[dict] = []
+
+        async def _execute(stmt, *args, **kwargs):
+            params.append(stmt.compile().params)
+            return _mock_result([])
+
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=_execute)
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock(side_effect=_make_refresh())
+        return db, params
+
+    @staticmethod
+    def _pl_request(**overrides) -> ReportRunRequest:
+        kwargs = {
+            "template_name": "profit_and_loss",
+            "start_date": date(2026, 1, 1),
+            "end_date": date(2026, 12, 31),
+            "comparison": False,
+        }
+        kwargs.update(overrides)
+        return ReportRunRequest(**kwargs)
+
+    @staticmethod
+    def _bs_request() -> ReportRunRequest:
+        return ReportRunRequest(
+            template_name="balance_sheet",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+
+    @staticmethod
+    def _tb_request() -> ReportRunRequest:
+        return ReportRunRequest(
+            template_name="trial_balance",
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 12, 31),
+        )
+
+    @staticmethod
+    def _filtered(params: dict) -> bool:
+        return any("entity_id" in key for key in params)
+
+    @pytest.mark.asyncio
+    async def test_run_pl_entity_id_filters_transactions(self):
+        entity_id = uuid.uuid4()
+        db, params = self._capturing_db()
+
+        result = await ReportService.run_pl(
+            db, self._pl_request(), entity_id=entity_id
+        )
+
+        assert result.net_profit == 0
+        assert len(params) == 1
+        assert self._filtered(params[0])
+        assert str(entity_id) in str(list(params[0].values()))
+
+    @pytest.mark.asyncio
+    async def test_run_pl_null_scope_unfiltered(self):
+        db, params = self._capturing_db()
+
+        result = await ReportService.run_pl(db, self._pl_request())
+
+        assert result.net_profit == 0
+        assert len(params) == 1
+        assert not self._filtered(params[0])
+
+    @pytest.mark.asyncio
+    async def test_run_pl_comparison_filters_both_periods(self):
+        entity_id = uuid.uuid4()
+        db, params = self._capturing_db()
+
+        await ReportService.run_pl(
+            db, self._pl_request(comparison=True), entity_id=entity_id
+        )
+
+        assert len(params) == 2
+        assert all(self._filtered(p) for p in params)
+
+    @pytest.mark.asyncio
+    async def test_run_bs_entity_id_filters_balance_query(self):
+        entity_id = uuid.uuid4()
+        db, params = self._capturing_db()
+
+        result = await ReportService.run_bs(
+            db, self._bs_request(), entity_id=entity_id
+        )
+
+        assert result.balanced is True
+        assert len(params) == 1
+        assert self._filtered(params[0])
+
+    @pytest.mark.asyncio
+    async def test_run_bs_null_scope_unfiltered(self):
+        db, params = self._capturing_db()
+
+        result = await ReportService.run_bs(db, self._bs_request())
+
+        assert result.balanced is True
+        assert len(params) == 1
+        assert not self._filtered(params[0])
+
+    @pytest.mark.asyncio
+    async def test_run_tb_entity_id_filters_query(self):
+        entity_id = uuid.uuid4()
+        db, params = self._capturing_db()
+
+        result = await ReportService.run_tb(
+            db, self._tb_request(), entity_id=entity_id
+        )
+
+        assert result.balanced is True
+        assert len(params) == 1
+        assert self._filtered(params[0])
+
+    @pytest.mark.asyncio
+    async def test_run_tb_null_scope_unfiltered(self):
+        db, params = self._capturing_db()
+
+        result = await ReportService.run_tb(db, self._tb_request())
+
+        assert result.balanced is True
+        assert len(params) == 1
+        assert not self._filtered(params[0])
+
+    @pytest.mark.asyncio
+    async def test_run_dispatcher_passes_entity_id_from_request(self):
+        entity_id = uuid.uuid4()
+        db, _params = self._capturing_db()
+        data = self._pl_request(entity_id=entity_id)
+
+        class _FakePgReport:
+            def model_dump(self) -> dict:
+                return {"report_type": "profit_and_loss"}
+
+        with patch(
+            "src.services.report_service.ReportService.run_pl",
+            new_callable=AsyncMock,
+        ) as run_pl:
+            run_pl.return_value = _FakePgReport()
+            await ReportService.run(db, data)
+
+        run_pl.assert_awaited_once()
+        assert run_pl.await_args.kwargs["entity_id"] == entity_id
+        assert run_pl.await_args.args[1].entity_id == entity_id

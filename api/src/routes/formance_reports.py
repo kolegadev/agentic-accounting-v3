@@ -28,7 +28,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config.database import get_db
 from src.services.entity_service import (
     AmbiguousEntityError,
+    EntityNotFoundError,
     get_ledger_for_entity,
+    require_active_entity,
     resolve_entity_scope,
 )
 from src.services.formance_reports import (
@@ -55,7 +57,14 @@ async def _resolve_scope(
     db: AsyncSession,
     entity_id: Optional[uuid.UUID],
 ) -> tuple[Optional[uuid.UUID], str]:
-    """(entity scope, ledger) per the F19 rule; ambiguous raises."""
+    """(entity scope, ledger) per the F19 rule; ambiguous raises.
+
+    Contract F20: an explicit ``entity_id`` must exist AND be active —
+    else :class:`EntityNotFoundError` (the route answers 404
+    {type: entity_not_found}) instead of silently degrading to 'main'.
+    """
+    if entity_id is not None:
+        await require_active_entity(db, entity_id)
     scope_id = await resolve_entity_scope(db, entity_id)
     if scope_id is None:
         return None, "main"
@@ -127,9 +136,10 @@ async def formance_report(
             },
         )
 
-    # Resolve the entity scope once per request (Contract F19): explicit id
-    # > single active entity > NULL legacy; ambiguity is a 409, never a
-    # silent 'main'.
+    # Resolve the entity scope once per request (Contract F19 + F20):
+    # explicit id (validated) > single active entity > NULL legacy;
+    # ambiguity is a 409, an unknown explicit id a 404 — never a silent
+    # 'main'.
     try:
         scope_id, ledger = await _resolve_scope(db, entity_id)
     except AmbiguousEntityError as exc:
@@ -137,6 +147,14 @@ async def formance_report(
             status_code=409,
             content={
                 "type": exc.error_type or "ambiguous_entity",
+                "message": exc.message,
+            },
+        )
+    except EntityNotFoundError as exc:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "type": exc.error_type or "entity_not_found",
                 "message": exc.message,
             },
         )
@@ -170,7 +188,9 @@ async def formance_report(
         )
 
     if report_type == "pl" or report_type in BALANCE_TYPES:
-        diffs = await verify_against_postgres(db, report, report_type)
+        diffs = await verify_against_postgres(
+            db, report, report_type, entity_id=scope_id
+        )
         cross_check = {"diffs": diffs, "ok": not bool(diffs)}
     else:
         cross_check = {

@@ -31,7 +31,6 @@ from src.constructors.facts import FACTS_MODELS, parse_facts
 from src.services.coa_service import CoaService
 from src.services.entity_service import (
     AmbiguousEntityError,
-    get_active_ledger,  # noqa: F401 — patch seam for legacy tests
     get_ledger_for_entity,
     resolve_entity_scope,
 )
@@ -46,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "LLMError",
+    "EntityScopeError",
     "OrchestrateResult",
     "PostResult",
     "PreviewLeg",
@@ -88,6 +88,30 @@ LLMTransport = Callable[[str, str], Awaitable[str]]
 
 class LLMError(Exception):
     """LLM transport failed or returned an unparseable response."""
+
+
+class EntityScopeError(TransactionServiceError):
+    """A draft is stamped with a different entity than the request scope.
+
+    Contract F20: the reject route carries a resolved ``entity_id``; a
+    draft owned by a DIFFERENT entity (or the NULL legacy scope) is
+    invisible within that scope, so the refusal is a 404
+    (EntityNotFoundError-style) with ``error_type="entity_mismatch"`` —
+    never a cross-entity discard.
+    """
+
+    def __init__(
+        self,
+        transaction_id: uuid.UUID,
+        draft_entity_id: uuid.UUID | None,
+        scope_entity_id: uuid.UUID,
+    ) -> None:
+        super().__init__(
+            f"Transaction '{transaction_id}' belongs to entity "
+            f"'{draft_entity_id}', not the request scope '{scope_entity_id}'",
+            status_code=404,
+        )
+        self.error_type = "entity_mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -509,11 +533,26 @@ async def approve_entry(
     )
 
 
-async def reject_entry(db: Any, transaction_id: uuid.UUID) -> RejectResult:
+async def reject_entry(
+    db: Any,
+    transaction_id: uuid.UUID,
+    entity_id: uuid.UUID | None = None,
+) -> RejectResult:
     """Discard a draft. Posted/reversed rows are append-only — never deleted.
+
+    ``entity_id`` (Contract F20) scopes the discard: a draft stamped with
+    a DIFFERENT entity — including the NULL legacy scope — is refused with
+    :class:`EntityScopeError` (404).  ``None`` keeps the legacy unscoped
+    discard.
 
     Raises TransactionNotFoundError / TransactionNotDraftError from the
     service layer.
     """
+    if entity_id is not None:
+        draft = await TransactionService.get_transaction(db, transaction_id)
+        if draft is None:
+            raise TransactionNotFoundError(transaction_id)
+        if draft.entity_id != entity_id:
+            raise EntityScopeError(transaction_id, draft.entity_id, entity_id)
     await TransactionService.discard_draft(db, transaction_id)
     return RejectResult(transaction_id=transaction_id)

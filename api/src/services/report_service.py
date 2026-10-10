@@ -169,9 +169,13 @@ class ReportService:
         db: AsyncSession,
         start_date: date,
         end_date: date,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> list[Transaction]:
         """Fetch all posted transactions with postings, accounts, and VAT lines
         within the given date range.
+
+        ``entity_id`` (Contract F20) scopes the query to one entity's rows;
+        ``None`` keeps the legacy unfiltered query.
         """
         stmt = (
             select(Transaction)
@@ -188,6 +192,8 @@ class ReportService:
             )
             .order_by(Transaction.effective_date)
         )
+        if entity_id is not None:
+            stmt = stmt.where(Transaction.entity_id == entity_id)
         result = await db.execute(stmt)
         return list(result.scalars().all())
 
@@ -195,8 +201,13 @@ class ReportService:
     async def _query_transactions_for_balance(
         db: AsyncSession,
         as_of_date: date,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> list[Transaction]:
-        """Fetch all posted transactions up to the given date for balance sheet."""
+        """Fetch all posted transactions up to the given date for balance sheet.
+
+        ``entity_id`` (Contract F20) scopes the query to one entity's rows;
+        ``None`` keeps the legacy unfiltered query.
+        """
         stmt = (
             select(Transaction)
             .options(
@@ -208,6 +219,8 @@ class ReportService:
                 Transaction.effective_date <= as_of_date,
             )
         )
+        if entity_id is not None:
+            stmt = stmt.where(Transaction.entity_id == entity_id)
         result = await db.execute(stmt)
         return list(result.scalars().all())
 
@@ -278,19 +291,23 @@ class ReportService:
     async def run_pl(
         db: AsyncSession,
         data: ReportRunRequest,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> ProfitAndLossReport:
         """Generate a Profit & Loss (Income Statement) report.
 
         Structure:
           Revenue - Direct Costs = Gross Profit
           Gross Profit - Expenses = Net Profit
+
+        ``entity_id`` (Contract F20) scopes the underlying queries to one
+        entity's rows; ``None`` = legacy unfiltered.
         """
         # Stage 1: validate
         ReportService._validate_params(data)
 
         # Stage 2: query
         transactions = await ReportService._query_transactions(
-            db, data.start_date, data.end_date
+            db, data.start_date, data.end_date, entity_id=entity_id
         )
 
         # Previous period for comparison
@@ -300,7 +317,7 @@ class ReportService:
             prev_start = data.start_date - delta - timedelta(days=1)
             prev_end = data.start_date - timedelta(days=1)
             prev_transactions = await ReportService._query_transactions(
-                db, prev_start, prev_end
+                db, prev_start, prev_end, entity_id=entity_id
             )
 
         # Stage 3: group by category
@@ -455,6 +472,7 @@ class ReportService:
     async def run_bs(
         db: AsyncSession,
         data: ReportRunRequest,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> BalanceSheetReport:
         """Generate a Balance Sheet (Statement of Financial Position).
 
@@ -462,6 +480,9 @@ class ReportService:
           Current Assets + Fixed Assets = Total Assets
           Current Liabilities + Long-term Liabilities + Equity = Total L+E
           Must balance: Total Assets == Total Liabilities + Equity
+
+        ``entity_id`` (Contract F20) scopes the underlying queries to one
+        entity's rows; ``None`` = legacy unfiltered.
         """
         # Stage 1: validate
         ReportService._validate_params(data)
@@ -471,7 +492,7 @@ class ReportService:
 
         # Stage 2: query all transactions up to as_of_date
         transactions = await ReportService._query_transactions_for_balance(
-            db, as_of_date
+            db, as_of_date, entity_id=entity_id
         )
 
         # Stage 3: group by account
@@ -631,18 +652,22 @@ class ReportService:
     async def run_tb(
         db: AsyncSession,
         data: ReportRunRequest,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> TrialBalanceReport:
         """Generate a Trial Balance report.
 
         Lists every account with debit/credit totals and verifies
         total debits == total credits.
+
+        ``entity_id`` (Contract F20) scopes the underlying queries to one
+        entity's rows; ``None`` = legacy unfiltered.
         """
         # Stage 1: validate
         ReportService._validate_params(data)
 
         # Stage 2: query
         transactions = await ReportService._query_transactions(
-            db, data.start_date, data.end_date
+            db, data.start_date, data.end_date, entity_id=entity_id
         )
 
         # Stage 3: group by account
@@ -898,11 +923,11 @@ class ReportService:
         template_name = data.template_name
 
         if template_name == "profit_and_loss":
-            report = await ReportService.run_pl(db, data)
+            report = await ReportService.run_pl(db, data, entity_id=data.entity_id)
         elif template_name == "balance_sheet":
-            report = await ReportService.run_bs(db, data)
+            report = await ReportService.run_bs(db, data, entity_id=data.entity_id)
         elif template_name == "trial_balance":
-            report = await ReportService.run_tb(db, data)
+            report = await ReportService.run_tb(db, data, entity_id=data.entity_id)
         elif template_name == "aged_ar":
             report = await ReportService.run_ar_aging(db, data)
         elif template_name == "aged_ap":
