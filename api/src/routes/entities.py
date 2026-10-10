@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -125,11 +125,14 @@ async def create_entity(
     status_code=status.HTTP_200_OK,
 )
 async def list_entities(
+    include_inactive: bool = Query(
+        False, description="Include inactive entities in the listing"
+    ),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[EntityResponse]:
-    """Return all accounting entities, newest first."""
-    entities = await EntityService.list_entities(db)
+    """Return accounting entities, newest first. Active-only by default."""
+    entities = await EntityService.list_entities(db, include_inactive=include_inactive)
     return [EntityResponse.model_validate(e) for e in entities]
 
 

@@ -99,6 +99,16 @@ def test_js_references_entities_endpoint(html: str, endpoint: str) -> None:
 
 
 def test_entity_id_query_wiring_present(html: str) -> None:
-    """The JS wires ?entity_id=<selected> into the orchestrator/report
-    calls when an entity is selected."""
+    """The JS wires ?entity_id=<selected> into EVERY orchestrator/report
+    call when an entity is selected — pinned per call site so a future
+    regression that drops one call site's scope is caught."""
     assert "entity_id=" in html
+    # approve / reject / pending fetch through the scoped helper
+    assert "entityUrl('/api/orchestrator/approve')" in html
+    assert "entityUrl('/api/orchestrator/reject')" in html
+    assert "entityUrl('/api/orchestrator/pending')" in html
+    # message carries the entity in the request body
+    assert "body.entity_id = AppState.entityId" in html
+    # report fetch appends the entity param
+    assert "var eqs = entityParam();" in html
+    assert "'/api/reports/formance/'" in html

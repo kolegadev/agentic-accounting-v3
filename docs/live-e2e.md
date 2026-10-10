@@ -261,3 +261,35 @@ cd formance-mcp && .venv/bin/python -m pytest -q
 
 → 0 failed, 60 passed, 1 skipped (the live MCP test skips on hosts without
 a ledger).
+
+## Fresh start (reset for a new test day)
+
+One-shot full reset of every accounting datastore on thebrick (leaves the
+live Katra containers untouched — they mount anonymous/bind volumes, not
+the `agentic-accounting_*` named ones):
+
+```bash
+# from a synced repo tree on thebrick (e.g. /tmp/aa-live)
+docker rm -f accounting-api accounting-gateway accounting-postgres \
+             accounting-redis accounting-minio accounting-formance \
+             accounting-formance-pg 2>/dev/null || true
+docker volume rm agentic-accounting_postgres_data agentic-accounting_minio_data \
+                  agentic-accounting_redis_data agentic-accounting_katra_minio_data \
+                  agentic-accounting_katra_mongo_data agentic-accounting_katra_redis_data \
+                  aa-live_formance_data 2>/dev/null || true
+```
+
+First-run sequence for a new test day (blank databases):
+
+```bash
+docker compose up -d postgres redis formance-postgres formance-ledger
+# wait for health: curl -s http://127.0.0.1:3068/_info  (Formance) and
+#   docker exec accounting-postgres pg_isready -U accounting
+cd api && DATABASE_URL=postgresql+asyncpg://accounting:accounting@127.0.0.1:5432/accounting \
+  .venv/bin/python -m alembic upgrade head
+# then start the API (uvicorn src.index:app --port 8000), chat-ui, and use
+# POST /api/v1/entities to create the first entity + setup its COA/ledger.
+```
+
+The publish working clone at `/tmp/aa-v3-push` is intentionally kept; every
+other `/tmp/aa-*` artifact is transient.

@@ -119,6 +119,15 @@ async def run_report(
     - comparison: include prior period comparison (P&L only)
     - parameters: additional report-specific parameters
     """
+    if data.entity_id is not None:
+        from src.services.entity_service import EntityService
+
+        entity = await EntityService.get_entity(db, data.entity_id)
+        if entity is None or not entity.is_active:
+            raise HTTPException(
+                status_code=404,
+                detail={"type": "entity_not_found", "message": "entity not found or inactive"},
+            )
     try:
         return await ReportService.run(db, data)
     except ReportTemplateNotFoundError as exc:

@@ -509,3 +509,17 @@ def test_entity_status_404(client: TestClient) -> None:
         resp = client.get(f"/api/v1/entities/{ENTITY_ID}/status")
 
     assert resp.status_code == 404
+
+
+def test_list_entities_filters_inactive(client: TestClient) -> None:
+    """GET /entities excludes inactive entities by default."""
+    _override_auth(make_user("viewer"))
+    with patch(
+        "src.routes.entities.EntityService.list_entities",
+        new_callable=AsyncMock,
+    ) as mock_list:
+        mock_list.return_value = []
+        response = client.get("/api/v1/entities")
+        assert response.status_code == 200
+        mock_list.assert_called_once()
+        assert mock_list.call_args.kwargs.get("include_inactive") is False

@@ -156,11 +156,14 @@ class EntityService:
         return result.scalar_one_or_none()
 
     @staticmethod
-    async def list_entities(db: AsyncSession) -> list[Entity]:
-        """List all entities, newest first."""
-        result = await db.execute(
-            select(Entity).order_by(Entity.created_at.desc())
-        )
+    async def list_entities(
+        db: AsyncSession, include_inactive: bool = False
+    ) -> list[Entity]:
+        """List entities, newest first. Active-only by default."""
+        stmt = select(Entity).order_by(Entity.created_at.desc())
+        if not include_inactive:
+            stmt = stmt.where(Entity.is_active == True)  # noqa: E712
+        result = await db.execute(stmt)
         return list(result.scalars().all())
 
     @staticmethod

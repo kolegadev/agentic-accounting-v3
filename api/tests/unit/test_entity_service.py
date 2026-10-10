@@ -386,3 +386,21 @@ async def test_update_entity_empty_name_400(mock_db: AsyncMock) -> None:
 
     with pytest.raises(EntityServiceError, match="name is required"):
         await EntityService.update_entity(mock_db, entity.id, EntityUpdate(name=" "))
+
+
+async def test_list_entities_excludes_inactive_by_default() -> None:
+    """The entity dropdown must not offer inactive entities (F20 nits)."""
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = []
+    db.execute = AsyncMock(return_value=result)
+
+    await EntityService.list_entities(db)
+    stmt = db.execute.await_args.args[0]
+    sql = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+    assert "entities.is_active = true" in sql.lower()
+
+    await EntityService.list_entities(db, include_inactive=True)
+    stmt = db.execute.await_args.args[0]
+    sql = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+    assert "where" not in sql.lower()
