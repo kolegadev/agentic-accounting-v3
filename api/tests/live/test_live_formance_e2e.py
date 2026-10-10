@@ -167,6 +167,7 @@ _SQLITE_SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS accounts (
         id CHAR(36) PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
+        entity_id CHAR(36),
         code VARCHAR(10) NOT NULL UNIQUE,
         name VARCHAR(255) NOT NULL,
         category VARCHAR(20) NOT NULL,
@@ -181,6 +182,7 @@ _SQLITE_SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS transactions (
         id CHAR(36) PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
+        entity_id CHAR(36),
         reference VARCHAR(14) UNIQUE,
         description TEXT,
         contact_id CHAR(36),
@@ -218,6 +220,7 @@ _SQLITE_SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS bank_accounts (
         id CHAR(36) PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
+        entity_id CHAR(36),
         name VARCHAR(255) NOT NULL,
         sort_code VARCHAR(10),
         account_number VARCHAR(20),

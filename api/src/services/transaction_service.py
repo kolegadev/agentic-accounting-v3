@@ -16,6 +16,7 @@ from sqlalchemy.orm import selectinload
 
 from src.models.account import Account
 from src.models.transaction import Posting, Transaction, VATLine
+from src.services.entity_service import get_ledger_for_entity
 from src.services.formance_client import formance_client, FormanceClient
 from src.validators.transaction import (
     PostingCreate,
@@ -314,12 +315,15 @@ class TransactionService:
     async def create_transaction(
         db: AsyncSession,
         data: TransactionCreate,
+        *,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> Transaction:
         """Create a new transaction in Draft status.
 
-        Checks idempotency — if the idempotency_key already exists,
-        returns the existing transaction (or raises if the caller prefers
-        to handle it differently).
+        ``entity_id`` stamps the row with its owning entity (NULL = the
+        legacy/global scope).  Checks idempotency — if the idempotency_key
+        already exists, returns the existing transaction (or raises if the
+        caller prefers to handle it differently).
         """
         # ---- Idempotency check ----
         existing = await db.execute(
@@ -344,6 +348,7 @@ class TransactionService:
         )  # debits == credits at this point
 
         transaction = Transaction(
+            entity_id=entity_id,
             description=data.description,
             contact_id=data.contact_id,
             currency=data.currency,
@@ -378,9 +383,12 @@ class TransactionService:
     ) -> Transaction:
         """Post a Draft transaction — validates, assigns JE ref, sets status.
 
-        ``ledger`` is the Formance ledger to mirror to; ``None`` (the
-        default) mirrors to ``"main"`` — backward compatible with direct
-        callers that don't resolve an entity ledger.
+        The Formance mirror ledger is resolved from the TRANSACTION's own
+        ``entity_id`` via :func:`get_ledger_for_entity` (the entity's
+        ledger, or ``"main"`` for NULL-scoped legacy rows) — never a
+        global guess.  An explicit ``ledger`` argument remains as an
+        OVERRIDE only, for callers that resolve the ledger themselves
+        (e.g. the orchestrator).
 
         Raises TransactionNotFoundError, TransactionNotDraftError,
         or UnbalancedTransactionError.
@@ -421,9 +429,13 @@ class TransactionService:
         await db.commit()
         await db.refresh(transaction, attribute_names=["postings"])
 
-        # Post to Formance Ledger if available
+        # Post to Formance Ledger if available — the ledger follows the
+        # transaction's own entity (NULL entity -> "main"), unless the
+        # caller supplied an explicit override.
         await TransactionService._post_to_formance(
-            db, transaction, ledger=ledger or "main"
+            db, transaction, ledger=ledger or await get_ledger_for_entity(
+                db, transaction.entity_id
+            )
         )
 
         return transaction
@@ -476,10 +488,15 @@ class TransactionService:
         date_from: Optional[date] = None,
         date_to: Optional[date] = None,
         contact_id: Optional[uuid.UUID] = None,
+        entity_id: Optional[uuid.UUID] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[Transaction], int]:
-        """List transactions with optional filters. Returns (items, total_count)."""
+        """List transactions with optional filters. Returns (items, total_count).
+
+        ``entity_id`` scopes the listing to one entity's transactions;
+        ``None`` keeps the legacy global listing (Contract F18).
+        """
         stmt = (
             select(Transaction)
             .options(
@@ -497,6 +514,8 @@ class TransactionService:
             stmt = stmt.where(Transaction.effective_date <= date_to)
         if contact_id:
             stmt = stmt.where(Transaction.contact_id == contact_id)
+        if entity_id is not None:
+            stmt = stmt.where(Transaction.entity_id == entity_id)
 
         # ---- Count ----
         count_stmt = select(func.count()).select_from(stmt.subquery())
@@ -520,8 +539,10 @@ class TransactionService:
 
         The original transaction is set to 'reversed' status, and a new
         transaction is created with debits/credits swapped.  The new
-        transaction is automatically posted.  ``ledger`` mirrors the
-        reversal to the given Formance ledger (default ``"main"``).
+        transaction is automatically posted, inherits the original's
+        ``entity_id``, and mirrors to the ledger resolved from that entity
+        (``"main"`` for NULL-scoped legacy rows) — an explicit ``ledger``
+        argument remains an OVERRIDE only.
         """
         # ---- Load original ----
         stmt = (
@@ -550,9 +571,10 @@ class TransactionService:
                 )
             )
 
-        # ---- Create new reversing transaction ----
+        # ---- Create new reversing transaction (inherits the entity) ----
         total = sum(pp.debit_amount for pp in reversed_postings)
         reversing_tx = Transaction(
+            entity_id=original.entity_id,
             description=f"Reversal of {original.reference or original.id}",
             contact_id=original.contact_id,
             currency=original.currency,
@@ -588,9 +610,13 @@ class TransactionService:
         await db.commit()
         await db.refresh(reversing_tx, attribute_names=["postings"])
 
-        # Mirror the reversing entry to Formance with the same pairing logic
+        # Mirror the reversing entry to Formance with the same pairing logic —
+        # the ledger follows the ORIGINAL transaction's entity (the reversal
+        # inherits it), unless an explicit override was supplied.
         await TransactionService._post_to_formance(
-            db, reversing_tx, ledger=ledger or "main"
+            db, reversing_tx, ledger=ledger or await get_ledger_for_entity(
+                db, reversing_tx.entity_id
+            )
         )
 
         return reversing_tx

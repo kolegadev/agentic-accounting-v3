@@ -29,10 +29,11 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.exc import MultipleResultsFound
 
 from src.constructors import CONSTRUCTORS, ConstructorError, resolve_from_coa
 from src.constructors.facts import OpeningBalanceItem, OpeningBalancesFacts
@@ -68,35 +69,88 @@ class SetupError(Exception):
         super().__init__(message)
 
 
-async def _account_count(db: AsyncSession) -> int:
-    """Number of rows in the global chart of accounts."""
-    result = await db.execute(select(func.count()).select_from(Account))
+async def _account_count(
+    db: AsyncSession,
+    entity_id: Optional[uuid.UUID] = None,
+) -> int:
+    """Number of rows in the chart of accounts (scoped to ``entity_id``).
+
+    ``None`` keeps the legacy global count (unfiltered).
+    """
+    stmt = select(func.count()).select_from(Account)
+    if entity_id is not None:
+        stmt = stmt.where(Account.entity_id == entity_id)
+    result = await db.execute(stmt)
     return int(result.scalar_one_or_none() or 0)
 
 
-async def _bank_count(db: AsyncSession) -> int:
-    """Number of bank account rows (any row, active or not)."""
-    result = await db.execute(select(func.count()).select_from(BankAccount))
+async def _bank_count(
+    db: AsyncSession,
+    entity_id: Optional[uuid.UUID] = None,
+) -> int:
+    """Number of bank account rows (any row, active or not; entity-scoped)."""
+    stmt = select(func.count()).select_from(BankAccount)
+    if entity_id is not None:
+        stmt = stmt.where(BankAccount.entity_id == entity_id)
+    result = await db.execute(stmt)
     return int(result.scalar_one_or_none() or 0)
 
 
-async def _draft_count(db: AsyncSession) -> int:
-    """Number of draft transactions."""
-    result = await db.execute(
+async def _draft_count(
+    db: AsyncSession,
+    entity_id: Optional[uuid.UUID] = None,
+) -> int:
+    """Number of draft transactions (entity-scoped)."""
+    stmt = (
         select(func.count())
         .select_from(Transaction)
         .where(Transaction.status == "draft")
     )
+    if entity_id is not None:
+        stmt = stmt.where(Transaction.entity_id == entity_id)
+    result = await db.execute(stmt)
     return int(result.scalar_one_or_none() or 0)
+
+
+async def _resolve_leg_account(
+    db: AsyncSession,
+    code: str,
+    by_code: dict[str, Account],
+) -> Optional[Any]:
+    """Resolve a constructor leg's account code.
+
+    Prefers the legacy unscoped lookup (keeps the plain ``(db, code)``
+    service call for single-entity compatibility); when several entities
+    share the code — the unscoped lookup is ambiguous — the entity-scoped
+    COA map (``by_code``) decides, so cross-entity resolution is
+    impossible.
+    """
+    try:
+        account = await CoaService.get_account_by_code(db, code)
+    except MultipleResultsFound:
+        account = None
+    if account is not None:
+        return account
+    return by_code.get(code)
 
 
 async def _create_opening_draft(
     db: AsyncSession,
     ob: SetupOpeningBalances,
+    *,
+    entity_id: Optional[uuid.UUID] = None,
 ) -> Transaction:
-    """Build the F4 opening-balances facts, run the constructor, create a draft."""
-    # All COA accounts -> the constructor's code -> canonical class resolver.
-    result = await db.execute(select(Account))
+    """Build the F4 opening-balances facts, run the constructor, create a draft.
+
+    All resolution is scoped to ``entity_id`` (its COA only) so an entity's
+    opening draft can never reference another entity's accounts even when
+    codes collide across entities.  ``None`` keeps the legacy global scope.
+    """
+    # The entity's COA -> the constructor's code -> canonical class resolver.
+    coa_stmt = select(Account)
+    if entity_id is not None:
+        coa_stmt = coa_stmt.where(Account.entity_id == entity_id)
+    result = await db.execute(coa_stmt)
     orm_accounts: list[Account] = list(result.scalars().all())
     codes = resolve_from_coa(orm_accounts)
 
@@ -127,7 +181,7 @@ async def _create_opening_draft(
 
     postings: list[PostingCreate] = []
     for leg in entry.legs:
-        account = await CoaService.get_account_by_code(db, leg.account)
+        account = await _resolve_leg_account(db, leg.account, by_code)
         if account is None:
             raise SetupError(
                 f"Account code '{leg.account}' not found in the COA",
@@ -150,6 +204,11 @@ async def _create_opening_draft(
     )
     # Draft only — never posted here. Approval is the orchestrator's job.
     transaction = await TransactionService.create_transaction(db, tx_data)
+    # Stamp the draft with the entity.  Done as a post-creation update
+    # rather than a create_transaction keyword so callers that wrap
+    # create_transaction with a strict (db, data) signature keep working.
+    transaction.entity_id = entity_id
+    await db.commit()
     return transaction
 
 
@@ -185,14 +244,19 @@ async def setup_entity(
         await db.commit()
 
     # 2. Chart of accounts (fuzzy *_vat / *_no_vat match inside CoaService).
-    #    Skipped on resume when accounts already exist.
+    #    Skipped on resume when accounts already exist (entity-scoped).
     coa_accounts: list = []
-    if await _account_count(db) == 0:
-        coa_accounts = await CoaService.load_template(db, template_name)
+    if await _account_count(db, entity_id=entity.id) == 0:
+        coa_accounts = await CoaService.load_template(
+            db, template_name, entity_id=entity.id
+        )
 
-    # 3. Bank accounts — skipped on resume when any bank account exists.
+    # 3. Bank accounts — skipped on resume when any bank account exists
+    #    (entity-scoped).  Created via the plain (db, data) call and
+    #    stamped with the entity afterwards, so callers that wrap
+    #    create_account with a strict (db, data) signature keep working.
     bank_account_ids: list[uuid.UUID] = []
-    if await _bank_count(db) == 0:
+    if await _bank_count(db, entity_id=entity.id) == 0:
         for ba in bank_accounts or []:
             created = await BankService.create_account(
                 db,
@@ -204,23 +268,33 @@ async def setup_entity(
                 ),
             )
             bank_account_ids.append(created.id)
+        if bank_account_ids:
+            await db.execute(
+                update(BankAccount)
+                .where(BankAccount.id.in_(bank_account_ids))
+                .values(entity_id=entity.id)
+            )
+            await db.commit()
 
     # 4. Formance ledger — ALWAYS attempted (idempotent on Formance's side);
     #    tolerated; Formance may be started later.
     await formance_client.create_ledger(entity.ledger_name)
 
     # 5. Opening balances -> F4 constructor -> DRAFT transaction(s).
-    #    Skipped on resume when a draft transaction already exists.
+    #    Skipped on resume when a draft transaction already exists
+    #    (entity-scoped).
     opening_ids: list[uuid.UUID] = []
     draft_total = 0
-    if opening_balances is not None and await _draft_count(db) == 0:
+    if opening_balances is not None and await _draft_count(db, entity_id=entity.id) == 0:
         sets = (
             opening_balances
             if isinstance(opening_balances, list)
             else [opening_balances]
         )
         for ob in sets:
-            transaction = await _create_opening_draft(db, ob)
+            transaction = await _create_opening_draft(
+                db, ob, entity_id=entity.id
+            )
             opening_ids.append(transaction.id)
             draft_total += sum(p.debit_amount for p in transaction.postings)
 
@@ -246,10 +320,10 @@ async def get_entity_status(db: AsyncSession, entity_id: uuid.UUID) -> EntitySta
     if entity is None:
         raise EntityNotFoundError(entity_id)
 
-    account_count = await _account_count(db)
-    bank_accounts = await BankService.list_accounts(db)
+    account_count = await _account_count(db, entity_id=entity.id)
+    bank_accounts = await BankService.list_accounts(db, entity_id=entity.id)
     pending, _total = await TransactionService.list_transactions(
-        db, status="draft", limit=500
+        db, status="draft", entity_id=entity.id, limit=500
     )
     pending_responses = [
         TransactionService._transaction_to_response(t) for t in pending

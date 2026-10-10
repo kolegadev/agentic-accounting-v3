@@ -56,6 +56,18 @@ class DuplicateLedgerNameError(EntityServiceError):
         )
 
 
+class AmbiguousEntityError(EntityServiceError):
+    """More than one active entity — an explicit entity_id is required."""
+
+    def __init__(self, active_ids: Optional[list[uuid.UUID]] = None) -> None:
+        super().__init__(
+            "Multiple active entities found — an explicit entity_id is required",
+            status_code=409,
+            error_type="ambiguous_entity",
+        )
+        self.active_ids = active_ids or []
+
+
 class EntityService:
     """Stateless service for Entity CRUD."""
 
@@ -176,6 +188,50 @@ class EntityService:
         return entity
 
 
+async def get_active_entity(db: AsyncSession) -> Optional[Entity]:
+    """Return the single active entity, None when there is none, or raise.
+
+    Exactly one active entity (``is_active=True``) → it; zero → ``None``
+    (legacy global mode); MORE than one → :class:`AmbiguousEntityError`
+    (409) — an explicit ``entity_id`` is then required (Contract F18).
+    """
+    result = await db.execute(
+        select(Entity).where(Entity.is_active.is_(True))
+    )
+    entities = list(result.scalars().all())
+    if len(entities) > 1:
+        raise AmbiguousEntityError([e.id for e in entities])
+    return entities[0] if entities else None
+
+
+async def get_ledger_for_entity(
+    db: AsyncSession,
+    entity_id: Optional[uuid.UUID],
+) -> str:
+    """Return the entity's ledger_name, else ``"main"`` (legacy scope).
+
+    ``None``/unknown entity_id → ``"main"`` WITHOUT a query (the legacy
+    global ledger).  Any lookup failure (e.g. a pre-F11 schema without the
+    ``entities`` table) also degrades to ``"main"`` so the no-entity
+    system keeps behaving exactly as before.
+    """
+    if entity_id is None:
+        return "main"
+    try:
+        result = await db.execute(select(Entity).where(Entity.id == entity_id))
+        entity = result.scalar_one_or_none()
+    except Exception as exc:  # noqa: BLE001 — resolution is best-effort
+        logger.warning(
+            "get_ledger_for_entity: entity lookup failed (%s); "
+            "falling back to 'main'",
+            exc,
+        )
+        return "main"
+    if entity is None:
+        return "main"
+    return entity.ledger_name
+
+
 async def get_active_ledger(db: AsyncSession) -> str:
     """Return the single active entity's ledger name, else ``"main"``.
 
@@ -184,12 +240,18 @@ async def get_active_ledger(db: AsyncSession) -> str:
     zero or multiple active entities → ``"main"``.  Any lookup failure
     (e.g. a pre-F11 schema without the ``entities`` table) degrades to
     ``"main"`` so the no-entity system keeps behaving exactly as before.
+
+    Delegates to :func:`get_active_entity`; the multi-active case keeps
+    resolving to ``"main"`` (single-entity semantics preserved — its
+    callers become entity-aware in F19).
     """
     try:
-        result = await db.execute(
-            select(Entity).where(Entity.is_active.is_(True))
+        entity = await get_active_entity(db)
+    except AmbiguousEntityError:
+        logger.warning(
+            "get_active_ledger: multiple active entities; falling back to 'main'"
         )
-        entities = list(result.scalars().all())
+        return "main"
     except Exception as exc:  # noqa: BLE001 — resolution is best-effort
         logger.warning(
             "get_active_ledger: active-entity lookup failed (%s); "
@@ -197,6 +259,6 @@ async def get_active_ledger(db: AsyncSession) -> str:
             exc,
         )
         return "main"
-    if len(entities) != 1:
+    if entity is None:
         return "main"
-    return entities[0].ledger_name
+    return entity.ledger_name

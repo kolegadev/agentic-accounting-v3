@@ -52,12 +52,18 @@ class Account(Base):
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
+    entity_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entities.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Owning accounting entity; NULL = legacy/global scope",
+    )
     code: Mapped[str] = mapped_column(
         String(10),
-        unique=True,
         nullable=False,
         index=True,
-        comment="4-digit account code (e.g., 1000, 5210). Must be in valid range for category.",
+        comment="4-digit account code (e.g., 1000, 5210). Must be in valid range for category. Unique per entity (legacy rows unique within the NULL scope).",
     )
     name: Mapped[str] = mapped_column(
         String(255),
@@ -128,7 +134,23 @@ class Account(Base):
             f"vat_rate IS NULL OR vat_rate = ANY(ARRAY[{', '.join(repr(v) for v in VALID_VAT_RATES)}])",
             name="ck_accounts_vat_rate",
         ),
-        Index("ix_accounts_code_unique", "code", unique=True),
+        # Multi-entity scoping (F18): a code must be unique within its
+        # entity, and legacy (NULL-scope) codes stay globally unique.
+        Index(
+            "uq_accounts_entity_code",
+            "entity_id",
+            "code",
+            unique=True,
+            postgresql_where=text("entity_id IS NOT NULL"),
+            sqlite_where=text("entity_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_accounts_legacy_code",
+            "code",
+            unique=True,
+            postgresql_where=text("entity_id IS NULL"),
+            sqlite_where=text("entity_id IS NULL"),
+        ),
         Index("ix_accounts_is_active", "is_active"),
     )
 

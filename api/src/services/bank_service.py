@@ -126,9 +126,16 @@ class BankService:
     async def create_account(
         db: AsyncSession,
         data: BankAccountCreate,
+        *,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> BankAccountResponse:
-        """Create a new bank account."""
+        """Create a new bank account.
+
+        With ``entity_id`` the account is stamped with it; ``None`` keeps
+        the legacy NULL (global) stamp (Contract F18).
+        """
         account = BankAccount(
+            entity_id=entity_id,
             name=data.name,
             sort_code=data.sort_code,
             account_number=data.account_number,
@@ -157,9 +164,17 @@ class BankService:
     async def list_accounts(
         db: AsyncSession,
         include_inactive: bool = False,
+        *,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> list[BankAccountResponse]:
-        """List bank accounts, optionally including inactive ones."""
+        """List bank accounts, optionally including inactive ones.
+
+        ``entity_id`` scopes the listing to one entity's bank accounts;
+        ``None`` keeps the legacy global listing (Contract F18).
+        """
         stmt = select(BankAccount).order_by(BankAccount.name)
+        if entity_id is not None:
+            stmt = stmt.where(BankAccount.entity_id == entity_id)
         if not include_inactive:
             stmt = stmt.where(BankAccount.is_active == True)  # noqa: E712
         result = await db.execute(stmt)

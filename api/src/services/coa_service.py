@@ -6,6 +6,7 @@ import json
 import os
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -78,9 +79,17 @@ class CoaService:
         db: AsyncSession,
         *,
         include_inactive: bool = False,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> list[AccountResponse]:
-        """Return all active (or all) accounts ordered by code."""
+        """Return all active (or all) accounts ordered by code.
+
+        ``entity_id`` scopes the listing to one entity's COA; ``None`` (the
+        default) keeps the legacy global listing (NO filter) so every
+        existing caller behaves exactly as before (Contract F18).
+        """
         stmt = select(Account)
+        if entity_id is not None:
+            stmt = stmt.where(Account.entity_id == entity_id)
         if not include_inactive:
             stmt = stmt.where(Account.is_active.is_(True))
         stmt = stmt.order_by(Account.code)
@@ -103,9 +112,18 @@ class CoaService:
     async def get_account_by_code(
         db: AsyncSession,
         code: str,
+        *,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> AccountResponse | None:
-        """Return a single account by code, or None if not found."""
+        """Return a single account by code, or None if not found.
+
+        With ``entity_id`` the lookup is scoped to that entity's COA (so
+        duplicate codes across entities resolve to the right account);
+        ``None`` keeps the legacy global lookup.
+        """
         stmt = select(Account).where(Account.code == code)
+        if entity_id is not None:
+            stmt = stmt.where(Account.entity_id == entity_id)
         result = await db.execute(stmt)
         account = result.scalar_one_or_none()
         return CoaService._account_to_response(account) if account else None
@@ -114,10 +132,20 @@ class CoaService:
     async def create_account(
         db: AsyncSession,
         data: AccountCreate,
+        *,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> AccountResponse:
-        """Create a new account after validating uniqueness and code range."""
-        # Validate code uniqueness
-        existing = await CoaService.get_account_by_code(db, data.code)
+        """Create a new account after validating uniqueness and code range.
+
+        With ``entity_id`` the account is stamped with it and the code
+        uniqueness check is scoped to that entity (allowing the same code
+        in different entities); ``None`` keeps the legacy global stamp
+        (NULL) and global uniqueness check.
+        """
+        # Validate code uniqueness (scoped to the entity when one is given)
+        existing = await CoaService.get_account_by_code(
+            db, data.code, entity_id=entity_id
+        )
         if existing:
             raise DuplicateCodeError(data.code)
 
@@ -126,6 +154,7 @@ class CoaService:
             raise InvalidCodeRangeError(data.code, data.category)
 
         account = Account(
+            entity_id=entity_id,
             code=data.code,
             name=data.name,
             category=data.category,
@@ -205,6 +234,8 @@ class CoaService:
     async def load_template(
         db: AsyncSession,
         template_name: str,
+        *,
+        entity_id: Optional[uuid.UUID] = None,
     ) -> list[AccountResponse]:
         """Load a COA template from JSON and bulk insert accounts.
 
@@ -213,6 +244,11 @@ class CoaService:
 
         Does fuzzy matching: 'uk_sole_trader' matches
         'uk_sole_trader_vat.json' or 'uk_sole_trader_no_vat.json'.
+
+        With ``entity_id`` every created account is stamped with it and the
+        duplicate-skip check is scoped to that entity (so two entities can
+        both load the same template); ``None`` keeps the legacy global
+        stamp (NULL) and global dedup.
         """
         # Direct match first
         template_path = COA_TEMPLATES_DIR / f"{template_name}.json"
@@ -235,15 +271,18 @@ class CoaService:
 
         created: list[Account] = []
         for item in accounts_data:
-            # Check for existing account by code to avoid duplicates
-            existing = await db.execute(
-                select(Account).where(Account.code == item["code"])
-            )
+            # Check for an existing account by code to avoid duplicates
+            # (scoped to the entity when one is given).
+            dedup_stmt = select(Account).where(Account.code == item["code"])
+            if entity_id is not None:
+                dedup_stmt = dedup_stmt.where(Account.entity_id == entity_id)
+            existing = await db.execute(dedup_stmt)
             if existing.scalar_one_or_none():
                 # Skip if account already exists (idempotent template load)
                 continue
 
             account = Account(
+                entity_id=entity_id,
                 code=item["code"],
                 name=item["name"],
                 category=item["category"],

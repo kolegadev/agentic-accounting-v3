@@ -41,6 +41,13 @@ class Transaction(Base):
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
+    entity_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entities.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Owning accounting entity; NULL = legacy/global scope",
+    )
     reference: Mapped[Optional[str]] = mapped_column(
         String(14),
         unique=True,

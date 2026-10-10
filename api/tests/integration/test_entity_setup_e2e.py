@@ -99,6 +99,7 @@ _SQLITE_SCHEMA = [
         category VARCHAR(20) NOT NULL,
         type VARCHAR(30) NOT NULL,
         parent_id CHAR(36),
+        entity_id CHAR(36),
         vat_rate VARCHAR(10),
         is_active BOOLEAN NOT NULL DEFAULT 1,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -111,6 +112,7 @@ _SQLITE_SCHEMA = [
         reference VARCHAR(14) UNIQUE,
         description TEXT,
         contact_id CHAR(36),
+        entity_id CHAR(36),
         total_amount INTEGER,
         currency VARCHAR(3) NOT NULL DEFAULT 'GBP',
         status VARCHAR(10) NOT NULL DEFAULT 'draft',
@@ -146,6 +148,7 @@ _SQLITE_SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS bank_accounts (
         id CHAR(36) PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
+        entity_id CHAR(36),
         name VARCHAR(255) NOT NULL,
         sort_code VARCHAR(10),
         account_number VARCHAR(20),
