@@ -195,3 +195,81 @@ def test_pending_upstream_unreachable_returns_502(client: TestClient, monkeypatc
     body = resp.json()
     assert body["type"] == "upstream_unreachable"
     assert "no route to host" in body["message"]
+
+
+# ---------------------------------------------------------------------------
+# Reports forwarding (Contract F10) — GET with query-param pass-through
+# ---------------------------------------------------------------------------
+
+
+def test_reports_forwards_path_and_query_params(client: TestClient, upstream) -> None:
+    resp = client.get(
+        "/api/reports/formance/pl",
+        params={"period_start": "2026-01-01", "period_end": "2026-12-31"},
+    )
+
+    assert resp.status_code == 200
+    echo = resp.json()
+    assert echo["method"] == "GET"
+    assert echo["path"] == "/api/v1/reports/formance/pl"
+    req = upstream[0]
+    assert req.method == "GET"
+    assert req.url.path == "/api/v1/reports/formance/pl"
+    assert req.url.params.get("period_start") == "2026-01-01"
+    assert req.url.params.get("period_end") == "2026-12-31"
+
+
+def test_reports_forwards_balance_sheet_as_at(client: TestClient, upstream) -> None:
+    resp = client.get(
+        "/api/reports/formance/balance-sheet", params={"as_at": "2026-03-31"}
+    )
+
+    assert resp.status_code == 200
+    echo = resp.json()
+    assert echo["path"] == "/api/v1/reports/formance/balance-sheet"
+    assert upstream[0].url.params.get("as_at") == "2026-03-31"
+
+
+def test_reports_no_query_params_passthrough(client: TestClient, upstream) -> None:
+    resp = client.get("/api/reports/formance/trial-balance")
+
+    assert resp.status_code == 200
+    assert upstream[0].url.path == "/api/v1/reports/formance/trial-balance"
+    assert dict(upstream[0].url.params) == {}
+
+
+def test_reports_upstream_error_status_and_json_passthrough(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422, json={"type": "missing_period_params", "message": "requires period_start"}
+        )
+
+    _set_transport(monkeypatch, handler)
+    resp = client.get("/api/reports/formance/pl")
+
+    assert resp.status_code == 422
+    assert resp.json() == {
+        "type": "missing_period_params",
+        "message": "requires period_start",
+    }
+
+
+def test_reports_upstream_unreachable_returns_502(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _set_transport(monkeypatch, handler)
+    resp = client.get(
+        "/api/reports/formance/cash-flow",
+        params={"period_start": "2026-01-01", "period_end": "2026-12-31"},
+    )
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "upstream_unreachable"
+    assert "connection refused" in body["message"]

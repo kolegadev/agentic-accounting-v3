@@ -198,6 +198,66 @@
   }
   .pending-item-meta { font-size:10.5px; color:var(--text-dim3); font-family:var(--mono); }
 
+  /* ── Formance Reports (F10) ── */
+  .reports-pane {
+    width:26%; min-width:0; display:flex; flex-direction:column;
+    background:var(--topbar-bg); border-left:1px solid var(--border);
+  }
+  .report-controls {
+    display:flex; flex-direction:column; gap:8px; padding:12px 16px;
+    border-bottom:1px solid var(--border2); flex:none;
+  }
+  .report-select {
+    width:100%; background:var(--surface2); color:var(--text);
+    border:1px solid var(--border4); border-radius:8px;
+    padding:8px 10px; font-family:inherit; font-size:12.5px; outline:none;
+  }
+  .report-dates { display:flex; gap:8px; }
+  .report-date {
+    flex:1; min-width:0; background:var(--surface2); color:var(--text);
+    border:1px solid var(--border4); border-radius:8px; padding:7px 8px;
+    font-family:inherit; font-size:11.5px; outline:none;
+  }
+  .report-fetch-btn {
+    border:none; border-radius:8px; padding:9px 0; font-size:12.5px; font-weight:700;
+    cursor:pointer; font-family:inherit; background:var(--accent); color:var(--accent-dark);
+    transition:filter .15s;
+  }
+  .report-fetch-btn:hover { filter:brightness(1.1); }
+  .report-output {
+    flex:1; overflow-y:auto; padding:12px 16px;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  .report-table { width:100%; border-collapse:collapse; font-size:11.5px; }
+  .report-table th {
+    text-align:left; color:var(--text-dim4); font-weight:600; padding:4px 6px;
+    border-bottom:1px solid var(--border4); font-size:10px;
+    text-transform:uppercase; letter-spacing:.05em;
+  }
+  .report-table th.num, .report-table td.num { text-align:right; }
+  .report-table td { padding:5px 6px; border-bottom:1px solid var(--border2); vertical-align:top; }
+  .report-section-head {
+    font-size:10.5px; text-transform:uppercase; letter-spacing:.08em;
+    color:var(--accent); margin-top:6px; font-weight:700;
+  }
+  .report-total-row td {
+    border-top:2px solid var(--border4); font-weight:700;
+    font-family:var(--mono);
+  }
+  .report-error { color:var(--red); font-size:12px; line-height:1.5; }
+  .report-empty { font-size:11.5px; color:var(--text-dim4); padding:6px 0; }
+  .report-crosscheck {
+    flex:none; padding:10px 16px 14px; border-top:1px solid var(--border2);
+    font-size:11.5px; line-height:1.5;
+  }
+  .cc-ok { color:var(--green); font-weight:600; }
+  .cc-note { color:var(--text-dim3); }
+  .cc-bad { color:var(--red); font-weight:600; margin-bottom:4px; }
+  .cc-diff { font-family:var(--mono); font-size:10.5px; color:var(--red); }
+  @media (max-width:900px) {
+    .reports-pane { width:100%; flex:none; border-left:none; border-top:1px solid var(--border); max-height:40vh; }
+  }
+
   /* ── Topbar Components ── */
   .co-switcher { position:relative; }
   .co-switch-btn {
@@ -777,6 +837,40 @@
         </div>
         <div class="pending-list" id="pending-drafts"><div class="pending-empty">Loading…</div></div>
       </div>
+    </div>
+
+    <!-- ── RIGHT: FORMANCING REPORTS (F10) ── -->
+    <div class="reports-pane" id="reports-pane">
+      <div class="chat-header">
+        <div class="chat-avatar">📊</div>
+        <div>
+          <div class="chat-header-title">Formance reports</div>
+          <div class="chat-header-sub">Ledger reports · Postgres cross-check</div>
+        </div>
+      </div>
+
+      <div class="report-controls">
+        <select id="report-type-select" class="report-select">
+          <option value="pl">Profit &amp; Loss</option>
+          <option value="balance-sheet">Balance Sheet</option>
+          <option value="trial-balance">Trial Balance</option>
+          <option value="cash-flow">Cash Flow</option>
+          <option value="funds">Funds Statement</option>
+        </select>
+        <div class="report-dates" id="report-dates">
+          <input type="date" id="report-period-start" class="report-date" />
+          <input type="date" id="report-period-end" class="report-date" />
+        </div>
+        <div class="report-dates" id="report-as-at-wrap" style="display:none">
+          <input type="date" id="report-as-at" class="report-date" />
+        </div>
+        <button class="report-fetch-btn" id="report-fetch">Fetch report</button>
+      </div>
+
+      <div class="report-output" id="report-output">
+        <div class="report-empty">Pick a report and fetch it — amounts come straight from the Formance ledger.</div>
+      </div>
+      <div class="report-crosscheck" id="report-crosscheck"></div>
     </div>
 
   </div>
@@ -2360,6 +2454,173 @@ async function loadPendingDraft(transactionId) {
 document.getElementById('preview-approve').addEventListener('click', approvePreview);
 document.getElementById('preview-reject').addEventListener('click', rejectPreview);
 loadPendingDrafts();
+
+// ═══════════════════════════════════════════
+//  FORMANCING REPORTS (F10)
+//  Right pane: pick a report type, fetch it from the forwarding endpoint,
+//  render the lines as a table (£X,XXX.XX from pence), and show the
+//  Postgres cross-check result.
+// ═══════════════════════════════════════════
+var REPORT_FLOW_TYPES = { 'pl': true, 'cash-flow': true, 'funds': true };
+
+function defaultIsoDate() {
+  var d = new Date();
+  var m = ('0' + (d.getMonth() + 1)).slice(-2);
+  var day = ('0' + d.getDate()).slice(-2);
+  return d.getFullYear() + '-' + m + '-' + day;
+}
+
+function reportDateFields() {
+  var type = document.getElementById('report-type-select').value;
+  var flow = !!REPORT_FLOW_TYPES[type];
+  document.getElementById('report-dates').style.display = flow ? 'flex' : 'none';
+  document.getElementById('report-as-at-wrap').style.display = flow ? 'none' : 'flex';
+}
+
+function reportLineRows(lines) {
+  return (lines || []).map(function(l) {
+    return '<tr><td class="leg-code">' + esc(l.code || '') + '</td><td>' + esc(l.name || '') +
+      '</td><td class="num">' + fmtMoney(l.amount) + '</td></tr>';
+  }).join('');
+}
+
+function reportSectionBlock(label, lines) {
+  if (!lines || !lines.length) return '';
+  return '<div class="report-section-head">' + esc(label) + '</div>' +
+    '<table class="report-table"><tbody>' + reportLineRows(lines) + '</tbody></table>';
+}
+
+function renderFormanceReport(data) {
+  var out = document.getElementById('report-output');
+  var type = data.report_type;
+  var r = data.report || {};
+  var html = '';
+
+  if (type === 'pl') {
+    var s = r.sections || {};
+    html += reportSectionBlock('Revenue', s.revenue);
+    html += reportSectionBlock('Direct costs', s.direct_costs);
+    html += reportSectionBlock('Overheads', s.overheads);
+    html += reportSectionBlock('Staff costs', s.staff_costs);
+    html += reportSectionBlock('Depreciation', s.depreciation);
+    html += reportSectionBlock('Finance costs', s.finance_costs);
+    html += reportSectionBlock('Corporation tax', s.corporation_tax);
+    html += '<table class="report-table"><tbody>' +
+      '<tr class="report-total-row"><td colspan="2">Profit for the period</td><td class="num">' + fmtMoney(r.profit) + '</td></tr>' +
+      '</tbody></table>';
+  } else if (type === 'balance-sheet') {
+    var bs = r.sections || {};
+    html += reportSectionBlock('Bank', bs.bank);
+    html += reportSectionBlock('Current assets', bs.current_assets);
+    html += reportSectionBlock('Fixed assets', bs.fixed_assets);
+    html += reportSectionBlock('Accumulated depreciation', bs.accumulated_depreciation);
+    html += reportSectionBlock('Current liabilities', bs.current_liabilities);
+    html += reportSectionBlock('Long-term liabilities', bs.long_term_liabilities);
+    html += reportSectionBlock('Equity', bs.equity);
+    var bt = r.totals || {};
+    html += '<table class="report-table"><tbody>' +
+      '<tr class="report-total-row"><td colspan="2">Total assets</td><td class="num">' + fmtMoney(bt.assets) + '</td></tr>' +
+      '<tr class="report-total-row"><td colspan="2">Total liabilities + equity</td><td class="num">' + fmtMoney(bt.liabilities_and_equity) + '</td></tr>' +
+      '</tbody></table>';
+  } else if (type === 'trial-balance') {
+    var rows = (r.accounts || []).map(function(a) {
+      return '<tr><td class="leg-code">' + esc(a.code) + '</td><td>' + esc(a.name) + '</td>' +
+        '<td class="num">' + (a.debit ? fmtMoney(a.debit) : '') + '</td>' +
+        '<td class="num">' + (a.credit ? fmtMoney(a.credit) : '') + '</td></tr>';
+    }).join('');
+    html += '<table class="report-table"><thead><tr>' +
+      '<th>Code</th><th>Account</th><th class="num">Debit</th><th class="num">Credit</th>' +
+      '</tr></thead><tbody>' + rows +
+      '<tr class="report-total-row"><td colspan="2">Totals</td>' +
+      '<td class="num">' + fmtMoney(r.total_debits) + '</td>' +
+      '<td class="num">' + fmtMoney(r.total_credits) + '</td></tr>' +
+      '</tbody></table>';
+  } else if (type === 'cash-flow') {
+    var cs = r.sections || {};
+    html += reportSectionBlock('Operating', cs.operating);
+    html += reportSectionBlock('Investing', cs.investing);
+    html += reportSectionBlock('Financing', cs.financing);
+    var rec = r.reconciliation || {};
+    html += '<table class="report-table"><tbody>' +
+      '<tr class="report-total-row"><td colspan="2">Net change in cash</td><td class="num">' + fmtMoney(rec.net_change_in_cash) + '</td></tr>' +
+      '<tr><td colspan="2">Opening bank</td><td class="num">' + fmtMoney(rec.bank_opening) + '</td></tr>' +
+      '<tr><td colspan="2">Closing bank</td><td class="num">' + fmtMoney(rec.bank_closing) + '</td></tr>' +
+      '</tbody></table>';
+  } else if (type === 'funds') {
+    html += reportSectionBlock('Sources', r.sources);
+    html += reportSectionBlock('Applications', r.applications);
+    var ft = r.totals || {};
+    html += '<table class="report-table"><tbody>' +
+      '<tr class="report-total-row"><td colspan="2">Total sources</td><td class="num">' + fmtMoney(ft.sources) + '</td></tr>' +
+      '<tr class="report-total-row"><td colspan="2">Total applications</td><td class="num">' + fmtMoney(ft.applications) + '</td></tr>' +
+      '</tbody></table>';
+  }
+  out.innerHTML = html || '<div class="report-empty">No lines to show.</div>';
+}
+
+function renderCrossCheck(cc) {
+  var el = document.getElementById('report-crosscheck');
+  if (!cc) { el.innerHTML = ''; return; }
+  var diffs = cc.diffs || [];
+  if (cc.ok === true && !diffs.length) {
+    el.innerHTML = '<div class="cc-ok">✔ Postgres agrees</div>';
+    return;
+  }
+  if (cc.ok === null || cc.ok === undefined) {
+    el.innerHTML = '<div class="cc-note">' + esc(cc.note || 'No Postgres equivalent') + '</div>';
+    return;
+  }
+  el.innerHTML = '<div class="cc-bad">✘ Postgres disagrees</div>' +
+    diffs.map(function(d) {
+      return '<div class="cc-diff">' + esc(d.line) + ': engine ' + fmtMoney(d.engine) +
+        ' vs postgres ' + fmtMoney(d.postgres) + ' (Δ ' + fmtMoney(d.delta) + ')</div>';
+    }).join('');
+}
+
+async function loadFormanceReport() {
+  var type = document.getElementById('report-type-select').value;
+  var qs = [];
+  if (REPORT_FLOW_TYPES[type]) {
+    var ps = document.getElementById('report-period-start').value;
+    var pe = document.getElementById('report-period-end').value;
+    if (ps) qs.push('period_start=' + encodeURIComponent(ps));
+    if (pe) qs.push('period_end=' + encodeURIComponent(pe));
+  } else {
+    var aa = document.getElementById('report-as-at').value;
+    if (aa) qs.push('as_at=' + encodeURIComponent(aa));
+  }
+  var url = '/api/reports/formance/' + encodeURIComponent(type) + (qs.length ? '?' + qs.join('&') : '');
+  var out = document.getElementById('report-output');
+  var ccEl = document.getElementById('report-crosscheck');
+  out.innerHTML = '<div class="report-empty">Loading…</div>';
+  ccEl.innerHTML = '';
+  try {
+    var resp = await fetch(url);
+    var data = await resp.json().catch(function() { return null; });
+    if (resp.status === 422) {
+      var err = (data && (data.message || data.type)) || 'Invalid request';
+      out.innerHTML = '<div class="report-error">' + esc(err) + '</div>';
+      return;
+    }
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    renderFormanceReport(data);
+    renderCrossCheck(data.cross_check);
+  } catch (e) {
+    out.innerHTML = '<div class="report-error">Reports unavailable: ' + esc(e.message) + '</div>';
+  }
+}
+
+document.getElementById('report-type-select').addEventListener('change', function() {
+  reportDateFields();
+  loadFormanceReport();
+});
+document.getElementById('report-fetch').addEventListener('click', loadFormanceReport);
+
+document.getElementById('report-period-start').value = new Date().getFullYear() + '-01-01';
+document.getElementById('report-period-end').value = defaultIsoDate();
+document.getElementById('report-as-at').value = defaultIsoDate();
+reportDateFields();
+loadFormanceReport();
 </script>
 </body>
 </html>

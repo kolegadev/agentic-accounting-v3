@@ -1,11 +1,13 @@
 # /Users/johnpellew/agentic-accounting-v3/api/tests/test_chatui_contract.py
 
-"""Contract F7 — static DOM contract test for the chat-ui frontend.
+"""Contract F7 + F10 — static DOM contract test for the chat-ui frontend.
 
 Reads chat-ui/index.html directly (no browser harness) and asserts the
 7 required preview/approval DOM ids exist, and that the JavaScript
-references all 4 orchestrator endpoints.  Prevents UI drift: if the pane
-is renamed or the wiring is removed, this fails.
+references all 4 orchestrator endpoints.  Also asserts the F10 reports
+pane: the 8 report DOM ids and the /api/reports/formance/ endpoint
+reference.  Prevents UI drift: if a pane is renamed or the wiring is
+removed, this fails.
 """
 
 from __future__ import annotations
@@ -33,6 +35,21 @@ ORCHESTRATOR_ENDPOINTS = [
     "/api/orchestrator/pending",
 ]
 
+REPORT_DOM_IDS = [
+    "reports-pane",
+    "report-type-select",
+    "report-period-start",
+    "report-period-end",
+    "report-as-at",
+    "report-fetch",
+    "report-output",
+    "report-crosscheck",
+]
+
+REPORT_ENDPOINTS = [
+    "/api/reports/formance/",
+]
+
 
 @pytest.fixture(scope="module")
 def html() -> str:
@@ -47,4 +64,14 @@ def test_required_dom_id_present(html: str, dom_id: str) -> None:
 
 @pytest.mark.parametrize("endpoint", ORCHESTRATOR_ENDPOINTS)
 def test_js_references_orchestrator_endpoint(html: str, endpoint: str) -> None:
+    assert endpoint in html
+
+
+@pytest.mark.parametrize("dom_id", REPORT_DOM_IDS)
+def test_required_report_dom_id_present(html: str, dom_id: str) -> None:
+    assert f'id="{dom_id}"' in html
+
+
+@pytest.mark.parametrize("endpoint", REPORT_ENDPOINTS)
+def test_js_references_report_endpoint(html: str, endpoint: str) -> None:
     assert endpoint in html

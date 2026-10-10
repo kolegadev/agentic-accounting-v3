@@ -15,7 +15,7 @@ from pathlib import Path
 
 import httpx
 from datetime import datetime, timezone
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
@@ -1018,6 +1018,39 @@ async def orchestrator_reject(data: dict):
 async def orchestrator_pending():
     """GET → /api/v1/orchestrator/pending (drafts awaiting approval)."""
     return await _forward_orchestrator("pending", None)
+
+
+# ---------------------------------------------------------------------------
+# Reports forwarding (Contract F10) — real pipeline only, NO mock fallback.
+#
+# GET /api/reports/formance/{report_type} proxies to the accounting API's
+# /api/v1/reports/formance/{report_type} with query params passed through
+# untouched.  If the upstream API is unreachable the response is 502 JSON.
+# Reuses the same injectable _upstream_client test seam as the F7 routes.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/reports/formance/{report_type}")
+async def forward_formance_report(report_type: str, request: Request):
+    """GET → /api/v1/reports/formance/{report_type} (query params pass through)."""
+    url = f"{API_BASE_URL}/api/v1/reports/formance/{report_type}"
+    try:
+        client = _get_upstream_client()
+        resp = await client.get(url, params=dict(request.query_params))
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "type": "upstream_unreachable",
+                "message": f"Accounting API unreachable: {exc}",
+            },
+        )
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=payload)
 
 
 # ---------------------------------------------------------------------------
