@@ -21,8 +21,8 @@ def client():
 @pytest.fixture
 def sample_postings():
     return [
-        {"source": "world", "destination": "cash", "amount": 10.00, "asset": "GBP/2"},
-        {"source": "revenue", "destination": "world", "amount": 10.00, "asset": "GBP/2"},
+        {"source": "revenue", "destination": "cash", "amount": "10.00", "asset": "GBP/2"},
+        {"source": "cash", "destination": "expense", "amount": "10.00", "asset": "GBP/2"},
     ]
 
 

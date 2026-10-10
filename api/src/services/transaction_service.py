@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
 from sqlalchemy import func, select
@@ -91,6 +93,78 @@ class IdempotencyConflictError(TransactionServiceError):
             f"transaction '{existing_transaction_id}'",
             status_code=409,
         )
+
+
+# ---------------------------------------------------------------------------
+# Formance mirroring helpers
+# ---------------------------------------------------------------------------
+
+def _pence_to_major(pence: int) -> str:
+    """Convert integer pence to an exact major-unit decimal string.
+
+    e.g. 5000 -> "50.00", 123 -> "1.23", 1 -> "0.01".
+    Pure decimal arithmetic — no binary floating point.
+    """
+    return str(Decimal(pence).scaleb(-2))
+
+
+def build_formance_postings(
+    postings: list[PostingCreate],
+    currency: str = "GBP",
+    codes: Optional[Mapping[uuid.UUID, str]] = None,
+) -> list[dict[str, str]]:
+    """Build paired double-entry Formance postings from journal postings.
+
+    Debit legs are paired with credit legs greedily in posting order: walk
+    both lists, pair min(remaining_dr, remaining_cr) chunks, and emit one
+    Formance posting per chunk whose source is the credit account and
+    destination is the debit account.  Amounts are integer pence converted
+    to exact major-unit decimal strings.
+
+    ``postings`` items are duck-typed: any object exposing ``account_id``,
+    ``debit_amount`` and ``credit_amount`` (PostingCreate or the ORM
+    Posting model) works.  ``codes`` optionally maps account_id -> account
+    code; when missing, ``str(account_id)`` is used.
+    """
+    code_map = codes or {}
+
+    def code_of(posting: Any) -> str:
+        return code_map.get(posting.account_id) or str(posting.account_id)
+
+    debit_legs = [(code_of(p), p.debit_amount) for p in postings if p.debit_amount]
+    credit_legs = [(code_of(p), p.credit_amount) for p in postings if p.credit_amount]
+
+    total_debits = sum(amount for _, amount in debit_legs)
+    total_credits = sum(amount for _, amount in credit_legs)
+    if total_debits != total_credits:
+        raise ValueError(
+            f"Unbalanced postings: debits {total_debits} != credits {total_credits}"
+        )
+
+    formance_postings: list[dict[str, str]] = []
+    i, j = 0, 0
+    remaining_dr = remaining_cr = 0
+    while i < len(debit_legs) and j < len(credit_legs):
+        if remaining_dr == 0:
+            remaining_dr = debit_legs[i][1]
+        if remaining_cr == 0:
+            remaining_cr = credit_legs[j][1]
+        chunk = min(remaining_dr, remaining_cr)
+        if chunk > 0:
+            formance_postings.append({
+                "source": credit_legs[j][0],
+                "destination": debit_legs[i][0],
+                "amount": _pence_to_major(chunk),
+                "asset": f"{currency}/2",
+            })
+        remaining_dr -= chunk
+        remaining_cr -= chunk
+        if remaining_dr == 0:
+            i += 1
+        if remaining_cr == 0:
+            j += 1
+
+    return formance_postings
 
 
 # ---------------------------------------------------------------------------
@@ -466,20 +540,25 @@ class TransactionService:
 
         # Add postings
         for rp in reversed_postings:
-            posting = Posting(
-                transaction_id=reversing_tx.id,
-                account_id=rp.account_id,
-                debit_amount=rp.debit_amount,
-                credit_amount=rp.credit_amount,
-                description=rp.description,
+            db.add(
+                Posting(
+                    transaction_id=reversing_tx.id,
+                    account_id=rp.account_id,
+                    debit_amount=rp.debit_amount,
+                    credit_amount=rp.credit_amount,
+                    description=rp.description,
+                )
             )
-            db.add(posting)
 
         # ---- Update original ----
         original.status = "reversed"
 
         await db.commit()
         await db.refresh(reversing_tx, attribute_names=["postings"])
+
+        # Mirror the reversing entry to Formance with the same pairing logic
+        await TransactionService._post_to_formance(db, reversing_tx)
+
         return reversing_tx
 
     @staticmethod
@@ -487,45 +566,33 @@ class TransactionService:
         db: AsyncSession,
         transaction: Transaction,
     ) -> Optional[dict[str, Any]]:
-        """Post transaction to Formance Ledger if available.
+        """Mirror a transaction to the Formance Ledger as paired postings.
 
-        Converts postings to Formance format:
-        - Debit postings: funds flow INTO the account (destination)
-        - Credit postings: funds flow OUT of the account (source)
-        - Amounts are converted from pence to major units (e.g., GBP)
+        Each Formance posting pairs a credit account (source) with a debit
+        account (destination) — no ``world`` contra account — and carries
+        the amount as an exact major-unit decimal string.  Returns None
+        gracefully when Formance is not configured or unreachable.
         """
         if not os.getenv("FORNANCE_LEDGER_URL"):
             return None
 
-        # Ensure accounts are loaded
-        for posting in transaction.postings:
-            if not posting.account:
-                await db.refresh(posting, attribute_names=["account"])
-
-        formance_postings: list[dict[str, Any]] = []
-        for posting in transaction.postings:
-            code = posting.account.code if posting.account else "unknown"
-            if posting.debit_amount:
-                # Debit: money enters this account (destination)
-                formance_postings.append({
-                    "source": "world",
-                    "destination": code,
-                    "amount": posting.debit_amount / 100,
-                    "asset": "GBP/2",
-                })
-            elif posting.credit_amount:
-                # Credit: money leaves this account (source)
-                formance_postings.append({
-                    "source": code,
-                    "destination": "world",
-                    "amount": posting.credit_amount / 100,
-                    "asset": "GBP/2",
-                })
-
-        if not formance_postings:
-            return None
-
         try:
+            # Resolve account codes via a bulk query (no lazy loading).
+            account_ids = {p.account_id for p in transaction.postings}
+            codes: dict[uuid.UUID, str] = {}
+            if account_ids:
+                stmt = select(Account).where(Account.id.in_(account_ids))
+                result = await db.execute(stmt)
+                codes = {a.id: a.code for a in result.scalars().all()}
+
+            formance_postings = build_formance_postings(
+                transaction.postings,
+                currency=transaction.currency or "GBP",
+                codes=codes,
+            )
+            if not formance_postings:
+                return None
+
             result = await formance_client.create_transaction(
                 ledger="main",
                 postings=formance_postings,
