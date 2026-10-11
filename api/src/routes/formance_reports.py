@@ -29,6 +29,7 @@ from src.config.database import get_db
 from src.services.entity_service import (
     AmbiguousEntityError,
     EntityNotFoundError,
+    EntityService,
     get_ledger_for_entity,
     require_active_entity,
     resolve_entity_scope,
@@ -69,6 +70,20 @@ async def _resolve_scope(
     if scope_id is None:
         return None, "main"
     return scope_id, await get_ledger_for_entity(db, scope_id)
+
+
+def _fiscal_year_start(fiscal_year_start: str, today: date) -> date:
+    """Most recent occurrence of the entity's fiscal-year-start (MM-DD)
+    on or before ``today``; falls back to the UK 6-April convention."""
+    try:
+        month, day = (int(part) for part in fiscal_year_start.split("-"))
+        candidate = date(today.year, month, day)
+        if candidate > today:
+            candidate = date(today.year - 1, month, day)
+        return candidate
+    except (ValueError, AttributeError):
+        candidate = date(today.year, 4, 6)
+        return candidate if candidate <= today else date(today.year - 1, 4, 6)
 
 
 # ---------------------------------------------------------------------------
@@ -124,18 +139,6 @@ async def formance_report(
             },
         )
 
-    if report_type in FLOW_TYPES and (period_start is None or period_end is None):
-        return JSONResponse(
-            status_code=422,
-            content={
-                "type": "missing_period_params",
-                "message": (
-                    f"report type {report_type!r} requires period_start and "
-                    "period_end query params"
-                ),
-            },
-        )
-
     # Resolve the entity scope once per request (Contract F19 + F20):
     # explicit id (validated) > single active entity > NULL legacy;
     # ambiguity is a 409, an unknown explicit id a 404 — never a silent
@@ -157,6 +160,17 @@ async def formance_report(
                 "type": exc.error_type or "entity_not_found",
                 "message": exc.message,
             },
+        )
+
+    if report_type in FLOW_TYPES and (period_start is None or period_end is None):
+        fiscal_year_start = "04-06"
+        if scope_id is not None:
+            entity = await EntityService.get_entity(db, scope_id)
+            if entity is not None and entity.fiscal_year_start:
+                fiscal_year_start = entity.fiscal_year_start
+        period_end = period_end or date.today()
+        period_start = period_start or _fiscal_year_start(
+            fiscal_year_start, period_end
         )
 
     if report_type == "pl":

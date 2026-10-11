@@ -283,24 +283,48 @@ def test_invalid_report_type_returns_422(client: TestClient) -> None:
 
 
 @pytest.mark.parametrize(
-    "report_type,params",
+    ("report_type", "generator_attr", "params", "expected_start", "expected_end"),
     [
-        ("pl", {}),
-        ("pl", {"period_start": "2026-01-01"}),
-        ("cash-flow", {"period_end": "2026-12-31"}),
-        ("funds", {}),
+        ("pl", "generate_pl", {}, "fiscal", "today"),
+        ("pl", "generate_pl", {"period_start": "2026-01-01"}, "2026-01-01", "today"),
+        ("cash-flow", "generate_cash_flow", {"period_end": "2026-12-31"}, "fiscal", "2026-12-31"),
+        ("funds", "generate_funds", {}, "fiscal", "today"),
     ],
 )
-def test_missing_period_params_return_422(
-    client: TestClient, report_type: str, params: dict[str, str]
+def test_flow_reports_default_to_fiscal_year_window(
+    client: TestClient,
+    report_type: str,
+    generator_attr: str,
+    params: dict[str, str],
+    expected_start: str,
+    expected_end: str,
 ) -> None:
-    response = client.get(f"/api/v1/reports/formance/{report_type}", params=params)
+    """Flow reports missing one or both dates default the MISSING value to
+    the entity's fiscal year to date (UK 6-April convention with no
+    entity) — never a 422. This is what the Books-in-plain-English pane
+    relies on."""
+    with (
+        patch(
+            f"src.routes.formance_reports.{generator_attr}", new_callable=AsyncMock
+        ) as generate,
+        patch(
+            "src.routes.formance_reports.verify_against_postgres",
+            new_callable=AsyncMock,
+        ) as verify,
+    ):
+        generate.return_value = PL_REPORT
+        verify.return_value = []
+        response = client.get(f"/api/v1/reports/formance/{report_type}", params=params)
 
-    assert response.status_code == 422
-    body = response.json()
-    assert body["type"] == "missing_period_params"
-    assert "period_start" in body["message"]
-    assert "period_end" in body["message"]
+    assert response.status_code == 200
+    kwargs = generate.await_args.kwargs
+    fiscal_start = date(date.today().year, 4, 6)
+    if fiscal_start > date.today():
+        fiscal_start = date(date.today().year - 1, 4, 6)
+    want_start = fiscal_start if expected_start == "fiscal" else date.fromisoformat(expected_start)
+    want_end = date.today() if expected_end == "today" else date.fromisoformat(expected_end)
+    assert kwargs["period_start"] == want_start
+    assert kwargs["period_end"] == want_end
 
 
 def test_report_engine_error_maps_to_422(client: TestClient) -> None:
