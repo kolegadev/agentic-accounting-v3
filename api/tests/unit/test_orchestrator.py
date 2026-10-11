@@ -10,6 +10,7 @@ Nothing here touches a real LLM, database, or ledger.
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from datetime import UTC, date, datetime
@@ -20,7 +21,9 @@ import pytest
 
 from src.constructors import ConstructorError
 from src.models.account import Account
+from src.models.contact import Contact
 from src.models.transaction import Posting, Transaction
+from src.services.contact_service import ContactService
 from src.services.ledger_parity import ParityReport
 from src.services.orchestrator import (
     EntityScopeError,
@@ -35,6 +38,7 @@ from src.services.transaction_service import (
     TransactionNotFoundError,
     TransactionService,
 )
+from src.validators.contact import ContactResponse
 
 NOW = datetime(2026, 10, 10, 12, 0, 0, tzinfo=UTC)
 
@@ -106,6 +110,37 @@ def _result(*, scalar=None, scalars=None):
     m.scalar_one_or_none.return_value = scalar
     m.scalars.return_value.all.return_value = scalars if scalars is not None else []
     return m
+
+
+def _contact_orm(name: str) -> Contact:
+    """A fully-populated Contact ORM row (model_validate needs every field)."""
+    return Contact(
+        id=uuid.uuid4(),
+        type="supplier",
+        name=name,
+        company=None,
+        email=None,
+        phone=None,
+        address_line1=None,
+        address_line2=None,
+        city=None,
+        postcode=None,
+        country="GB",
+        vat_number=None,
+        payment_terms="Net 30",
+        default_gl_account_id=None,
+        currency="GBP",
+        status="active",
+        total_invoiced=0,
+        total_paid=0,
+        total_owing=0,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def _contact_response(name: str) -> ContactResponse:
+    return ContactResponse.model_validate(_contact_orm(name))
 
 
 async def _llm_returning(raw: str):
@@ -216,8 +251,20 @@ async def test_orchestrate_supplier_invoice_vat_preview(
         _result(scalar=None),  # idempotency check
         _result(scalars=[coa["5000"], coa["2220"], coa["2000"]]),  # validate accounts
     ]
+    supplier_contact = _contact_response("Acme Office Supplies")
 
-    result = await orchestrate_message(mock_db, "Supplier invoice INV-1001 for £120", llm=llm)
+    with patch.object(
+        ContactService,
+        "find_or_create",
+        AsyncMock(return_value=(supplier_contact, True)),
+    ) as mock_find_or_create:
+        result = await orchestrate_message(
+            mock_db, "Supplier invoice INV-1001 for £120", llm=llm
+        )
+
+    mock_find_or_create.assert_awaited_once()
+    assert mock_find_or_create.call_args.args[1] == "Acme Office Supplies"
+    assert mock_find_or_create.call_args.kwargs["type"] == "supplier"
 
     assert result.status == "preview"
     assert result.skill_id == "supplier-invoice"
@@ -240,6 +287,11 @@ async def test_orchestrate_supplier_invoice_vat_preview(
     assert drafts[0].status == "draft"
     assert drafts[0].effective_date == date(2026, 10, 1)
     assert drafts[0].reference is None
+    # Contract F29 — the supplier contact was resolved/created + stamped.
+    assert result.contact is not None
+    assert result.contact["name"] == "Acme Office Supplies"
+    assert result.contact["created"] is True
+    assert drafts[0].contact_id == uuid.UUID(result.contact["id"])
     mock_db.commit.assert_called_once()
 
 
@@ -267,6 +319,8 @@ async def test_orchestrate_bank_transfer_preview(
     assert result.status == "preview"
     assert result.skill_id == "bank-transfer"
     assert result.total_pence == 50000
+    # Contract F29 — no counterparty facts -> no contact work at all.
+    assert result.contact is None
     assert [(l.code, l.debit_pence, l.credit_pence) for l in result.legs] == [
         ("1001", 50000, 0),
         ("1000", 0, 50000),
@@ -315,6 +369,217 @@ async def test_orchestrate_payroll_preview(
     ]
     drafts = [o for o in mock_db.added if isinstance(o, Transaction)]
     assert drafts[0].effective_date == date(2026, 9, 30)
+
+
+# ---------------------------------------------------------------------------
+# orchestrate_message — contact auto-creation (Contract F29)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_customer_receipt_creates_customer_contact(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    """customer-receipt derives the counterparty from ``customer_name``,
+    creates the contact and stamps it on the draft."""
+    llm = await _llm_returning(
+        '{"skill_id": "customer-receipt", "facts": {'
+        '"customer_name": "Acme Corp", "receipt_date": "2026-10-05", '
+        '"bank_account_code": "1000", "amount_pence": 15000, '
+        '"invoice_refs": ["INV-001"], "allocated_pence": [15000]}}'
+    )
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=list(coa.values())),  # list_accounts
+        _result(scalar=coa["1000"]),  # Dr bank
+        _result(scalar=coa["1100"]),  # Cr trade debtors
+        _result(scalar=None),  # idempotency check
+        _result(scalars=[coa["1000"], coa["1100"]]),  # validate accounts
+    ]
+    contact = _contact_response("Acme Corp")
+
+    with patch.object(
+        ContactService, "find_or_create", AsyncMock(return_value=(contact, True))
+    ) as mock_find:
+        result = await orchestrate_message(
+            mock_db, "Customer Acme Corp paid £150 against INV-001", llm=llm
+        )
+
+    assert result.status == "preview"
+    assert result.skill_id == "customer-receipt"
+    mock_find.assert_awaited_once()
+    assert mock_find.call_args.args[1] == "Acme Corp"
+    assert mock_find.call_args.kwargs == {
+        "email": None,
+        "vat_number": None,
+        "type": "customer",
+    }
+    assert result.contact == {
+        "id": str(contact.id),
+        "name": "Acme Corp",
+        "created": True,
+    }
+    assert [(l.code, l.debit_pence, l.credit_pence) for l in result.legs] == [
+        ("1000", 15000, 0),
+        ("1100", 0, 15000),
+    ]
+    drafts = [o for o in mock_db.added if isinstance(o, Transaction)]
+    assert drafts[0].contact_id == contact.id
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_sales_invoice_reuses_existing_customer_contact(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    """The REAL ``ContactService.find_or_create`` runs here: a case-
+    insensitive name match reuses the existing contact (created=False) and
+    the draft still carries its contact_id."""
+    existing = _contact_orm("Acme Corp")
+    llm = await _llm_returning(
+        '{"skill_id": "sales-invoice", "facts": {'
+        '"customer_name": "acme corp", "invoice_ref": "INV-2001", '
+        '"invoice_date": "2026-10-01", "lines": [{"description": "Consulting", '
+        '"net_pence": 10000, "vat_rate": "20%", "revenue_account_code": "4000"}]}}'
+    )
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope
+        _result(scalars=list(coa.values())),  # list_accounts
+        _result(scalar=coa["1100"]),  # Dr trade debtors
+        _result(scalar=coa["4000"]),  # Cr sales revenue
+        _result(scalar=coa["2210"]),  # Cr output VAT
+        _result(scalar=existing),  # find_or_create — name match
+        _result(scalar=None),  # idempotency check
+        _result(scalars=[coa["1100"], coa["4000"], coa["2210"]]),
+    ]
+
+    result = await orchestrate_message(
+        mock_db, "Invoice Acme Corp £120 for consulting", llm=llm
+    )
+
+    assert result.status == "preview", result.error
+    assert result.skill_id == "sales-invoice"
+    assert result.contact == {
+        "id": str(existing.id),
+        "name": "Acme Corp",
+        "created": False,
+    }
+    drafts = [o for o in mock_db.added if isinstance(o, Transaction)]
+    assert len(drafts) == 1
+    assert drafts[0].contact_id == existing.id
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_supplier_payment_uses_supplier_name(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    llm = await _llm_returning(
+        '{"skill_id": "supplier-payment", "facts": {'
+        '"supplier_name": "Beta Stationery", "payment_date": "2026-10-06", '
+        '"bank_account_code": "1000", "amount_pence": 5000, '
+        '"invoice_refs": ["INV-1002"], "allocated_pence": [5000]}}'
+    )
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope
+        _result(scalars=list(coa.values())),  # list_accounts
+        _result(scalar=coa["2000"]),  # Dr trade creditors
+        _result(scalar=coa["1000"]),  # Cr bank
+        _result(scalar=None),  # idempotency check
+        _result(scalars=[coa["2000"], coa["1000"]]),  # validate accounts
+    ]
+    contact = _contact_response("Beta Stationery")
+
+    with patch.object(
+        ContactService, "find_or_create", AsyncMock(return_value=(contact, True))
+    ) as mock_find:
+        result = await orchestrate_message(
+            mock_db, "Pay Beta Stationery £50 from the bank", llm=llm
+        )
+
+    assert result.status == "preview"
+    assert result.skill_id == "supplier-payment"
+    mock_find.assert_awaited_once()
+    assert mock_find.call_args.args[1] == "Beta Stationery"
+    assert result.contact is not None
+    assert result.contact["created"] is True
+    drafts = [o for o in mock_db.added if isinstance(o, Transaction)]
+    assert drafts[0].contact_id == contact.id
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_contact_failure_degrades_to_draft_without_contact(
+    mock_db: AsyncMock, coa: dict[str, Account], caplog
+) -> None:
+    """A contact-service failure NEVER blocks the draft: the entry is still
+    created (without contact_id) and the drop is logged as a warning."""
+    llm = await _llm_returning(
+        '{"skill_id": "supplier-invoice", "facts": {'
+        '"supplier_name": "Gamma Supplies", "invoice_ref": "INV-1003", '
+        '"invoice_date": "2026-10-03", "lines": [{"description": "Paper", '
+        '"net_pence": 10000, "vat_rate": "20%", "expense_account_code": "5000"}]}}'
+    )
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope
+        _result(scalars=list(coa.values())),  # list_accounts
+        _result(scalar=coa["5000"]),
+        _result(scalar=coa["2220"]),
+        _result(scalar=coa["2000"]),
+        _result(scalar=None),  # idempotency check
+        _result(scalars=[coa["5000"], coa["2220"], coa["2000"]]),
+    ]
+
+    with (
+        patch.object(
+            ContactService,
+            "find_or_create",
+            AsyncMock(side_effect=RuntimeError("contacts table unavailable")),
+        ),
+        caplog.at_level(logging.WARNING, logger="src.services.orchestrator"),
+    ):
+        result = await orchestrate_message(
+            mock_db, "Supplier invoice INV-1003 from Gamma Supplies", llm=llm
+        )
+
+    assert result.status == "preview"
+    assert result.contact is None
+    drafts = [o for o in mock_db.added if isinstance(o, Transaction)]
+    assert len(drafts) == 1
+    assert drafts[0].contact_id is None
+    assert result.total_pence == 12000
+    mock_db.rollback.assert_awaited()  # the aborted statement is cleared
+    assert any(
+        "Contact auto-creation failed" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_party_less_skill_never_touches_contacts(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    """Skills without a counterparty fact (bank-transfer, payroll, …) do no
+    contact work at all."""
+    llm = await _llm_returning(
+        '{"skill_id": "bank-transfer", "facts": {'
+        '"source_account_code": "1000", "destination_account_code": "1001", '
+        '"amount_pence": 50000, "transfer_date": "2026-10-02"}}'
+    )
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope
+        _result(scalars=list(coa.values())),  # list_accounts
+        _result(scalar=coa["1001"]),
+        _result(scalar=coa["1000"]),
+        _result(scalar=None),  # idempotency check
+        _result(scalars=[coa["1001"], coa["1000"]]),
+    ]
+
+    with patch.object(ContactService, "find_or_create", AsyncMock()) as mock_find:
+        result = await orchestrate_message(
+            mock_db, "Move £500 from 1000 to 1001", llm=llm
+        )
+
+    assert result.status == "preview"
+    assert result.contact is None
+    mock_find.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

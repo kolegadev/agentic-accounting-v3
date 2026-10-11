@@ -1102,7 +1102,7 @@ function renderTable(text) {
     var tag = inHead ? 'th' : 'td';
     for (var j = 0; j < cells.length; j++) {
       var val = esc(cells[j].trim());
-      if (!inHead) {
+      if (!inHead && /^\d{4}$/.test(cells[j].trim())) {
         val = '<span class="clickable-cell" onclick="event.stopPropagation(); sendTableCellQuery(this)" data-value="' + esc(cells[j].trim()) + '" style="cursor:pointer;transition:all .15s" onmouseover="this.style.color=\'var(--accent)\'" onmouseout="this.style.color=\'\'">' + val + '</span>';
       }
       html += '<' + tag + (inHead ? ' style="font-weight:600;color:var(--blue);border-bottom:2px solid rgba(255,255,255,.15);padding:4px 8px;text-align:left"' : ' style="padding:4px 8px;text-align:left;border-bottom:1px solid rgba(255,255,255,.08)"') + '>' + val + '</' + tag + '>';
@@ -1171,7 +1171,11 @@ function renderPreview(data) {
 
   var skillEl = document.getElementById('preview-skill');
   if (skillEl) {
-    skillEl.innerHTML = '<span class="skill-badge">' + esc(p.skill_id || 'entry') + '</span>' +
+    // Contract F29 — the auto-created/found contact shows in the header.
+    var contactBadge = (p.contact && p.contact.name)
+      ? '<span class="skill-badge">' + esc(p.contact.name) + (p.contact.created ? ' · new' : '') + '</span>'
+      : '';
+    skillEl.innerHTML = '<span class="skill-badge">' + esc(p.skill_id || 'entry') + '</span>' + contactBadge +
       '<span class="orch-skill-label">constructed draft · awaiting approval</span>';
   }
 
@@ -1222,6 +1226,88 @@ function renderPreview(data) {
   setPreviewStatus('Draft ready — review the legs, then approve or reject.', 'ready');
 }
 
+// ═══════════════════════════════════════════
+//  QUERY ANSWERS (Contract F29) — status "answer".
+//  Deterministic data only: the API sends integer pence, the UI formats
+//  the table (the LLM never narrates a number).  Same endpoint, no draft.
+// ═══════════════════════════════════════════
+var ANSWER_TITLES = {
+  trial_balance: 'Trial balance',
+  account_balance: 'Account balance',
+  accounts: 'Chart of accounts',
+  contacts: 'Contacts',
+  pending: 'Pending drafts'
+};
+
+function answerTableMarkdown(data) {
+  var qt = data.query_type || '';
+  var d = data.data || {};
+  var rows = d.trial_balance || (d.account ? [d.account] : []);
+  var lines = [];
+  if (qt === 'trial_balance' || qt === 'account_balance') {
+    lines.push('| Code | Account | Debit | Credit |');
+    lines.push('| --- | --- | --- | --- |');
+    rows.forEach(function(r) {
+      lines.push('| ' + r.code + ' | ' + r.name +
+        ' | ' + (r.debit ? fmtMoney(r.debit) : '') +
+        ' | ' + (r.credit ? fmtMoney(r.credit) : '') + ' |');
+    });
+    if (qt === 'trial_balance') {
+      lines.push('| **Total** | | ' + fmtMoney(d.total_debits) + ' | ' + fmtMoney(d.total_credits) + ' |');
+    }
+    return lines.join('\n');
+  }
+  if (qt === 'accounts') {
+    lines.push('| Code | Account | Category | Type |');
+    lines.push('| --- | --- | --- | --- |');
+    (d.accounts || []).forEach(function(a) {
+      lines.push('| ' + a.code + ' | ' + a.name + ' | ' + (a.category || '') + ' | ' + (a.type || '') + ' |');
+    });
+    return lines.join('\n');
+  }
+  if (qt === 'contacts') {
+    lines.push('| Name | Type | Email |');
+    lines.push('| --- | --- | --- |');
+    var cs = d.contacts || [];
+    cs.forEach(function(c) {
+      lines.push('| ' + c.name + ' | ' + (c.type || '') + ' | ' + (c.email || '') + ' |');
+    });
+    if (d.count > cs.length) {
+      lines.push('| *Showing ' + cs.length + ' of ' + d.count + '* | | |');
+    }
+    return lines.join('\n');
+  }
+  if (qt === 'pending') {
+    lines.push('| Draft | Description | Date | Total |');
+    lines.push('| --- | --- | --- | --- |');
+    var ps = d.pending || [];
+    ps.forEach(function(t) {
+      lines.push('| ' + (t.reference || String(t.transaction_id || '').slice(0, 8)) +
+        ' | ' + (t.description || '') + ' | ' + (t.effective_date || '') +
+        ' | ' + fmtMoney(t.total_amount || 0) + ' |');
+    });
+    if (d.count > ps.length) {
+      lines.push('| *Showing ' + ps.length + ' of ' + d.count + '* | | | |');
+    }
+    return lines.join('\n');
+  }
+  return '';
+}
+
+function renderAnswer(data) {
+  var qt = data.query_type || '';
+  var title = ANSWER_TITLES[qt] || 'Here is what the ledger says';
+  var table = answerTableMarkdown(data);
+  var d = data.data || {};
+  var text = '**' + title + '**';
+  if (d.as_at) text += ' — as at ' + d.as_at;
+  var html = renderMarkdown(text);
+  html += table ? renderTable(table) : '<br><em>Nothing to show yet.</em>';
+  addMessage('assistant', html);
+  renderPreview(null);  // a question never produces a draft
+  setPreviewStatus(title + ' — answered from the ledger (no draft created).', 'ready');
+}
+
 async function requestOrchestratorPreview(text) {
   try {
     setPreviewStatus('Classifying & constructing draft…', 'working');
@@ -1241,10 +1327,21 @@ async function requestOrchestratorPreview(text) {
       addMessage('system', msg422, true);
       return;
     }
+    if (data.status === 'answer') {
+      // Contract F29 — a deterministic query answer (no draft, no LLM maths).
+      renderAnswer(data);
+      return;
+    }
     if (data.status === 'preview') {
       renderPreview(data);
       loadPendingDrafts();
       var p = data.preview || {};
+      // Contract F29 — a preview may have auto-created the customer/supplier
+      // contact (preview.contact = {id, name, created}).  Refresh the global
+      // contacts panel so a NEW contact shows up without a page reload.
+      // (preview.contact is refreshed unconditionally when absent — the
+      // refresh is idempotent and cheap.)
+      if (!p.contact || p.contact.created) loadContacts();
       addMessage('assistant', 'Draft ready — **' + (p.skill_id || 'entry') + '** for ' + fmtMoney(p.total_pence) + '. Review the legs, then approve or reject in the preview pane.');
       return;
     }

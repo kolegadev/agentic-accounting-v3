@@ -149,6 +149,72 @@ def test_message_preview_returns_200_with_preview(client: TestClient) -> None:
     assert mock.await_args.args[1] == "Supplier invoice for £100"
 
 
+def test_message_preview_forwards_contact(client: TestClient) -> None:
+    contact = {
+        "id": str(uuid.uuid4()),
+        "name": "Brand New Customer Ltd",
+        "created": True,
+    }
+    result = OrchestrateResult.preview(
+        transaction_id=TX_ID,
+        skill_id="sales-invoice",
+        legs=_legs(),
+        total_pence=10000,
+        formance_preview=[],
+        contact=contact,
+    )
+    with patch(
+        "src.routes.orchestrator.orchestrate_message", new_callable=AsyncMock
+    ) as mock:
+        mock.return_value = result
+        response = client.post(
+            "/api/v1/orchestrator/message",
+            json={"message": "Invoice the new customer"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "preview"
+    assert body["preview"]["contact"] == contact
+
+
+def test_message_answer_returns_200_with_data(client: TestClient) -> None:
+    result = OrchestrateResult.answer(
+        "trial_balance",
+        {
+            "trial_balance": [
+                {
+                    "code": "1000",
+                    "name": "Business Current",
+                    "class": "Asset (bank)",
+                    "balance": 10000,
+                    "debit": 10000,
+                    "credit": 0,
+                }
+            ],
+            "total_debits": 10000,
+            "total_credits": 10000,
+            "as_at": "2026-10-10",
+        },
+    )
+    with patch(
+        "src.routes.orchestrator.orchestrate_message", new_callable=AsyncMock
+    ) as mock:
+        mock.return_value = result
+        response = client.post(
+            "/api/v1/orchestrator/message",
+            json={"message": "what is my trial balance"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "answer"
+    assert body["query_type"] == "trial_balance"
+    assert body["data"]["total_debits"] == 10000
+    assert body["contact"] is None
+    mock.assert_awaited_once()
+
+
 def test_message_passes_history_to_orchestrator(client: TestClient) -> None:
     history = [{"role": "user", "content": "prior message"}]
     result = OrchestrateResult.failure("clarification", "Which bank account?")

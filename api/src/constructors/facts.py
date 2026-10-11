@@ -15,6 +15,8 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 __all__ = [
     "VatRate",
+    "QueryFacts",
+    "QUERY_TYPES",
     "BankTransferFacts",
     "CustomerReceiptFacts",
     "DepreciationFacts",
@@ -162,6 +164,32 @@ class SupplierPaymentFacts(BaseModel):
     amount_pence: int
     invoice_refs: list[str] = Field(default_factory=list)
     allocated_pence: list[int] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Contract F29 — query mode (NOT a catalog skill)
+# ---------------------------------------------------------------------------
+
+#: The deterministic, read-only question types the orchestrator answers.
+QUERY_TYPES: frozenset[str] = frozenset(
+    {"trial_balance", "account_balance", "accounts", "contacts", "pending"}
+)
+
+
+class QueryFacts(BaseModel):
+    """Contract F29 query-mode facts — classify a QUESTION about the books.
+
+    ``query_type`` is deliberately a plain ``str`` (not a ``Literal``) and
+    is validated against :data:`QUERY_TYPES` by the orchestrator: an
+    unknown type must surface as the structured ``invalid_query`` error,
+    not as a facts-validation error.  ``account_code`` is only meaningful
+    for ``account_balance``.  No money ever travels through this model —
+    the orchestrator answers from the reports/COA/contacts services in
+    integer pence.
+    """
+
+    query_type: str
+    account_code: str | None = None
 
 
 FACTS_MODELS: dict[str, type[BaseModel]] = {

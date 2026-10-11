@@ -275,6 +275,7 @@ class ContactService:
         name: str,
         email: Optional[str] = None,
         vat_number: Optional[str] = None,
+        type: str = "supplier",
     ) -> tuple[ContactResponse, bool]:
         """Find a contact by email, VAT number, or name; create if not found.
 
@@ -308,10 +309,10 @@ class ContactService:
         if contact:
             return ContactService._to_response(contact), False
 
-        # Not found — auto-create with type=supplier
+        # Not found — auto-create with the caller's type
         create_data = ContactCreate(
             name=name,
-            type="supplier",
+            type=type,
             email=email,
             vat_number=vat_number,
         )

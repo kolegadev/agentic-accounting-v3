@@ -119,6 +119,32 @@ _SQLITE_SCHEMA = [
         vat_type VARCHAR(6) NOT NULL
     )
     """,
+    # Contract F29 — contact auto-creation writes real contact rows.
+    """
+    CREATE TABLE IF NOT EXISTS contacts (
+        id CHAR(36) PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
+        type VARCHAR(10) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        company VARCHAR(255),
+        email VARCHAR(255) UNIQUE,
+        phone VARCHAR(50),
+        address_line1 VARCHAR(255),
+        address_line2 VARCHAR(255),
+        city VARCHAR(100),
+        postcode VARCHAR(10),
+        country VARCHAR(2) NOT NULL DEFAULT 'GB',
+        vat_number VARCHAR(20) UNIQUE,
+        payment_terms VARCHAR(50) NOT NULL DEFAULT 'Net 30',
+        default_gl_account_id CHAR(36),
+        currency VARCHAR(3) NOT NULL DEFAULT 'GBP',
+        status VARCHAR(10) NOT NULL DEFAULT 'active',
+        total_invoiced INTEGER NOT NULL DEFAULT 0,
+        total_paid INTEGER NOT NULL DEFAULT 0,
+        total_owing INTEGER NOT NULL DEFAULT 0,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
 ]
 
 COA_SEED = [
@@ -154,6 +180,15 @@ RECEIPT_RAW = (
     '"customer_name": "Acme Corp", "receipt_date": "2026-10-05", '
     '"bank_account_code": "1000", "amount_pence": 15000, '
     '"invoice_refs": ["INV-001"], "allocated_pence": [15000]}}'
+)
+
+# Contract F29 — a sale to a customer that does not exist yet.
+SALES_RAW = (
+    '{"skill_id": "sales-invoice", "facts": {'
+    '"customer_name": "Brand New Customer Ltd", "invoice_ref": "INV-9001", '
+    '"invoice_date": "2026-10-07", "lines": ['
+    '{"description": "Consulting", "net_pence": 20000, '
+    '"vat_rate": "20%", "revenue_account_code": "4000"}]}}'
 )
 
 
@@ -263,6 +298,8 @@ async def ctx(monkeypatch):
             AsyncMock(side_effect=fake.create_transaction),
         ),
         patch("src.services.ledger_parity.formance_client", parity_client),
+        # Contract F29 — query mode reads the F8/F9 report engine.
+        patch("src.services.formance_reports.formance_client", parity_client),
     ):
         yield {"db": db, "fake": fake, "session_factory": session_factory}
 
@@ -526,3 +563,147 @@ async def test_entity_scoped_orchestration_roundtrip(ctx) -> None:
     assert post.parity_ok is True, post.parity_report.summary
     assert ledgers == ["entity-scoped"]
     assert fake.transactions[-1]["reference"] == "JE-2026-0001"
+
+
+# ---------------------------------------------------------------------------
+# (g) F29 — a sale to a NEW customer auto-creates the contact
+# ---------------------------------------------------------------------------
+
+
+async def test_sales_invoice_to_new_customer_creates_contact(ctx) -> None:
+    """Contract F29: invoicing a customer the books have never seen creates
+    the contact (visible via ContactService.list_contacts), stamps it on
+    the draft, and the approved entry still posts + balances."""
+    from src.services.contact_service import ContactService
+
+    db, fake = ctx["db"], ctx["fake"]
+
+    before, total_before = await ContactService.list_contacts(db)
+    assert before == [] and total_before == 0
+
+    llm = make_fake_llm({"invoice INV-9001": SALES_RAW})
+    preview = await orchestrate_message(
+        db,
+        "Send invoice INV-9001 to Brand New Customer Ltd for £200 plus VAT",
+        llm=llm,
+    )
+
+    assert preview.status == "preview", preview.error
+    assert preview.skill_id == "sales-invoice"
+    assert preview.total_pence == 24000
+    assert preview.contact is not None
+    assert preview.contact["name"] == "Brand New Customer Ltd"
+    assert preview.contact["created"] is True
+
+    # The contact is REAL (a row) and listed by the contacts service.
+    contacts, total = await ContactService.list_contacts(db)
+    assert total == 1
+    assert [c.name for c in contacts] == ["Brand New Customer Ltd"]
+    assert str(contacts[0].id) == preview.contact["id"]
+
+    # ... and the DRAFT carries it.
+    draft = await TransactionService.get_transaction(db, preview.transaction_id)
+    assert draft is not None
+    assert str(draft.contact_id) == preview.contact["id"]
+
+    # Idempotent: the same customer on a second invoice is NOT re-created.
+    second_llm = make_fake_llm({"invoice INV-9002": SALES_RAW.replace("INV-9001", "INV-9002")})
+    second = await orchestrate_message(
+        db, "Send invoice INV-9002 to Brand New Customer Ltd", llm=second_llm
+    )
+    assert second.status == "preview", second.error
+    assert second.contact["created"] is False
+    assert second.contact["id"] == preview.contact["id"]
+    contacts_after, total_after = await ContactService.list_contacts(db)
+    assert len(contacts_after) == 1
+    assert total_after == 1
+
+    # Approve -> posted, mirrored, parity ok (postings untouched by F29).
+    post = await approve_entry(db, preview.transaction_id)
+    assert post.transaction.status == "posted"
+    assert post.parity_ok is True, post.parity_report.summary
+    assert fake.transactions[-1]["metadata"]["transaction_id"] == str(
+        preview.transaction_id
+    )
+    assert fake.transactions[-1]["postings"] == preview.formance_preview
+
+
+# ---------------------------------------------------------------------------
+# (h) F29 — query mode answers with the REAL ledger data
+# ---------------------------------------------------------------------------
+
+
+async def test_query_trial_balance_and_account_match_the_real_ledger(ctx) -> None:
+    """A QUESTION (not a transaction) is classified as the query skill and
+    answered deterministically: the trial balance totals equal the posted
+    entry exactly, and so does the single-account balance.  Nothing is
+    drafted, nothing is posted."""
+    from src.models.transaction import Transaction as TxRow
+
+    db, fake = ctx["db"], ctx["fake"]
+
+    # Seed ONE real posted entry: £100 net + £20 VAT supplier invoice.
+    llm = make_fake_llm({"supplier invoice INV-1001": SUPPLIER_RAW})
+    preview = await orchestrate_message(db, "supplier invoice INV-1001", llm=llm)
+    assert preview.status == "preview", preview.error
+    post = await approve_entry(db, preview.transaction_id)
+    assert post.parity_ok is True
+
+    query_llm = make_fake_llm(
+        {
+            "trial balance": (
+                '{"skill_id": "query", "facts": {"query_type": "trial_balance"}}'
+            ),
+            "balance on 5000": (
+                '{"skill_id": "query", "facts": {"query_type": "account_balance", '
+                '"account_code": "5000"}}'
+            ),
+        }
+    )
+
+    tb = await orchestrate_message(db, "what's my trial balance?", llm=query_llm)
+
+    assert tb.status == "answer", tb.error
+    assert tb.query_type == "trial_balance"
+    assert tb.transaction_id is None  # a question never drafts
+    assert tb.data["total_debits"] == 12000
+    assert tb.data["total_credits"] == 12000
+    by_code = {row["code"]: row for row in tb.data["trial_balance"]}
+    assert by_code["5000"]["debit"] == 10000
+    assert by_code["2220"]["debit"] == 2000
+    assert by_code["2000"]["credit"] == 12000
+    assert all(
+        isinstance(row["debit"], int) and isinstance(row["credit"], int)
+        for row in tb.data["trial_balance"]
+    )
+
+    one = await orchestrate_message(db, "what's the balance on 5000?", llm=query_llm)
+
+    assert one.status == "answer", one.error
+    assert one.query_type == "account_balance"
+    assert one.data["account"]["code"] == "5000"
+    assert one.data["account"]["debit"] == 10000
+
+    # The query created no extra rows.
+    rows = (await db.execute(select(TxRow))).scalars().all()
+    assert len(rows) == 1
+    assert fake.transactions and len(fake.transactions) == 1
+
+
+async def test_query_unknown_type_is_a_structured_error(ctx) -> None:
+    """An unsupported query_type degrades to the structured invalid_query
+    error — no data, no draft."""
+    from src.models.transaction import Transaction as TxRow
+
+    db = ctx["db"]
+    llm = make_fake_llm(
+        {"report": '{"skill_id": "query", "facts": {"query_type": "stock_price"}}'}
+    )
+
+    result = await orchestrate_message(db, "give me a report on stock price", llm=llm)
+
+    assert result.status == "error"
+    assert result.error["type"] == "invalid_query"
+    assert result.data is None
+    rows = (await db.execute(select(TxRow))).scalars().all()
+    assert rows == []

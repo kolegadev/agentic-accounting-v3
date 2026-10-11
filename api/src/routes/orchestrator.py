@@ -120,10 +120,10 @@ async def message(
 ) -> JSONResponse:
     """Run classify → construct → draft. Nothing is posted.
 
-    Returns 200 with status "preview" (draft awaiting approval) or
-    "clarification" (the LLM needs more detail).  Hard errors map to
-    422 with {type, message}.  An ambiguous entity scope maps to
-    409 {type: ambiguous_entity}.
+    Returns 200 with status "preview" (draft awaiting approval),
+    "clarification" (the LLM needs more detail), or "answer" (a query
+    response).  Hard errors map to 422 with {type, message}.  An
+    ambiguous entity scope maps to 409 {type: ambiguous_entity}.
     """
     try:
         scope_id = await _resolve_scope(db, data.entity_id)
@@ -157,7 +157,19 @@ async def message(
                     ],
                     "total_pence": result.total_pence,
                     "formance_preview": result.formance_preview,
+                    "contact": result.contact,
                 },
+            },
+        )
+
+    if result.status == "answer":
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "answer",
+                "query_type": result.query_type,
+                "data": result.data,
+                "contact": result.contact,
             },
         )
 
