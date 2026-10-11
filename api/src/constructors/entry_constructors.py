@@ -24,6 +24,7 @@ from src.validators.transaction import PostingCreate
 from . import ConstructorError, ConstructedEntry, Leg
 from .facts import (
     BankTransferFacts,
+    CardPurchaseFacts,
     CustomerReceiptFacts,
     DepreciationFacts,
     JournalAccrualFacts,
@@ -37,6 +38,7 @@ from .facts import (
 
 __all__ = [
     "bank_transfer",
+    "card_purchase",
     "customer_receipt",
     "depreciation",
     "journal_accrual",
@@ -219,6 +221,65 @@ def bank_transfer(
         _cr(source, source_cls, facts.amount_pence, f"Transfer to {destination}"),
     ]
     return _finish("bank-transfer", legs, checks, {})
+
+
+# ---------------------------------------------------------------------------
+# card-purchase
+# ---------------------------------------------------------------------------
+
+
+def card_purchase(facts: CardPurchaseFacts, codes: Mapping[str, str]) -> ConstructedEntry:
+    """Cash-basis purchase paid immediately by card / bank transfer (F36b).
+
+    Dr the expense/asset account net; standard/reduced-rated purchases add
+    Dr 2220 Input VAT; Cr the bank account gross.  ``0%`` / ``exempt`` /
+    ``None`` produce no VAT leg (the full net is the cost).
+    """
+    checks: list[str] = []
+    if facts.net_pence <= 0:
+        raise ConstructorError(
+            f"card-purchase: net_pence must be > 0, got {facts.net_pence}"
+        )
+    bank_cls = _resolve(
+        codes, facts.bank_account_code, {"Asset (Bank)"}, "card-purchase bank"
+    )
+    account_cls = _resolve(
+        codes,
+        facts.account_code,
+        {"Expense (Expense)", "Expense (DirectCost)", "Asset (FixedAsset)"},
+        "card-purchase expense or asset",
+    )
+    vat = _vat_for_line(facts.net_pence, facts.vat_rate) if facts.vat_rate else 0
+    gross = facts.net_pence + vat
+    checks.append(
+        f"gross {gross} == net {facts.net_pence} + VAT {vat} (rate "
+        f"{facts.vat_rate.value if facts.vat_rate else None})"
+    )
+    legs: list[Leg] = [
+        _dr(facts.account_code, account_cls, facts.net_pence, "Purchase (net)")
+    ]
+    if vat > 0:
+        assert facts.vat_rate is not None
+        vat_cls = _resolve(
+            codes,
+            "2220",
+            {"Liability (CurrentLiability)"},
+            "card-purchase input VAT",
+        )
+        legs.append(_dr("2220", vat_cls, vat, f"Input VAT {facts.vat_rate.value}"))
+    legs.append(_cr(facts.bank_account_code, bank_cls, gross, "Card payment"))
+    checks.append(
+        "at most one 2220 Input VAT Dr leg (rate group); 0%/exempt/no-VAT "
+        "purchases contribute none"
+    )
+    checks.append(
+        "credit leg is Asset (Bank); debit legs are Expense or Asset "
+        "(FixedAsset) for capitalised purchases — no creditor leg (cash basis)"
+    )
+    return _finish("card-purchase", legs, checks, {
+        "gross_pence": gross,
+        "vat_pence": vat,
+    })
 
 
 # ---------------------------------------------------------------------------

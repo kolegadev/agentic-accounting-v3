@@ -175,6 +175,14 @@ SUPPLIER_RAW_2 = (
     '"vat_rate": "20%", "expense_account_code": "5010"}]}}'
 )
 
+# Contract F36b — a purchase paid immediately by card (cash basis).
+CARD_RAW = (
+    '{"skill_id": "card-purchase", "facts": {'
+    '"purchase_date": "2026-10-04", "bank_account_code": "1000", '
+    '"account_code": "5000", "net_pence": 10000, "vat_rate": "20%", '
+    '"description": "Printer paper", "supplier_name": "Card Supplies Ltd"}}'
+)
+
 RECEIPT_RAW = (
     '{"skill_id": "customer-receipt", "facts": {'
     '"customer_name": "Acme Corp", "receipt_date": "2026-10-05", '
@@ -344,6 +352,74 @@ async def test_supplier_invoice_vat_roundtrip(ctx) -> None:
         {"source": "2000", "destination": "5000", "amount": "100.00", "asset": GBP},
         {"source": "2000", "destination": "2220", "amount": "20.00", "asset": GBP},
     ]
+
+    # Nothing posted and nothing mirrored by the preview.
+    assert await _posted_count(db) == 0
+    assert fake.transactions == []
+
+    post = await approve_entry(db, preview.transaction_id)
+
+    assert post.transaction.status == "posted"
+    assert post.transaction.reference == "JE-2026-0001"
+    assert post.parity_ok is True
+    assert post.parity_report.missing_in_formance == []
+    assert post.parity_report.orphans_in_formance == []
+    assert post.parity_report.leg_mismatches == []
+    assert post.parity_report.balance_mismatches == []
+    assert "OK" in post.parity_report.summary
+
+    assert len(fake.transactions) == 1
+    mirror = fake.transactions[0]
+    assert mirror["reference"] == "JE-2026-0001"
+    assert mirror["metadata"]["transaction_id"] == str(preview.transaction_id)
+    assert mirror["postings"] == preview.formance_preview
+
+
+# ---------------------------------------------------------------------------
+# (a2) F36b — card-purchase round-trip (cash basis + supplier contact)
+# ---------------------------------------------------------------------------
+
+
+async def test_card_purchase_roundtrip(ctx) -> None:
+    """A purchase paid immediately by card previews Dr expense / Dr 2220
+    Input VAT / Cr bank (no creditor leg), auto-creates the supplier
+    contact, and approve posts + mirrors with parity ok."""
+    from src.services.contact_service import ContactService
+
+    db, fake = ctx["db"], ctx["fake"]
+    llm = make_fake_llm({"card purchase": CARD_RAW})
+
+    preview = await orchestrate_message(
+        db,
+        "Card purchase of £100 net plus VAT for printer paper, "
+        "paid from the current account",
+        llm=llm,
+    )
+
+    assert preview.status == "preview", preview.error
+    assert preview.skill_id == "card-purchase"
+    assert preview.total_pence == 12000
+    assert [(l.code, l.debit_pence, l.credit_pence) for l in preview.legs] == [
+        ("5000", 10000, 0),
+        ("2220", 2000, 0),
+        ("1000", 0, 12000),
+    ]
+    assert preview.legs[0].name == "Office Expenses"
+    assert preview.legs[1].name == "Input VAT"
+    assert preview.legs[2].name == "Bank Current"
+    # Cash basis — the purchase never touches Trade Creditors (2000).
+    assert all(l.code != "2000" for l in preview.legs)
+    assert preview.formance_preview == [
+        {"source": "1000", "destination": "5000", "amount": "100.00", "asset": GBP},
+        {"source": "1000", "destination": "2220", "amount": "20.00", "asset": GBP},
+    ]
+    # Contract F29 — the named supplier contact is real and stamped.
+    assert preview.contact is not None
+    assert preview.contact["name"] == "Card Supplies Ltd"
+    assert preview.contact["created"] is True
+    contacts, total = await ContactService.list_contacts(db)
+    assert total == 1
+    assert [c.name for c in contacts] == ["Card Supplies Ltd"]
 
     # Nothing posted and nothing mirrored by the preview.
     assert await _posted_count(db) == 0

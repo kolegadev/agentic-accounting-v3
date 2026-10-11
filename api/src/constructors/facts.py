@@ -18,6 +18,7 @@ __all__ = [
     "QueryFacts",
     "QUERY_TYPES",
     "BankTransferFacts",
+    "CardPurchaseFacts",
     "CustomerReceiptFacts",
     "DepreciationFacts",
     "JournalAccrualFacts",
@@ -50,6 +51,24 @@ class BankTransferFacts(BaseModel):
     amount_pence: int
     transfer_date: date
     reference: str | None = None
+
+
+class CardPurchaseFacts(BaseModel):
+    """Contract F36b — a purchase paid immediately by card / bank transfer.
+
+    Cash (debit) basis: the expense or asset is recognised AND paid in the
+    same entry — no creditor involved.  ``account_code`` is the expense or
+    asset account hit; ``net_pence`` is the net amount (integer pence) and
+    ``vat_rate`` follows the engine rates (``None`` = no VAT split).
+    """
+
+    purchase_date: date
+    bank_account_code: str
+    account_code: str
+    net_pence: int  # integer pence, > 0 (enforced by the constructor)
+    vat_rate: VatRate | None = None
+    description: str = ""
+    supplier_name: str | None = None
 
 
 class CustomerReceiptFacts(BaseModel):
@@ -194,6 +213,7 @@ class QueryFacts(BaseModel):
 
 FACTS_MODELS: dict[str, type[BaseModel]] = {
     "bank-transfer": BankTransferFacts,
+    "card-purchase": CardPurchaseFacts,
     "customer-receipt": CustomerReceiptFacts,
     "depreciation": DepreciationFacts,
     "journal-accrual": JournalAccrualFacts,

@@ -191,11 +191,12 @@ def _draft_transaction() -> Transaction:
 # ---------------------------------------------------------------------------
 
 
-def test_build_system_prompt_lists_all_10_skills_with_schemas() -> None:
+def test_build_system_prompt_lists_all_skills_with_schemas() -> None:
     prompt = build_system_prompt([{"role": "user", "content": "hi"}])
 
     for skill_id in (
         "bank-transfer",
+        "card-purchase",
         "customer-receipt",
         "depreciation",
         "journal-accrual",
@@ -292,6 +293,79 @@ async def test_orchestrate_supplier_invoice_vat_preview(
     assert result.contact["name"] == "Acme Office Supplies"
     assert result.contact["created"] is True
     assert drafts[0].contact_id == uuid.UUID(result.contact["id"])
+    mock_db.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_card_purchase_preview_with_supplier_contact(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    """F36b: a card purchase previews Dr expense / Dr 2220 Input VAT /
+    Cr bank AND auto-creates the supplier contact from ``supplier_name``."""
+    llm = await _llm_returning(
+        '{"skill_id": "card-purchase", "facts": {'
+        '"purchase_date": "2026-10-04", "bank_account_code": "1000", '
+        '"account_code": "5000", "net_pence": 10000, "vat_rate": "20%", '
+        '"description": "Printer paper", '
+        '"supplier_name": "Apple Store UK"}}'
+    )
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=list(coa.values())),  # list_accounts
+        _result(scalar=coa["5000"]),  # Dr expense/asset (net)
+        _result(scalar=coa["2220"]),  # Dr 2220 Input VAT
+        _result(scalar=coa["1000"]),  # Cr bank (gross)
+        _result(scalar=None),  # idempotency check
+        _result(scalars=[coa["5000"], coa["2220"], coa["1000"]]),
+    ]
+    supplier_contact = _contact_response("Apple Store UK")
+
+    with patch.object(
+        ContactService,
+        "find_or_create",
+        AsyncMock(return_value=(supplier_contact, True)),
+    ) as mock_find_or_create:
+        result = await orchestrate_message(
+            mock_db,
+            "I paid £100 plus VAT for printer paper with the company card",
+            llm=llm,
+        )
+
+    assert result.status == "preview", result.error
+    assert result.skill_id == "card-purchase"
+    assert result.transaction_id is not None
+    assert result.total_pence == 12000
+    assert [(l.code, l.debit_pence, l.credit_pence) for l in result.legs] == [
+        ("5000", 10000, 0),
+        ("2220", 2000, 0),
+        ("1000", 0, 12000),
+    ]
+    assert result.legs[0].name == "Office Expenses"
+    assert result.legs[1].name == "Input VAT"
+    assert result.legs[2].name == "Bank Current"
+    assert result.formance_preview == [
+        {"source": "1000", "destination": "5000", "amount": "100.00", "asset": "GBP/2"},
+        {"source": "1000", "destination": "2220", "amount": "20.00", "asset": "GBP/2"},
+    ]
+    # Draft only — nothing posted, no mirroring.
+    drafts = [o for o in mock_db.added if isinstance(o, Transaction)]
+    assert len(drafts) == 1
+    assert drafts[0].status == "draft"
+    assert drafts[0].description.startswith("I paid £100")
+    # Contract F29 — the card-purchase supplier contact was created + stamped.
+    mock_find_or_create.assert_awaited_once()
+    assert mock_find_or_create.call_args.args[1] == "Apple Store UK"
+    assert mock_find_or_create.call_args.kwargs == {
+        "email": None,
+        "vat_number": None,
+        "type": "supplier",
+    }
+    assert result.contact == {
+        "id": str(supplier_contact.id),
+        "name": "Apple Store UK",
+        "created": True,
+    }
+    assert drafts[0].contact_id == supplier_contact.id
     mock_db.commit.assert_called_once()
 
 

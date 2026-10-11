@@ -79,6 +79,7 @@ LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2048"))
 # Human-readable skill names (from each SKILL.md front-matter) for the prompt.
 SKILL_DESCRIPTIONS: dict[str, str] = {
     "bank-transfer": "Transfer between own bank accounts",
+    "card-purchase": "Purchase paid immediately by card or bank transfer (expense or asset)",
     "customer-receipt": "Receive an AR balance into bank",
     "depreciation": "Monthly straight-line depreciation",
     "journal-accrual": "Accrued expense / provision journal",
@@ -106,6 +107,7 @@ QUERY_SKILL_ID = "query"
 #: The facts field carrying the counterparty name, per contact-bearing
 #: skill (the exact F4 field names: ``supplier_name`` / ``customer_name``).
 CONTACT_NAME_FACT_FIELDS: dict[str, tuple[str, ...]] = {
+    "card-purchase": ("supplier_name",),
     "supplier-invoice": ("supplier_name",),
     "supplier-payment": ("supplier_name",),
     "sales-invoice": ("customer_name",),
@@ -114,6 +116,7 @@ CONTACT_NAME_FACT_FIELDS: dict[str, tuple[str, ...]] = {
 
 #: Contact type for auto-created counterparties, per skill family.
 CONTACT_TYPE_BY_SKILL: dict[str, str] = {
+    "card-purchase": "supplier",
     "supplier-invoice": "supplier",
     "supplier-payment": "supplier",
     "sales-invoice": "customer",
@@ -451,6 +454,7 @@ _DATE_FACT_FIELDS = (
     "opening_date",
     "start_date",
     "end_date",
+    "purchase_date",
 )
 
 

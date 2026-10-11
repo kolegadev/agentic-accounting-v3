@@ -156,6 +156,42 @@ WORKED_CASES: dict[str, list[dict]] = {
             "kwargs": {},
         },
     ],
+    "card-purchase": [
+        {
+            "facts": {
+                "purchase_date": "2026-10-01",
+                "bank_account_code": "1000",
+                "account_code": "1320",
+                "net_pence": 250000,
+                "vat_rate": "20%",
+                "description": "Laptop",
+                "supplier_name": "Apple Store UK",
+            },
+            "kwargs": {},
+        },
+        {
+            "facts": {
+                "purchase_date": "2026-10-02",
+                "bank_account_code": "1000",
+                "account_code": "5000",
+                "net_pence": 20000,
+                "vat_rate": "5%",
+                "description": "Materials",
+            },
+            "kwargs": {},
+        },
+        {
+            "facts": {
+                "purchase_date": "2026-10-03",
+                "bank_account_code": "1000",
+                "account_code": "6030",
+                "net_pence": 25000,
+                "vat_rate": "exempt",
+                "description": "Insurance",
+            },
+            "kwargs": {},
+        },
+    ],
     "customer-receipt": [
         {
             "facts": {
@@ -466,6 +502,106 @@ def test_property_bank_transfer() -> None:
         assert len(entry.formance_postings) == 1
         assert entry.legs[0].debit_amount == facts.amount_pence
         assert entry.legs[1].credit_amount == facts.amount_pence
+
+
+def test_property_card_purchase() -> None:
+    rng = random.Random(42)
+    codes = _template_codes()
+    rates: list[str | None] = [None, "20%", "5%", "0%", "exempt"]
+    for _ in range(200):
+        rate = rng.choice(rates)
+        facts_dict: dict = {
+            "purchase_date": date(2026, rng.randint(1, 12), rng.randint(1, 28)),
+            "bank_account_code": rng.choice(BANK_CODES),
+            "account_code": rng.choice(EXPENSE_CODES + FIXED_ASSET_CODES),
+            "net_pence": rng.randint(1, 5_000_000),
+            "description": f"Purchase {rng.randint(1, 9999)}",
+            "supplier_name": f"Supplier {rng.randint(1, 9999)}",
+        }
+        if rate is not None:
+            facts_dict["vat_rate"] = rate
+        facts = parse_facts("card-purchase", facts_dict)
+        entry = CONSTRUCTORS["card-purchase"](facts, codes)
+        _check_common_invariants(entry, codes, "card-purchase")
+
+        expected_vat = _vat_for_line(facts.net_pence, rate) if rate else 0
+        expected_gross = facts.net_pence + expected_vat  # exact pence
+        assert entry.derived["vat_pence"] == expected_vat
+        assert entry.derived["gross_pence"] == expected_gross
+
+        debits = [leg for leg in entry.legs if leg.debit_amount]
+        credits = [leg for leg in entry.legs if leg.credit_amount]
+        assert len(credits) == 1
+        assert credits[0].account == facts.bank_account_code
+        assert credits[0].account_class == "Asset (Bank)"
+        assert credits[0].credit_amount == expected_gross
+        assert debits[0].account == facts.account_code
+        assert debits[0].debit_amount == facts.net_pence
+        assert debits[0].account_class in (
+            "Expense (Expense)",
+            "Expense (DirectCost)",
+            "Asset (FixedAsset)",
+        )
+        vat_legs = [leg for leg in debits if leg.account == "2220"]
+        if expected_vat:
+            assert len(vat_legs) == 1
+            assert vat_legs[0].debit_amount == expected_vat
+            assert vat_legs[0].description == f"Input VAT {rate}"
+        else:
+            assert vat_legs == []
+        # balance identity: debits == credits == gross, exact pence
+        assert sum(leg.debit_amount for leg in entry.legs) == expected_gross
+        assert sum(leg.credit_amount for leg in entry.legs) == expected_gross
+        assert all(leg.account != "2000" for leg in entry.legs), (
+            "cash-basis purchase: never a trade creditor leg"
+        )
+
+
+def test_card_purchase_legs_by_vat_variant() -> None:
+    """F36b: expense + 20%, asset + 5%, exempt and 0% (and no rate at all)
+    — exact pence legs, VAT only for 20%/5%, gross = net + VAT."""
+    codes = _template_codes()
+    cases = [
+        # (account_code, vat_rate, net, expected VAT leg pence)
+        ("6050", "20%", 10000, 2000),
+        ("1320", "5%", 10000, 500),
+        ("6030", "exempt", 10000, 0),
+        ("6020", "0%", 10000, 0),
+        ("6020", None, 10000, 0),
+    ]
+    for account_code, rate, net, expected_vat in cases:
+        facts_dict: dict = {
+            "purchase_date": "2026-10-01",
+            "bank_account_code": "1000",
+            "account_code": account_code,
+            "net_pence": net,
+        }
+        if rate is not None:
+            facts_dict["vat_rate"] = rate
+        facts = parse_facts("card-purchase", facts_dict)
+        entry = CONSTRUCTORS["card-purchase"](facts, codes)
+
+        gross = net + expected_vat  # exact pence, no float arithmetic
+        expected: list[tuple[str, str, int]] = [("Dr", account_code, net)]
+        if expected_vat:
+            expected.append(("Dr", "2220", expected_vat))
+        expected.append(("Cr", "1000", gross))
+        actual: list[tuple[str, str, int]] = []
+        for leg in entry.legs:
+            if leg.debit_amount:
+                actual.append(("Dr", leg.account, leg.debit_amount))
+            else:
+                actual.append(("Cr", leg.account, leg.credit_amount))
+        assert actual == expected, f"{account_code}/{rate}: {actual} != {expected}"
+        assert entry.derived == {"gross_pence": gross, "vat_pence": expected_vat}
+
+        vat_legs = [leg for leg in entry.legs if leg.account == "2220"]
+        assert len(vat_legs) == (1 if expected_vat else 0)
+        if expected_vat:
+            assert vat_legs[0].description == f"Input VAT {rate}"
+        # balance identity
+        assert sum(leg.debit_amount for leg in entry.legs) == gross
+        assert sum(leg.credit_amount for leg in entry.legs) == gross
 
 
 def test_property_customer_receipt() -> None:
@@ -970,6 +1106,16 @@ def test_error_zero_amounts() -> None:
             },
             {},
         ),
+        (
+            "card-purchase",
+            {
+                "purchase_date": "2026-10-01",
+                "bank_account_code": "1000",
+                "account_code": "6050",
+                "net_pence": 0,
+            },
+            {},
+        ),
     ]
     for skill_id, facts_dict, kwargs in cases:
         facts = parse_facts(skill_id, facts_dict)
@@ -1055,6 +1201,50 @@ def test_error_prepayment_period_out_of_range() -> None:
         )
 
 
+def test_error_card_purchase_wrong_account_class() -> None:
+    """The debit account must be Expense or Asset (FixedAsset) — a
+    Liability, Revenue, Equity or Bank code is a ConstructorError."""
+    codes = _template_codes()
+    for account_code in ("2000", "4000", "3000", "1000"):
+        facts = parse_facts("card-purchase", {
+            "purchase_date": "2026-10-01",
+            "bank_account_code": "1010",
+            "account_code": account_code,
+            "net_pence": 10000,
+            "vat_rate": "20%",
+        })
+        with pytest.raises(ConstructorError):
+            CONSTRUCTORS["card-purchase"](facts, codes)
+
+
+def test_error_card_purchase_wrong_bank_account_class() -> None:
+    """The credit leg must be Asset (Bank) — any other class is a
+    ConstructorError (verifier fix-list D4)."""
+    codes = _template_codes()
+    facts = parse_facts("card-purchase", {
+        "purchase_date": "2026-10-01",
+        "bank_account_code": "6050",  # Expense (Expense), not a bank
+        "account_code": "6050",
+        "net_pence": 10000,
+        "vat_rate": "20%",
+    })
+    with pytest.raises(ConstructorError):
+        CONSTRUCTORS["card-purchase"](facts, codes)
+
+
+def test_error_card_purchase_unknown_account_code() -> None:
+    codes = _template_codes()
+    facts = parse_facts("card-purchase", {
+        "purchase_date": "2026-10-01",
+        "bank_account_code": "9999",
+        "account_code": "6050",
+        "net_pence": 10000,
+        "vat_rate": "20%",
+    })
+    with pytest.raises(ConstructorError):
+        CONSTRUCTORS["card-purchase"](facts, codes)
+
+
 # ---------------------------------------------------------------------------
 # Registry / resolver / types
 # ---------------------------------------------------------------------------
@@ -1063,7 +1253,7 @@ def test_error_prepayment_period_out_of_range() -> None:
 def test_registry_covers_every_catalog_skill() -> None:
     skill_ids = {path.parent.name for path in SKILLS_DIR.glob("*/SKILL.md")}
     assert set(CONSTRUCTORS) == skill_ids
-    assert len(CONSTRUCTORS) == 10
+    assert len(CONSTRUCTORS) == 11
     for skill_id, constructor in CONSTRUCTORS.items():
         assert callable(constructor), f"{skill_id} constructor is not callable"
 
@@ -1108,3 +1298,33 @@ def test_entry_types_are_frozen_and_error_is_exception() -> None:
     )
     with pytest.raises(FrozenInstanceError):
         entry.derived = {}  # type: ignore[misc]
+
+
+def test_card_purchase_exempt_needs_no_input_vat_account() -> None:
+    """Verifier D1 regression: an exempt/0%/no-rate purchase must NOT
+    resolve 2220 — it works on COAs without an input-VAT account, while a
+    20% purchase on the same COA is a ConstructorError."""
+    codes = dict(_template_codes())
+    codes.pop("2220", None)
+    for vat_rate in ("exempt", "0%", None):
+        facts = parse_facts("card-purchase", {
+            "purchase_date": "2026-10-01",
+            "bank_account_code": "1010",
+            "account_code": "6050",
+            "net_pence": 250000,
+            "vat_rate": vat_rate,
+        })
+        legs = CONSTRUCTORS["card-purchase"](facts, codes).legs
+        assert [(l.account, l.debit_amount, l.credit_amount) for l in legs] == [
+            ("6050", 250000, 0),
+            ("1010", 0, 250000),
+        ]
+    vat_facts = parse_facts("card-purchase", {
+        "purchase_date": "2026-10-01",
+        "bank_account_code": "1010",
+        "account_code": "6050",
+        "net_pence": 250000,
+        "vat_rate": "20%",
+    })
+    with pytest.raises(ConstructorError):
+        CONSTRUCTORS["card-purchase"](vat_facts, codes)

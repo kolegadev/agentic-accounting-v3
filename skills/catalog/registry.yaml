@@ -66,6 +66,12 @@
   frameworks: [uk-gaap, ifrs, us-gaap]
   status: v0
   path: transactions/opening-balances/SKILL.md
+- id: card-purchase
+  name: Purchase paid immediately by card or bank transfer (expense or asset)
+  category: transaction
+  frameworks: [uk-gaap, ifrs, us-gaap]
+  status: v0
+  path: transactions/card-purchase/SKILL.md
 - id: profit-and-loss
   name: Income statement (profit and loss)
   category: report

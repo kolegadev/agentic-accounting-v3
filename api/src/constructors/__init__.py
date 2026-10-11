@@ -96,6 +96,7 @@ from . import entry_constructors as _entry  # noqa: E402  (import after definiti
 
 CONSTRUCTORS: dict[str, Any] = {
     "bank-transfer": _entry.bank_transfer,
+    "card-purchase": _entry.card_purchase,
     "customer-receipt": _entry.customer_receipt,
     "depreciation": _entry.depreciation,
     "journal-accrual": _entry.journal_accrual,
