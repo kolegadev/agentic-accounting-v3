@@ -1058,6 +1058,19 @@ function addMessage(role, content, isError) {
   scrollDown();
 }
 
+// Pre-rendered, already-escaped HTML (e.g. answer tables). Never feed it
+// raw user/LLM text — every dynamic fragment must pass esc()/fmtMoney first.
+function addMessageHtml(role, html) {
+  var div = document.createElement('div');
+  div.className = 'msg ' + role;
+  var bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  bubble.innerHTML = html;
+  div.appendChild(bubble);
+  chat.appendChild(div);
+  scrollDown();
+}
+
 function addTyping() {
   removeTyping();
   var div = document.createElement('div');
@@ -1306,7 +1319,7 @@ function renderAnswer(data) {
   if (d.as_at) text += ' — as at ' + d.as_at;
   var html = renderMarkdown(text);
   html += table ? renderTable(table) : '<br><em>Nothing to show yet.</em>';
-  addMessage('assistant', html);
+  addMessageHtml('assistant', html);
   renderPreview(null);  // a question never produces a draft
   setPreviewStatus(title + ' — answered from the ledger (no draft created).', 'ready');
 }
