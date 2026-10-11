@@ -502,6 +502,40 @@ async def forward_formance_report(report_type: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Account drill-down forwarding (Contract F37) — real pipeline only.
+#
+# GET /api/accounts/{code}/transactions proxies to the accounting API's
+# /api/v1/accounts/{code}/transactions with query params passed through
+# untouched (entity_id, date_from, date_to, limit).  If the upstream API is
+# unreachable the response is 502 JSON.  Uses the standard 10s client and
+# the same injectable _upstream_client test seam as the F7 routes.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/accounts/{code}/transactions")
+async def forward_account_transactions(code: str, request: Request):
+    """GET → /api/v1/accounts/{code}/transactions (query params pass through)."""
+    url = f"{API_BASE_URL}/api/v1/accounts/{code}/transactions"
+    try:
+        client = _get_upstream_client()
+        resp = await client.get(url, params=dict(request.query_params))
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "type": "upstream_unreachable",
+                "message": f"Accounting API unreachable: {exc}",
+            },
+        )
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=payload)
+
+
+# ---------------------------------------------------------------------------
 # Books in plain English (Contract F23) — real pipeline only, NO mock fallback.
 #
 # GET /api/books?entity_id=<uuid> fetches the REAL Formance P&L and balance

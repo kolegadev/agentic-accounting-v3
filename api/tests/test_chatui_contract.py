@@ -93,6 +93,19 @@ ADMIN_ENDPOINTS = [
     "/api/users",
 ]
 
+# Contract F37 — the account drill-down modal: clicking a 4-digit code cell
+# opens it (it no longer fills the chat input) and it fetches the proxy
+# route with the current entity.
+ACCOUNT_DOM_IDS = [
+    "account-modal",
+    "account-modal-title",
+    "account-modal-body",
+]
+
+ACCOUNT_ENDPOINTS = [
+    "/api/accounts/",
+]
+
 FORBIDDEN_STRINGS = [
     "brightwork",
     "/api/companies",
@@ -163,6 +176,33 @@ def test_mock_world_string_absent(html: str, forbidden: str) -> None:
     mock dashboard/companies endpoints, or the WS chat bridge may remain in
     the rebuilt page."""
     assert forbidden not in html
+
+
+@pytest.mark.parametrize("dom_id", ACCOUNT_DOM_IDS)
+def test_required_account_dom_id_present(html: str, dom_id: str) -> None:
+    assert f'id="{dom_id}"' in html
+
+
+@pytest.mark.parametrize("endpoint", ACCOUNT_ENDPOINTS)
+def test_js_references_account_drilldown_endpoint(html: str, endpoint: str) -> None:
+    assert endpoint in html
+
+
+def test_table_cell_click_opens_account_modal(html: str) -> None:
+    """Contract F37 — sendTableCellQuery opens the account modal via
+    openAccount(code) and no longer fills + sends a chat message.  Only
+    4-digit codes are accepted; the modal renders the running balance."""
+    assert "openAccount(code)" in html
+    assert "function openAccount(code)" in html
+    assert "function closeAccount()" in html
+    # The old chat-input behaviour is REMOVED.
+    assert "show account detail for code" not in html
+    assert "input.value = query" not in html
+    # The 4-digit guard is re-checked before opening.
+    assert "/^\\d{4}$/.test(code)" in html
+    # The modal table carries the running balance and money formatting.
+    assert "running_balance_pence" in html
+    assert "balance_pence" in html
 
 
 def test_entity_id_query_wiring_present(html: str) -> None:

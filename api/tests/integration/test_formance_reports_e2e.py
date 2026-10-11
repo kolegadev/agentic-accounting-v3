@@ -53,6 +53,7 @@ from sqlalchemy.pool import StaticPool
 from src.config.database import Base
 from src.models.account import Account
 from src.routes.formance_reports import formance_report as formance_report_route
+from src.routes.transactions import list_account_transactions
 from src.services.coa_service import CoaService
 from src.services.formance_reports import (
     generate_bs,
@@ -644,15 +645,94 @@ async def test_sabotage_mirror_amount_flags_identity_and_diff(ctx) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Contract F30 — aged payables through the route (real Postgres aging +
-# real entity-scoped engine TB).  The AR join needs contacts/invoices
-# tables this fixture does not create (Base.metadata.create_all fails on
-# SQLite and the fallback DDL has only four tables), so AR is covered by
-# the route tests plus the AP/AR service tests in test_reports.py.
+# Contract F37 — ledger-derived aging + account drill-down through the
+# routes (the REAL orchestrator/constructors seed the ledger).
 # ---------------------------------------------------------------------------
 
+CUSTOMER_RECEIPT_RAW = (
+    '{"skill_id": "customer-receipt", "facts": {'
+    '"customer_name": "Acme Corp", "receipt_date": "2026-10-15", '
+    '"bank_account_code": "1000", "amount_pence": 60000, '
+    '"invoice_refs": ["INV-2001"], "allocated_pence": [60000]}}'
+)
 
-async def test_aging_payables_route_buckets_and_ledger_balance(ctx) -> None:
+AGING_CROSS_CHECK_NOTE = (
+    "aging is ledger-derived (the same posted ledger the Balance Sheet "
+    "reads) and reconciles to the trial-balance balance by construction — "
+    "there is no separate Postgres equivalent to diff against"
+)
+
+
+async def _seed_partial_receipt(ctx):
+    """Post a PARTIAL customer receipt (£600.00 against the £1,200.00 invoice)."""
+    db = ctx["db"]
+    llm = make_fake_llm({"customer receipt": CUSTOMER_RECEIPT_RAW})
+    receipt = await orchestrate_message(
+        db, "customer receipt from Acme Corp", llm=llm
+    )
+    assert receipt.status == "preview", receipt.error
+    post = await approve_entry(db, receipt.transaction_id)
+    assert post.parity_ok is True
+    return receipt
+
+
+async def test_aging_receivables_reconciles_to_tb_with_partial_receipt(ctx) -> None:
+    await _seed_scenario(ctx)
+    receipt = await _seed_partial_receipt(ctx)
+    db = ctx["db"]
+
+    resp = await formance_report_route(
+        report_type="aged-receivables",
+        as_at=END,
+        entity_id=None,
+        db=db,
+    )
+
+    assert resp.status_code == 200, resp.body
+    body = json.loads(resp.body)
+    assert body["report_type"] == "aged-receivables"
+    assert body["as_at"] == END.isoformat()
+    report = body["report"]
+
+    # The debtors balance the Balance Sheet shows: 1,200.00 − 600.00.
+    tb = await generate_tb(db, "main", as_at=END)
+    tb_1100 = next(row for row in tb["accounts"] if row["code"] == "1100")
+    assert tb_1100["balance"] == 60000
+    assert report["total_outstanding_pence"] == abs(tb_1100["balance"]) == 60000
+    assert report["ledger_balance"] == {
+        "code": "1100",
+        "name": "Trade Debtors",
+        "balance_pence": 60000,
+    }
+    assert report["reconciled"] is True
+
+    # One item: the sales invoice, FIFO-allocated 600.00 of the receipt.
+    assert len(report["items"]) == 1
+    item = report["items"][0]
+    assert item["ref"] == "JE-2026-0002"
+    assert item["date"] == "2026-10-01"
+    assert item["original_pence"] == 120000
+    assert item["paid_pence"] == 60000
+    assert item["outstanding_pence"] == 60000
+    assert item["days_overdue"] == (END - date(2026, 10, 1)).days
+    buckets = {b["bucket"]: b for b in report["buckets"]}
+    assert buckets["90+"] == {"bucket": "90+", "count": 1, "total_pence": 60000}
+    assert buckets["0-30"] == {"bucket": "0-30", "count": 0, "total_pence": 0}
+    assert "invoice-derived" not in report["note"]
+    assert "ledger" in report["note"].lower()
+    assert body["cross_check"] == {
+        "ok": None,
+        "diffs": [],
+        "note": AGING_CROSS_CHECK_NOTE,
+    }
+    # The receipt really is a posted mirror: Cr 1100 -> Dr 1000, £600.00.
+    mirror = ctx["fake"].mirror_for(str(receipt.transaction_id))
+    assert mirror["postings"] == [
+        {"source": "1100", "destination": "1000", "amount": "600.00", "asset": "GBP/2"}
+    ]
+
+
+async def test_aging_payables_reconciles_to_tb(ctx) -> None:
     await _seed_scenario(ctx)
     db, fake = ctx["db"], ctx["fake"]
     assert fake.transactions  # scenario really mirrored to the engine
@@ -667,42 +747,60 @@ async def test_aging_payables_route_buckets_and_ledger_balance(ctx) -> None:
     assert resp.status_code == 200, resp.body
     body = json.loads(resp.body)
     assert body["report_type"] == "aged-payables"
-    assert body["as_at"] == END.isoformat()
     report = body["report"]
 
-    # Unmatched expense postings: supplier invoice Dr 5000 £900.00
-    # (2026-10-02) + depreciation Dr 6500 £100.00 (2026-10-31) — both 61-90
-    # days overdue against 2026-12-31.
-    buckets = {b["bucket"]: b for b in report["buckets"]}
-    assert buckets["61-90"] == {"bucket": "61-90", "count": 2, "total_pence": 100000}
-    assert buckets["0-30"] == {"bucket": "0-30", "count": 0, "total_pence": 0}
-    assert report["total_outstanding_pence"] == 100000
-    assert {line["ref"] for line in report["lines"]} == {
-        "JE-2026-0003",  # supplier invoice (NET 900.00 on 5000)
-        "JE-2026-0004",  # depreciation (100.00 on 6500)
-    }
-    assert all(
-        set(line) == {"contact_name", "ref", "due_date", "amount_pence", "days_overdue"}
-        for line in report["lines"]
-    )
-
-    # Creditors 2000: engine TB signs credit balances negative — the line
-    # matches the 2000 row of the trial balance exactly.
     tb = await generate_tb(db, "main", as_at=END)
     tb_2000 = next(row for row in tb["accounts"] if row["code"] == "2000")
+    assert tb_2000["balance"] == -108000
+    assert report["total_outstanding_pence"] == abs(tb_2000["balance"]) == 108000
     assert report["ledger_balance"] == {
         "code": "2000",
         "name": "Trade Creditors",
-        "balance_pence": tb_2000["balance"],
+        "balance_pence": -108000,
     }
-    assert report["ledger_balance"]["balance_pence"] == -108000
-    assert report["note"]
+    assert report["reconciled"] is True
+
+    # One item: the supplier invoice (credit to 2000), unpaid.
+    assert [item["ref"] for item in report["items"]] == ["JE-2026-0003"]
+    assert report["items"][0]["original_pence"] == 108000
+    assert report["items"][0]["outstanding_pence"] == 108000
+    assert report["items"][0]["paid_pence"] == 0
+    buckets = {b["bucket"]: b for b in report["buckets"]}
+    assert buckets["61-90"] == {"bucket": "61-90", "count": 1, "total_pence": 108000}
     assert body["cross_check"] == {
         "ok": None,
         "diffs": [],
-        "note": (
-            "aging is invoice-derived (Postgres); ledger balance is "
-            "Formance-derived — the difference is unpaid-draft timing, "
-            "not a defect"
-        ),
+        "note": AGING_CROSS_CHECK_NOTE,
     }
+
+
+async def test_account_drilldown_route_returns_postings_and_running_balance(ctx) -> None:
+    await _seed_scenario(ctx)
+    await _seed_partial_receipt(ctx)
+    db = ctx["db"]
+
+    resp = await list_account_transactions(code="1100", db=db, limit=100)
+
+    assert resp.status_code == 200, resp.body
+    body = json.loads(resp.body)
+    assert body["code"] == "1100"
+    assert body["name"] == "Trade Debtors"
+    assert body["count"] == 2
+    assert body["running_balance_pence"] == 60000
+
+    # Newest first: the receipt (credit 600.00) then the invoice (debit 1,200.00).
+    receipt, invoice = body["items"]
+    assert receipt["reference"] == "JE-2026-0006"
+    assert receipt["effective_date"] == "2026-10-15"
+    assert (receipt["debit_pence"], receipt["credit_pence"], receipt["balance_pence"]) == (
+        0, 60000, 60000,
+    )
+    assert invoice["reference"] == "JE-2026-0002"
+    assert invoice["effective_date"] == "2026-10-01"
+    assert (
+        invoice["debit_pence"],
+        invoice["credit_pence"],
+        invoice["balance_pence"],
+    ) == (120000, 0, 120000)
+    assert invoice["status"] == "posted"
+    assert invoice["description"]

@@ -551,6 +551,123 @@ class TransactionService:
         return transactions, total
 
     @staticmethod
+    async def list_for_account(
+        db: AsyncSession,
+        code: str,
+        *,
+        entity_id: Optional[uuid.UUID] = None,
+        date_from: Optional[date] = None,
+        date_to: Optional[date] = None,
+        limit: int = 100,
+    ) -> Optional[dict[str, Any]]:
+        """Contract F37 — one account's transactions with a running balance.
+
+        Reads the posted + reversed scope (the F2 discipline) for the
+        account identified by ``code``, entity-scoped like every other
+        entity read: a transaction belongs when it is in scope and has a
+        posting to this account.
+
+        Returns ``None`` when the code is unknown (or the account is
+        inactive / outside the requested entity) — the route answers 404.
+        Otherwise returns ``{code, name, items, running_balance_pence,
+        count}``:
+
+        - ``items`` are newest-first (effective_date DESC, id DESC); each
+          carries THIS account's ``debit_pence`` / ``credit_pence`` legs,
+          the transaction fields, and ``balance_pence`` — the cumulative
+          Σ debits − Σ credits from the oldest in-scope transaction
+          through that row (a true running balance, not a window total).
+        - ``running_balance_pence`` is the ENDING balance over the full
+          in-scope history (independent of the date window and ``limit``).
+        - ``count`` is the number of items returned.
+        """
+        # Imported locally: ledger_parity imports this module, so a
+        # module-level import would be circular.
+        from src.services.ledger_parity import IN_SCOPE_STATUSES
+
+        account_stmt = select(Account).where(Account.code == code)
+        if entity_id is not None:
+            account_stmt = account_stmt.where(Account.entity_id == entity_id)
+        account = (await db.execute(account_stmt)).scalars().first()
+        if account is None or not account.is_active:
+            return None
+
+        stmt = (
+            select(Transaction)
+            .where(Transaction.status.in_(IN_SCOPE_STATUSES))
+            .where(
+                Transaction.id.in_(
+                    select(Posting.transaction_id).where(
+                        Posting.account_id == account.id
+                    )
+                )
+            )
+            .options(selectinload(Transaction.postings))
+        )
+        if entity_id is not None:
+            stmt = stmt.where(Transaction.entity_id == entity_id)
+        transactions = list((await db.execute(stmt)).scalars().all())
+
+        ordered = sorted(
+            transactions,
+            key=lambda tx: (
+                tx.effective_date is None,
+                tx.effective_date or date.min,
+                str(tx.id),
+            ),
+        )
+
+        rows: list[dict[str, Any]] = []
+        running = 0
+        for tx in ordered:
+            debit = sum(
+                p.debit_amount
+                for p in (tx.postings or [])
+                if p.account_id == account.id
+            )
+            credit = sum(
+                p.credit_amount
+                for p in (tx.postings or [])
+                if p.account_id == account.id
+            )
+            if debit == 0 and credit == 0:
+                continue
+            running += debit - credit
+            rows.append(
+                {
+                    "transaction_id": str(tx.id),
+                    "reference": tx.reference,
+                    "description": tx.description,
+                    "effective_date": tx.effective_date,
+                    "debit_pence": debit,
+                    "credit_pence": credit,
+                    "status": tx.status,
+                    "balance_pence": running,
+                }
+            )
+
+        def in_window(row: dict[str, Any]) -> bool:
+            effective = row["effective_date"]
+            if effective is None:
+                return date_from is None and date_to is None
+            if date_from is not None and effective < date_from:
+                return False
+            if date_to is not None and effective > date_to:
+                return False
+            return True
+
+        window = [row for row in rows if in_window(row)]
+        items = window[-limit:][::-1] if limit > 0 else []
+
+        return {
+            "code": account.code,
+            "name": account.name,
+            "items": items,
+            "running_balance_pence": running,
+            "count": len(items),
+        }
+
+    @staticmethod
     async def reverse_transaction(
         db: AsyncSession,
         transaction_id: uuid.UUID,

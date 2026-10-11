@@ -1,4 +1,4 @@
-"""FastAPI router for Core General Ledger — Transaction endpoints."""
+"""FastAPI router for Core General Ledger — Transaction + account drill-down endpoints."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.database import get_db
@@ -24,14 +26,20 @@ from src.validators.transaction import (
     TransactionResponse,
 )
 
-router = APIRouter(prefix="/api/v1/transactions", tags=["Transactions"])
+# The transaction endpoints own the /api/v1/transactions prefix; the
+# F37 account drill-down lives under /api/v1/accounts.  The exported
+# ``router`` (registered once in src/index.py) is the composite of the
+# two — FastAPI applies a router prefix to included routes, so the
+# composite itself carries no prefix.
+transactions_router = APIRouter(prefix="/api/v1/transactions", tags=["Transactions"])
+accounts_router = APIRouter(prefix="/api/v1/accounts", tags=["Accounts"])
 
 
 # ---------------------------------------------------------------------------
 # POST / — Create transaction (Draft)
 # ---------------------------------------------------------------------------
 
-@router.post(
+@transactions_router.post(
     "/",
     response_model=TransactionResponse,
     summary="Create a new transaction (Draft)",
@@ -62,7 +70,7 @@ async def create_transaction(
 # POST /{transaction_id}/post — Post transaction
 # ---------------------------------------------------------------------------
 
-@router.post(
+@transactions_router.post(
     "/{transaction_id}/post",
     response_model=TransactionResponse,
     summary="Post a Draft transaction",
@@ -92,7 +100,7 @@ async def post_transaction(
 # GET / — List transactions
 # ---------------------------------------------------------------------------
 
-@router.get(
+@transactions_router.get(
     "/",
     response_model=TransactionListResponse,
     summary="List transactions with optional filters",
@@ -130,7 +138,7 @@ async def list_transactions(
 # GET /{transaction_id} — Get transaction with postings
 # ---------------------------------------------------------------------------
 
-@router.get(
+@transactions_router.get(
     "/{transaction_id}",
     response_model=TransactionResponse,
     summary="Get transaction by ID with all postings",
@@ -152,7 +160,7 @@ async def get_transaction(
 # POST /{transaction_id}/reverse — Reverse transaction
 # ---------------------------------------------------------------------------
 
-@router.post(
+@transactions_router.post(
     "/{transaction_id}/reverse",
     response_model=TransactionResponse,
     summary="Reverse a Posted transaction",
@@ -180,7 +188,7 @@ async def reverse_transaction(
 # GET /{transaction_id}/audit — Audit trail
 # ---------------------------------------------------------------------------
 
-@router.get(
+@transactions_router.get(
     "/{transaction_id}/audit",
     summary="Get audit trail for a transaction",
     status_code=status.HTTP_200_OK,
@@ -226,3 +234,56 @@ async def get_audit_trail(
         "transaction_id": str(transaction.id),
         "audit_trail": audit_entries,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/accounts/{code}/transactions — account drill-down (Contract F37)
+# ---------------------------------------------------------------------------
+
+@accounts_router.get(
+    "/{code}/transactions",
+    summary="List one account's posted transactions with a running balance",
+    status_code=status.HTTP_200_OK,
+    responses={404: {"description": "Unknown or inactive account code"}},
+)
+async def list_account_transactions(
+    code: str,
+    entity_id: Optional[uuid.UUID] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    limit: int = Query(100, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Contract F37 — the drill-down behind a clicked report account code.
+
+    Returns ``{code, name, items, running_balance_pence, count}`` for the
+    account's posted + reversed transactions (entity-scoped; optional
+    date window; newest first, each row carrying the per-item running
+    ``balance_pence``). An unknown or inactive code is a 404
+    ``{type: account_not_found}`` — never an empty 200.
+    """
+    result = await TransactionService.list_for_account(
+        db,
+        code,
+        entity_id=entity_id,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "type": "account_not_found",
+                "message": f"Account '{code}' not found or is inactive",
+            },
+        )
+    return JSONResponse(status_code=200, content=jsonable_encoder(result))
+
+
+# The exported router is the composite registered in src/index.py: the
+# transaction endpoints under /api/v1/transactions and the F37 account
+# drill-down under /api/v1/accounts.
+router = APIRouter()
+router.include_router(transactions_router)
+router.include_router(accounts_router)

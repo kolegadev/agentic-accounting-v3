@@ -310,6 +310,81 @@ def test_reports_upstream_unreachable_returns_502(
 
 
 # ---------------------------------------------------------------------------
+# Account drill-down forwarding (Contract F37) — GET
+# /api/accounts/{code}/transactions → /api/v1/accounts/{code}/transactions
+# with the query string (entity_id, date_from, date_to, limit) untouched.
+# ---------------------------------------------------------------------------
+
+
+def test_account_transactions_forwards_path_and_query(
+    client: TestClient, upstream
+) -> None:
+    resp = client.get(
+        "/api/accounts/1100/transactions",
+        params={"entity_id": "entity-1", "date_from": "2026-01-01", "limit": "50"},
+    )
+
+    assert resp.status_code == 200
+    echo = resp.json()
+    assert echo["method"] == "GET"
+    assert echo["path"] == "/api/v1/accounts/1100/transactions"
+    req = upstream[0]
+    assert req.method == "GET"
+    assert req.url.path == "/api/v1/accounts/1100/transactions"
+    assert req.url.params.get("entity_id") == "entity-1"
+    assert req.url.params.get("date_from") == "2026-01-01"
+    assert req.url.params.get("limit") == "50"
+
+
+def test_account_transactions_no_query_params_passthrough(
+    client: TestClient, upstream
+) -> None:
+    resp = client.get("/api/accounts/2000/transactions")
+
+    assert resp.status_code == 200
+    assert upstream[0].url.path == "/api/v1/accounts/2000/transactions"
+    assert dict(upstream[0].url.params) == {}
+
+
+def test_account_transactions_upstream_error_status_and_json_passthrough(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404,
+            json={
+                "type": "account_not_found",
+                "message": "Account '9999' not found or is inactive",
+            },
+        )
+
+    _set_transport(monkeypatch, handler)
+    resp = client.get("/api/accounts/9999/transactions")
+
+    assert resp.status_code == 404
+    assert resp.json() == {
+        "type": "account_not_found",
+        "message": "Account '9999' not found or is inactive",
+    }
+
+
+def test_account_transactions_upstream_unreachable_returns_502(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _set_transport(monkeypatch, handler)
+    resp = client.get("/api/accounts/1100/transactions")
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "upstream_unreachable"
+    assert "connection refused" in body["message"]
+
+
+# ---------------------------------------------------------------------------
 # Entities forwarding (Contract F20/F23) — GET → /api/v1/entities/ (WITH the
 # trailing slash — the slash-less URL 307-redirects and returned an empty
 # body), no mock fallback.

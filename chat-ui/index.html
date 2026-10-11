@@ -850,6 +850,22 @@
   </div>
 </div>
 
+<!-- ═══════════ ACCOUNT DRILL-DOWN MODAL (F37) ═══════════ -->
+<div class="modal-overlay" id="account-modal" onclick="closeAccount()">
+  <div class="modal-panel" style="width:90%;max-width:760px" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2 id="account-modal-title" style="font-size:18px;color:var(--accent);margin:0">Account</h2>
+      <button class="modal-close" onclick="closeAccount()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="account-modal-body"><div class="report-empty">Loading…</div></div>
+      <div class="modal-btn-row" style="justify-content:flex-end">
+        <button class="modal-btn-secondary" onclick="closeAccount()">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 // ═══════════════════════════════════════════
 //  APP STATE (Contract F23 — one selector: the entity)
@@ -1130,12 +1146,73 @@ function renderTable(text) {
 }
 
 function sendTableCellQuery(el) {
-  var tr = el.closest('tr');
-  var allCells = tr.querySelectorAll('.clickable-cell');
-  var code = allCells.length > 0 ? allCells[0].getAttribute('data-value') : '';
-  var query = 'show account detail for code ' + code;
-  input.value = query;
-  sendMessage();
+  // F37: a click on a 4-digit account code no longer fills the chat input —
+  // it opens the account drill-down modal (the F31 renderTable guard already
+  // limits clickable cells to 4-digit codes; re-checked here for safety).
+  var code = el.getAttribute('data-value') || '';
+  if (/^\d{4}$/.test(code)) openAccount(code);
+}
+
+// ═══════════════════════════════════════════
+//  ACCOUNT DRILL-DOWN (F37)
+//  Clicking a 4-digit code in ANY table (Formance report tables and chat
+//  answer tables both flow through renderTable) opens this account's
+//  posted transactions: date, reference, description, this account's
+//  debit/credit legs and the running balance.  Every value passes through
+//  esc()/fmtMoney before it reaches the DOM.
+// ═══════════════════════════════════════════
+function accountModalTitle(code, name) {
+  return 'Account ' + String(code || '') + (name ? ' — ' + String(name) : '');
+}
+
+function openAccountModal() {
+  var modal = document.getElementById('account-modal');
+  if (modal) modal.classList.add('open');
+}
+
+function closeAccount() {
+  var modal = document.getElementById('account-modal');
+  if (modal) modal.classList.remove('open');
+}
+
+async function openAccount(code) {
+  code = String(code || '');
+  if (!/^\d{4}$/.test(code)) return;
+  var title = document.getElementById('account-modal-title');
+  var body = document.getElementById('account-modal-body');
+  if (title) title.textContent = accountModalTitle(code, '');
+  if (body) body.innerHTML = '<div class="report-empty">Loading…</div>';
+  openAccountModal();
+  var qs = entityParam();
+  var url = '/api/accounts/' + encodeURIComponent(code) + '/transactions' + (qs ? '?' + qs : '');
+  try {
+    var resp = await fetch(url);
+    var data = await resp.json().catch(function() { return null; });
+    if (!resp.ok) {
+      var msg = (data && (data.message || data.type || data.detail)) || ('HTTP ' + resp.status);
+      body.innerHTML = '<div class="report-error">' + esc(msg) + '</div>';
+      return;
+    }
+    title.textContent = accountModalTitle(data.code || code, data.name || '');
+    var rows = (data.items || []).map(function(t) {
+      return '<tr><td>' + esc(t.effective_date || '') + '</td>' +
+        '<td>' + esc(t.reference || '') + '</td>' +
+        '<td>' + esc(t.description || '') + '</td>' +
+        '<td class="num">' + (t.debit_pence ? fmtMoney(t.debit_pence) : '') + '</td>' +
+        '<td class="num">' + (t.credit_pence ? fmtMoney(t.credit_pence) : '') + '</td>' +
+        '<td class="num">' + fmtMoney(t.balance_pence) + '</td></tr>';
+    }).join('');
+    var html = '<table class="report-table"><thead><tr>' +
+      '<th>Date</th><th>Ref</th><th>Description</th>' +
+      '<th class="num">Debit</th><th class="num">Credit</th><th class="num">Balance</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table>';
+    if (!rows) html = '<div class="report-empty">No posted transactions for this account.</div>';
+    html += '<div class="report-note">Running balance: ' + fmtMoney(data.running_balance_pence) +
+      ' · ' + esc(String(data.count || 0)) + ' transaction(s)</div>';
+    body.innerHTML = html;
+  } catch (e) {
+    if (body) body.innerHTML = '<div class="report-error">Account drill-down unavailable: ' + esc(e.message) + '</div>';
+  }
 }
 
 function scrollDown() {
@@ -1545,9 +1622,15 @@ function reportDateFields() {
   document.getElementById('report-as-at-wrap').style.display = flow ? 'none' : 'flex';
 }
 
+function accountCodeCell(code) {
+  var c = String(code || '');
+  if (!/^\d{4}$/.test(c)) return esc(c);
+  return '<span class="clickable-cell" onclick="event.stopPropagation(); sendTableCellQuery(this)" data-value="' + esc(c) + '" style="cursor:pointer;transition:all .15s" onmouseover="this.style.color=\'var(--accent)\'" onmouseout="this.style.color=\'\'">' + esc(c) + '</span>';
+}
+
 function reportLineRows(lines) {
   return (lines || []).map(function(l) {
-    return '<tr><td class="leg-code">' + esc(l.code || '') + '</td><td>' + esc(l.name || '') +
+    return '<tr><td class="leg-code">' + accountCodeCell(l.code) + '</td><td>' + esc(l.name || '') +
       '</td><td class="num">' + fmtMoney(l.amount) + '</td></tr>';
   }).join('');
 }
@@ -1592,7 +1675,7 @@ function renderFormanceReport(data) {
       '</tbody></table>';
   } else if (type === 'trial-balance') {
     var rows = (r.accounts || []).map(function(a) {
-      return '<tr><td class="leg-code">' + esc(a.code) + '</td><td>' + esc(a.name) + '</td>' +
+      return '<tr><td class="leg-code">' + accountCodeCell(a.code) + '</td><td>' + esc(a.name) + '</td>' +
         '<td class="num">' + (a.debit ? fmtMoney(a.debit) : '') + '</td>' +
         '<td class="num">' + (a.credit ? fmtMoney(a.credit) : '') + '</td></tr>';
     }).join('');
@@ -1604,6 +1687,21 @@ function renderFormanceReport(data) {
       '<td class="num">' + fmtMoney(r.total_credits) + '</td></tr>' +
       '</tbody></table>';
   } else if (type === 'aged-receivables' || type === 'aged-payables') {
+    // F37: ledger-derived aging — items, buckets, total, and the
+    // reconciliation badge against the Balance Sheet.
+    var itemRows = (r.items || []).map(function(it) {
+      return '<tr><td>' + esc(it.date || '') + '</td>' +
+        '<td>' + esc(it.ref || '') + '</td>' +
+        '<td class="num">' + fmtMoney(it.original_pence) + '</td>' +
+        '<td class="num">' + fmtMoney(it.paid_pence) + '</td>' +
+        '<td class="num">' + fmtMoney(it.outstanding_pence) + '</td>' +
+        '<td class="num">' + esc(String(it.days_overdue == null ? '' : it.days_overdue)) + '</td></tr>';
+    }).join('');
+    html += '<table class="report-table"><thead><tr>' +
+      '<th>Date</th><th>Reference</th><th class="num">Original</th>' +
+      '<th class="num">Paid</th><th class="num">Outstanding</th>' +
+      '<th class="num">Days overdue</th></tr></thead><tbody>' + itemRows + '</tbody></table>';
+    if (!itemRows) html += '<div class="report-empty">No open items.</div>';
     var bucketRows = ['| Bucket | Count | Total |', '| --- | --- | --- |'];
     (r.buckets || []).forEach(function(b) {
       bucketRows.push('| ' + b.bucket + ' | ' + b.count + ' | ' + fmtMoney(b.total_pence) + ' |');
@@ -1617,9 +1715,10 @@ function renderFormanceReport(data) {
     var lbVal = Number(lb.balance_pence) || 0;
     var lbLabel = lbVal < 0 ? fmtMoney(-lbVal) + ' (credit)' : fmtMoney(lbVal);
     html += '<div class="report-note">Ledger balance — ' + esc(lb.code || '') + ' ' +
-      esc(lb.name || '') + ': ' + lbLabel +
-      (lb.ledger_account_missing ? ' (account missing from the chart of accounts)' : '') +
-      '</div>';
+      esc(lb.name || '') + ': ' + lbLabel + '</div>';
+    html += r.reconciled
+      ? '<div class="cc-ok">✓ reconciles to the Balance Sheet</div>'
+      : '<div class="cc-bad">✘ does not reconcile to the Balance Sheet</div>';
     if (r.note) html += '<div class="report-note">' + esc(r.note) + '</div>';
   } else if (type === 'cash-flow') {
     var cs = r.sections || {};

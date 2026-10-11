@@ -65,9 +65,10 @@ import uuid
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.models.account import Account
-from src.models.transaction import Transaction
+from src.models.transaction import Posting, Transaction
 from src.services.formance_client import formance_client
 from src.services.ledger_parity import (
     IN_SCOPE_STATUSES,
@@ -85,6 +86,8 @@ __all__ = [
     "generate_tb",
     "generate_cash_flow",
     "generate_funds",
+    "generate_ar_aging",
+    "generate_ap_aging",
     "verify_against_postgres",
 ]
 
@@ -215,6 +218,26 @@ _CONTRA_DEPRECIATION_CODES = LINE_ITEM_CODES["balance-sheet"][
 _CONTRA_EQUITY_CODES = LINE_ITEM_CODES["balance-sheet"]["contra_equity"]
 _WC_ASSET_CODES = LINE_ITEM_CODES["cash-flow-statement"]["working_capital_assets"]
 _DIVIDEND_CODES = LINE_ITEM_CODES["cash-flow-statement"]["dividends_drawings"]
+
+# Contract F37 — ledger-derived AR/AP aging: report name -> (account code,
+# COA label fallback); buckets are always reported in this order.
+AGING_BUCKETS = ("0-30", "31-60", "61-90", "90+")
+_AGING_DEFS = {
+    "aged_receivables": ("1100", "Trade Debtors"),
+    "aged_payables": ("2000", "Trade Creditors"),
+}
+_AGING_NOTES = {
+    "aged_receivables": (
+        "Ledger-derived aging: invoice moments (debits to 1100) FIFO-"
+        "matched against customer receipts (credits to 1100) from the same "
+        "posted ledger the Balance Sheet reads."
+    ),
+    "aged_payables": (
+        "Ledger-derived aging: supplier-invoice moments (credits to 2000) "
+        "FIFO-matched against supplier payments (debits to 2000) from the "
+        "same posted ledger the Balance Sheet reads."
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +895,250 @@ async def generate_tb(
         "total_credits": total_credits,
         "identity_ok": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Contract F37 — ledger-derived AR/AP aging
+# ---------------------------------------------------------------------------
+
+
+def _aging_bucket(days_overdue: int) -> str:
+    """Aging bucket for a day count (future-dated items clamp into 0-30)."""
+    days = max(int(days_overdue), 0)
+    if days <= 30:
+        return "0-30"
+    if days <= 60:
+        return "31-60"
+    if days <= 90:
+        return "61-90"
+    return "90+"
+
+
+async def _aging_legs(
+    db: AsyncSession,
+    code: str,
+    entity_id: Optional[uuid.UUID],
+) -> list[dict[str, Any]]:
+    """Per-transaction legs on account ``code`` (posted + reversed scope).
+
+    Reads the POSTED Postgres transaction set (the F2 scope discipline:
+    ``posted`` + ``reversed``), entity-scoped, joining postings, and
+    aggregates each matching transaction into its NET movement on the
+    account: ``debit_pence`` / ``credit_pence`` are the sums of that
+    transaction's postings to this account. Ordered by effective_date
+    ascending (then id) — the FIFO allocation order. Integer pence only.
+    """
+    account_stmt = select(Account.id).where(
+        Account.code == code, Account.is_active.is_(True)
+    )
+    if entity_id is not None:
+        account_stmt = account_stmt.where(Account.entity_id == entity_id)
+    account_ids = set((await db.execute(account_stmt)).scalars().all())
+    if not account_ids:
+        return []
+
+    stmt = (
+        select(Transaction)
+        .where(Transaction.status.in_(IN_SCOPE_STATUSES))
+        .where(
+            Transaction.id.in_(
+                select(Posting.transaction_id).where(
+                    Posting.account_id.in_(account_ids)
+                )
+            )
+        )
+        .options(selectinload(Transaction.postings))
+    )
+    if entity_id is not None:
+        stmt = stmt.where(Transaction.entity_id == entity_id)
+    transactions = list((await db.execute(stmt)).scalars().all())
+
+    legs: list[dict[str, Any]] = []
+    for tx in transactions:
+        debit = sum(
+            p.debit_amount for p in (tx.postings or []) if p.account_id in account_ids
+        )
+        credit = sum(
+            p.credit_amount for p in (tx.postings or []) if p.account_id in account_ids
+        )
+        if debit == 0 and credit == 0:
+            continue
+        legs.append(
+            {
+                "transaction_id": tx.id,
+                "reference": tx.reference,
+                "date": tx.effective_date,
+                "debit_pence": debit,
+                "credit_pence": credit,
+            }
+        )
+    legs.sort(
+        key=lambda leg: (
+            leg["date"] is None,
+            leg["date"] or date.min,
+            str(leg["transaction_id"]),
+        )
+    )
+    return legs
+
+
+def _fifo_age_legs(
+    legs: list[dict[str, Any]], as_at: date, *, items_on_debit: bool
+) -> tuple[list[dict[str, Any]], int]:
+    """FIFO-age ordered legs: (items, total_outstanding_pence).
+
+    AR (``items_on_debit=True``): the item moments are the legs whose net
+    movement DEBITS 1100 (the invoice); settlements are the net-credit
+    legs (customer receipts). AP mirrors it: item moments are the net
+    CREDITS to 2000 (the supplier invoice), settlements the net debits
+    (supplier payments). Every settlement is allocated FIFO against the
+    oldest outstanding item remainder — exact pence, partial allocations
+    allowed. A leg that both debits and credits the account nets into one
+    movement.
+    """
+    items: list[dict[str, Any]] = []
+    settlements: list[dict[str, Any]] = []
+    for leg in legs:
+        net = leg["debit_pence"] - leg["credit_pence"]
+        is_item = net > 0 if items_on_debit else net < 0
+        if is_item:
+            amount = abs(net)
+            items.append(
+                {
+                    "ref": leg["reference"] or str(leg["transaction_id"])[:8],
+                    "date": leg["date"],
+                    "original_pence": amount,
+                    "paid_pence": 0,
+                    "outstanding_pence": amount,
+                    "days_overdue": (as_at - (leg["date"] or as_at)).days,
+                }
+            )
+        elif net != 0:
+            settlements.append({"amount": abs(net)})
+
+    next_item = 0
+    for settlement in settlements:
+        remaining = settlement["amount"]
+        while remaining > 0 and next_item < len(items):
+            item = items[next_item]
+            allocation = min(remaining, item["outstanding_pence"])
+            item["paid_pence"] += allocation
+            item["outstanding_pence"] -= allocation
+            remaining -= allocation
+            if item["outstanding_pence"] == 0:
+                next_item += 1
+
+    total = sum(item["outstanding_pence"] for item in items)
+    return items, total
+
+
+async def _generate_aging(
+    db: AsyncSession,
+    ledger: str,
+    as_at: Optional[date],
+    entity_id: Optional[uuid.UUID],
+    *,
+    report_name: str,
+) -> dict[str, Any]:
+    """Shared F37 AR/AP aging core (ledger-derived, TB-reconciled).
+
+    Every posted/reversed transaction is aged — there is no as-at cut-off
+    on the Postgres side because the reconciliation target (the Formance
+    balance read) has no as-of date either: filtering one side would break
+    the equality by construction.
+    """
+    as_at = as_at or date.today()
+    code, label = _AGING_DEFS[report_name]
+    class_map, name_map = await _load_coa(db, entity_id=entity_id)
+    balances = await _ledger_balances(ledger, class_map)
+    balance = balances.get(code, 0)
+
+    legs = await _aging_legs(db, code, entity_id)
+    items, total = _fifo_age_legs(
+        legs, as_at, items_on_debit=report_name == "aged_receivables"
+    )
+
+    # Sign-aware reconciliation (verifier fix-list): AR must sit debit,
+    # AP must sit credit, unless the account is flat.
+    if total != 0:
+        expected_debit = report_name == "aged_receivables"
+        if (balance > 0) != expected_debit:
+            raise ReportEngineError(
+                f"{report_name} sign mismatch: {code} balance {balance} "
+                f"is on the wrong side for outstanding {total} — a net "
+                f"credit balance on a receivables account (overpayment or "
+                f"credit note) is not an aged-receivable report"
+            )
+
+    if total != abs(balance):
+        raise ReportEngineError(
+            f"{report_name} does not reconcile to the trial balance: item "
+            f"outstanding {total} != |{code} balance| {abs(balance)} "
+            f"(the aging must be derived from the SAME ledger the Balance "
+            f"Sheet reads)"
+        )
+
+    buckets = [
+        {"bucket": bucket, "count": 0, "total_pence": 0} for bucket in AGING_BUCKETS
+    ]
+    by_bucket = {bucket["bucket"]: bucket for bucket in buckets}
+    for item in items:
+        if item["outstanding_pence"] <= 0:
+            continue
+        bucket = by_bucket[_aging_bucket(item["days_overdue"])]
+        bucket["count"] += 1
+        bucket["total_pence"] += item["outstanding_pence"]
+
+    return {
+        "report": report_name,
+        "as_at": as_at,
+        "items": items,
+        "buckets": buckets,
+        "total_outstanding_pence": total,
+        "ledger_balance": {
+            "code": code,
+            "name": name_map.get(code, label),
+            "balance_pence": balance,
+        },
+        "reconciled": True,
+        "note": _AGING_NOTES[report_name],
+    }
+
+
+async def generate_ar_aging(
+    db: AsyncSession,
+    ledger: str = DEFAULT_LEDGER,
+    as_at: Optional[date] = None,
+    entity_id: Optional[uuid.UUID] = None,
+) -> dict[str, Any]:
+    """Aged receivables from the POSTED ledger (Contract F37).
+
+    Invoice moments (net debits to 1100) FIFO-matched against customer
+    receipts (net credits to 1100) over the F2 posted + reversed scope,
+    entity-scoped. ``total_outstanding_pence`` must equal the absolute
+    trial-balance balance for 1100 — otherwise
+    :class:`ReportEngineError` (a broken aging is never returned).
+    """
+    return await _generate_aging(
+        db, ledger, as_at, entity_id, report_name="aged_receivables"
+    )
+
+
+async def generate_ap_aging(
+    db: AsyncSession,
+    ledger: str = DEFAULT_LEDGER,
+    as_at: Optional[date] = None,
+    entity_id: Optional[uuid.UUID] = None,
+) -> dict[str, Any]:
+    """Aged payables: the AR mirror on 2000 (Contract F37).
+
+    Supplier-invoice moments are the net CREDITS to 2000, supplier
+    payments the net DEBITS; same FIFO allocation and TB reconciliation
+    (absolute 2000 balance) as :func:`generate_ar_aging`.
+    """
+    return await _generate_aging(
+        db, ledger, as_at, entity_id, report_name="aged_payables"
+    )
 
 
 # ---------------------------------------------------------------------------

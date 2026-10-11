@@ -41,6 +41,8 @@ from src.services.formance_reports import (
     LINE_ITEM_CODES,
     ReportEngineError,
     build_code_class_map,
+    generate_ap_aging,
+    generate_ar_aging,
     generate_bs,
     generate_cash_flow,
     generate_funds,
@@ -1663,3 +1665,322 @@ async def test_verify_against_postgres_null_scope_keeps_legacy_engine(monkeypatc
     run_tb.assert_awaited_once()
     assert run_tb.await_args.kwargs["entity_id"] is None
     assert run_tb.await_args.args[1].entity_id is None
+
+
+# ---------------------------------------------------------------------------
+# Contract F37 — ledger-derived AR/AP aging
+# ---------------------------------------------------------------------------
+
+# (key, status, effective_date, postings [(code, debit_pence, credit_pence)])
+AGING_INVOICES = [
+    ("invoice-1", "posted", date(2026, 1, 10), [("1100", 120000, 0), ("4000", 0, 120000)]),
+    ("invoice-2", "posted", date(2026, 2, 10), [("1100", 80000, 0), ("4000", 0, 80000)]),
+    ("receipt-1", "posted", date(2026, 3, 1), [("1000", 100000, 0), ("1100", 0, 100000)]),
+]
+AGING_BALANCES = {
+    "1100": 100000,
+    "1000": -75000,
+    "4000": -200000,
+}
+
+
+async def _aging_world(
+    monkeypatch,
+    entries,
+    balances,
+    *,
+    entity_id=None,
+):
+    """Aging world: real Postgres Transactions/Postings + scripted balances.
+
+    ``balances`` is ``code -> pence``; it is served as the exact
+    major-unit decimal string Formance returns.  The aging engine reads
+    ONLY Postgres transactions and the Formance balance read, so the fake
+    exposes ``get_balances`` (all other reads would be a bug — the fake
+    has no ``list_transactions``).
+    """
+    rows = [
+        ("1000", "Bank Current Account", "Asset", "Bank"),
+        ("1100", "Trade Debtors", "Asset", "CurrentAsset"),
+        ("2000", "Trade Creditors", "Liability", "CurrentLiability"),
+        ("4000", "Sales - Standard Rated", "Revenue", "Revenue"),
+        ("5000", "Cost of Sales", "Expense", "DirectCost"),
+    ]
+    engine, db = await _make_db(rows)
+    result = await db.execute(select(Account))
+    accounts = {a.code: a for a in result.scalars().all()}
+    if entity_id is not None:
+        for account in accounts.values():
+            account.entity_id = entity_id
+
+    fake = ScriptedFormance(
+        balances={code: str(Decimal(pence).scaleb(-2)) for code, pence in balances.items()}
+    )
+    now = datetime.now(UTC)
+    ids: dict[str, uuid.UUID] = {}
+    for i, (key, status, day, legs) in enumerate(entries, start=1):
+        txid = uuid.uuid4()
+        ids[key] = txid
+        db.add(
+            Transaction(
+                id=txid,
+                reference=f"JE-2026-{i:04d}",
+                description=key,
+                entity_id=entity_id,
+                currency="GBP",
+                status=status,
+                effective_date=day,
+                total_amount=0,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        for code, debit, credit in legs:
+            db.add(
+                Posting(
+                    transaction_id=txid,
+                    account_id=accounts[code].id,
+                    debit_amount=debit,
+                    credit_amount=credit,
+                )
+            )
+    await db.commit()
+    monkeypatch.setattr("src.services.formance_reports.formance_client", fake)
+    return db, engine, ids
+
+
+def test_aging_generators_exported() -> None:
+    assert "generate_ar_aging" in fr.__all__
+    assert "generate_ap_aging" in fr.__all__
+
+
+async def test_ar_aging_fifo_partial_allocations_exact_pence(monkeypatch) -> None:
+    db, engine, _ = await _aging_world(monkeypatch, AGING_INVOICES, AGING_BALANCES)
+    try:
+        report = await generate_ar_aging(db, "main", as_at=date(2026, 3, 31))
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert report["report"] == "aged_receivables"
+    assert report["as_at"] == date(2026, 3, 31)
+    assert report["reconciled"] is True
+    assert report["total_outstanding_pence"] == 100000
+    assert report["ledger_balance"] == {
+        "code": "1100",
+        "name": "Trade Debtors",
+        "balance_pence": 100000,
+    }
+    assert [(i["ref"], i["original_pence"], i["paid_pence"], i["outstanding_pence"])
+            for i in report["items"]] == [
+        ("JE-2026-0001", 120000, 100000, 20000),
+        ("JE-2026-0002", 80000, 0, 80000),
+    ]
+    assert report["items"][0]["days_overdue"] == (date(2026, 3, 31) - date(2026, 1, 10)).days
+    assert report["items"][1]["days_overdue"] == (date(2026, 3, 31) - date(2026, 2, 10)).days
+    assert report["buckets"] == [
+        {"bucket": "0-30", "count": 0, "total_pence": 0},
+        {"bucket": "31-60", "count": 1, "total_pence": 80000},
+        {"bucket": "61-90", "count": 1, "total_pence": 20000},
+        {"bucket": "90+", "count": 0, "total_pence": 0},
+    ]
+    assert "1100" in report["note"] and "ledger" in report["note"].lower()
+
+
+async def test_ar_aging_penny_exact_fifo_partial(monkeypatch) -> None:
+    """Odd-penny invoices/receipts allocate exactly — no float drift."""
+    entries = [
+        ("invoice-1", "posted", date(2026, 1, 5), [("1100", 100001, 0), ("4000", 0, 100001)]),
+        ("invoice-2", "posted", date(2026, 2, 5), [("1100", 60000, 0), ("4000", 0, 60000)]),
+        ("receipt-1", "posted", date(2026, 3, 5), [("1000", 50001, 0), ("1100", 0, 50001)]),
+    ]
+    balances = {"1100": 110000, "1000": -50001, "4000": -160001}
+    db, engine, _ = await _aging_world(monkeypatch, entries, balances)
+    try:
+        report = await generate_ar_aging(db, "main", as_at=date(2026, 3, 31))
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert [(i["paid_pence"], i["outstanding_pence"]) for i in report["items"]] == [
+        (50001, 50000),
+        (0, 60000),
+    ]
+    assert report["total_outstanding_pence"] == 110000
+
+
+async def test_ar_aging_buckets_span_0_30_to_90plus(monkeypatch) -> None:
+    as_at = date(2026, 6, 30)
+    entries = [
+        ("inv-10d", "posted", date(2026, 6, 20), [("1100", 100000, 0), ("4000", 0, 100000)]),
+        ("inv-45d", "posted", date(2026, 5, 16), [("1100", 200000, 0), ("4000", 0, 200000)]),
+        ("inv-75d", "posted", date(2026, 4, 16), [("1100", 300000, 0), ("4000", 0, 300000)]),
+        ("inv-120d", "posted", date(2026, 3, 2), [("1100", 400000, 0), ("4000", 0, 400000)]),
+    ]
+    balances = {"1100": 1000000, "4000": -1000000}
+    db, engine, _ = await _aging_world(monkeypatch, entries, balances)
+    try:
+        report = await generate_ar_aging(db, "main", as_at=as_at)
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert [i["days_overdue"] for i in report["items"]] == [120, 75, 45, 10]
+    assert report["buckets"] == [
+        {"bucket": "0-30", "count": 1, "total_pence": 100000},
+        {"bucket": "31-60", "count": 1, "total_pence": 200000},
+        {"bucket": "61-90", "count": 1, "total_pence": 300000},
+        {"bucket": "90+", "count": 1, "total_pence": 400000},
+    ]
+    assert report["total_outstanding_pence"] == 1000000
+
+
+async def test_ar_aging_fully_paid_item_kept_with_zero_outstanding(monkeypatch) -> None:
+    entries = [
+        ("invoice", "posted", date(2026, 1, 10), [("1100", 120000, 0), ("4000", 0, 120000)]),
+        ("receipt", "posted", date(2026, 2, 10), [("1000", 120000, 0), ("1100", 0, 120000)]),
+    ]
+    balances = {"1100": 0, "1000": -120000, "4000": -120000}
+    db, engine, _ = await _aging_world(monkeypatch, entries, balances)
+    try:
+        report = await generate_ar_aging(db, "main", as_at=date(2026, 3, 31))
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert len(report["items"]) == 1
+    item = report["items"][0]
+    assert (item["original_pence"], item["paid_pence"], item["outstanding_pence"]) == (
+        120000,
+        120000,
+        0,
+    )
+    assert report["total_outstanding_pence"] == 0
+    assert all(bucket["count"] == 0 for bucket in report["buckets"])
+    assert report["reconciled"] is True
+
+
+async def test_ar_aging_reversal_cancels_the_item(monkeypatch) -> None:
+    """A reversed invoice (original 'reversed' + posted reversal) nets out."""
+    entries = [
+        ("invoice", "reversed", date(2026, 1, 10), [("1100", 120000, 0), ("4000", 0, 120000)]),
+        ("reversal", "posted", date(2026, 2, 10), [("1100", 0, 120000), ("4000", 120000, 0)]),
+    ]
+    balances = {"1100": 0, "4000": 0}
+    db, engine, _ = await _aging_world(monkeypatch, entries, balances)
+    try:
+        report = await generate_ar_aging(db, "main", as_at=date(2026, 3, 31))
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert report["items"][0]["outstanding_pence"] == 0
+    assert report["total_outstanding_pence"] == 0
+
+
+async def test_ar_aging_ignores_draft_transactions(monkeypatch) -> None:
+    entries = AGING_INVOICES + [
+        ("draft-invoice", "draft", date(2026, 2, 20), [("1100", 55555, 0), ("4000", 0, 55555)]),
+    ]
+    db, engine, _ = await _aging_world(monkeypatch, entries, AGING_BALANCES)
+    try:
+        report = await generate_ar_aging(db, "main", as_at=date(2026, 3, 31))
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert [i["ref"] for i in report["items"]] == ["JE-2026-0001", "JE-2026-0002"]
+    assert report["total_outstanding_pence"] == 100000
+
+
+async def test_ar_aging_entity_scope_filters_transactions(monkeypatch) -> None:
+    entity = uuid.uuid4()
+    entries = [
+        ("mine", "posted", date(2026, 1, 10), [("1100", 100000, 0), ("4000", 0, 100000)]),
+        ("theirs", "posted", date(2026, 1, 11), [("1100", 90000, 0), ("4000", 0, 90000)]),
+    ]
+    db, engine, _ = await _aging_world(
+        monkeypatch, entries, {"1100": 100000, "4000": -100000}, entity_id=entity
+    )
+    try:
+        # Transactions not stamped with the entity are outside its scope.
+        await db.execute(
+            text("UPDATE transactions SET entity_id = NULL WHERE reference = 'JE-2026-0002'")
+        )
+        await db.commit()
+        report = await generate_ar_aging(db, "main", as_at=date(2026, 3, 31), entity_id=entity)
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert [i["ref"] for i in report["items"]] == ["JE-2026-0001"]
+    assert report["total_outstanding_pence"] == 100000
+    assert report["reconciled"] is True
+
+
+async def test_ap_aging_mirror(monkeypatch) -> None:
+    entries = [
+        ("supplier-invoice", "posted", date(2026, 2, 1), [("5000", 108000, 0), ("2000", 0, 108000)]),
+        ("supplier-payment", "posted", date(2026, 3, 1), [("2000", 40000, 0), ("1000", 0, 40000)]),
+    ]
+    balances = {"2000": -68000, "5000": 108000, "1000": -40000}
+    db, engine, _ = await _aging_world(monkeypatch, entries, balances)
+    try:
+        report = await generate_ap_aging(db, "main", as_at=date(2026, 3, 31))
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert report["report"] == "aged_payables"
+    assert report["reconciled"] is True
+    assert report["total_outstanding_pence"] == 68000
+    assert report["ledger_balance"] == {
+        "code": "2000",
+        "name": "Trade Creditors",
+        "balance_pence": -68000,
+    }
+    item = report["items"][0]
+    assert (item["ref"], item["date"], item["original_pence"], item["paid_pence"],
+            item["outstanding_pence"]) == (
+        "JE-2026-0001",
+        date(2026, 2, 1),
+        108000,
+        40000,
+        68000,
+    )
+    assert report["buckets"][1] == {"bucket": "31-60", "count": 1, "total_pence": 68000}
+
+
+async def test_aging_tb_equality_sabotage_raises(monkeypatch) -> None:
+    """If the FIFO total does not equal the absolute TB balance, the engine
+    raises instead of returning a quietly wrong aging."""
+    balances = dict(AGING_BALANCES)
+    balances["1100"] = 100100  # one penny of drift
+    db, engine, _ = await _aging_world(monkeypatch, AGING_INVOICES, balances)
+    try:
+        with pytest.raises(ReportEngineError) as excinfo:
+            await generate_ar_aging(db, "main", as_at=date(2026, 3, 31))
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    message = str(excinfo.value)
+    assert "does not reconcile to the trial balance" in message
+    assert "100000" in message and "100100" in message
+
+
+async def test_aging_sign_mismatch_raises(monkeypatch) -> None:
+    """A credit balance on the receivables account (overpayment/credit
+    note) is NOT an aged-receivable report — the sign guard raises
+    instead of abs() papering over the mismatch (verifier fix-list)."""
+    balances = dict(AGING_BALANCES)
+    balances["1100"] = -100000  # flipped: net credit
+    db, engine, _ = await _aging_world(monkeypatch, AGING_INVOICES, balances)
+    try:
+        with pytest.raises(ReportEngineError) as excinfo:
+            await generate_ar_aging(db, "main", as_at=date(2026, 3, 31))
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert "sign mismatch" in str(excinfo.value)
