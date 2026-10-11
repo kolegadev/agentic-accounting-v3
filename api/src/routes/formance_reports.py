@@ -44,6 +44,8 @@ from src.services.formance_reports import (
     generate_tb,
     verify_against_postgres,
 )
+from src.services.report_service import ReportService
+from src.validators.report import ReportRunRequest
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +54,33 @@ router = APIRouter(prefix="/api/v1/reports/formance", tags=["Reports — Formanc
 # Flow reports read period flows; balance reports read balances as at a date.
 FLOW_TYPES = ("pl", "cash-flow", "funds")
 BALANCE_TYPES = ("balance-sheet", "trial-balance")
-VALID_REPORT_TYPES = FLOW_TYPES + BALANCE_TYPES
+# Contract F30 — aging reports combine the Postgres aging services with an
+# entity-scoped engine ledger balance (as_at only, like balance types).
+AGING_TYPES = ("aged-receivables", "aged-payables")
+VALID_REPORT_TYPES = FLOW_TYPES + BALANCE_TYPES + AGING_TYPES
 
 NO_POSTGRES_NOTE = "no Postgres equivalent"
+
+AGING_TEMPLATES = {"aged-receivables": "aged_ar", "aged-payables": "aged_ap"}
+AGING_LEDGER_ACCOUNTS = {
+    "aged-receivables": ("1100", "Trade Debtors"),
+    "aged-payables": ("2000", "Trade Creditors"),
+}
+AGING_NOTES = {
+    "aged-receivables": (
+        "Aging covers all invoices (invoices are not entity-scoped in "
+        "this release); the ledger balance is scoped to the selected entity."
+    ),
+    "aged-payables": (
+        "Aging covers all unmatched expense postings (they are not "
+        "entity-scoped in this release); the ledger balance is scoped to "
+        "the selected entity."
+    ),
+}
+AGING_CROSS_CHECK_NOTE = (
+    "aging is invoice-derived (Postgres); ledger balance is "
+    "Formance-derived — the difference is unpaid-draft timing, not a defect"
+)
 
 
 async def _resolve_scope(
@@ -117,6 +143,124 @@ async def _entity_fiscal_start(
     return _fiscal_year_start(fiscal_year_start, end)
 
 
+def _aging_lines(report_type: str, report: Any) -> list[dict[str, Any]]:
+    """Map AgedAR/AgedAPReport lines into the F30 response shape."""
+    lines: list[dict[str, Any]] = []
+    for line in report.lines:
+        if report_type == "aged-receivables":
+            lines.append(
+                {
+                    "contact_name": line.contact_name,
+                    "ref": line.invoice_reference,
+                    "due_date": line.due_date.isoformat(),
+                    "amount_pence": line.outstanding,
+                    "days_overdue": line.days_overdue,
+                }
+            )
+        else:
+            lines.append(
+                {
+                    "contact_name": line.account_name,
+                    "ref": line.transaction_reference,
+                    "due_date": line.effective_date.isoformat(),
+                    "amount_pence": line.outstanding,
+                    "days_overdue": line.days_overdue,
+                }
+            )
+    return lines
+
+
+async def _run_aging_report(
+    db: AsyncSession,
+    report_type: str,
+    scope_id: Optional[uuid.UUID],
+    ledger: str,
+    as_at: Optional[date],
+) -> JSONResponse:
+    """Contract F30 — Postgres aging + entity-scoped engine ledger balance.
+
+    The aging services take ``end_date`` as the as-of date; the ledger
+    balance is the debtors/creditors row of the entity-scoped trial
+    balance (a missing row is 0 with ``ledger_account_missing: true``,
+    never an error).  Aging-service failures answer 422
+    ``{type: report_engine_error}`` like the engine branch.
+    """
+    as_of = as_at or date.today()
+    template_name = AGING_TEMPLATES[report_type]
+    code, default_name = AGING_LEDGER_ACCOUNTS[report_type]
+    runner = (
+        ReportService.run_ar_aging
+        if template_name == "aged_ar"
+        else ReportService.run_ap_aging
+    )
+    try:
+        aging = await runner(
+            db,
+            ReportRunRequest(
+                template_name=template_name,
+                start_date=as_of,
+                end_date=as_of,
+                entity_id=scope_id,
+            ),
+        )
+        tb = await generate_tb(db, ledger, as_at=as_of, entity_id=scope_id)
+    except ReportEngineError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"type": "report_engine_error", "message": str(exc)},
+        )
+    except Exception as exc:  # noqa: BLE001 — aging-service failure is a 422
+        logger.exception("%s failed", report_type)
+        return JSONResponse(
+            status_code=422,
+            content={"type": "report_engine_error", "message": str(exc)},
+        )
+
+    row = next(
+        (r for r in tb.get("accounts", []) if r.get("code") == code), None
+    )
+    if row is None:
+        ledger_balance: dict[str, Any] = {
+            "code": code,
+            "name": default_name,
+            "balance_pence": 0,
+            "ledger_account_missing": True,
+        }
+    else:
+        ledger_balance = {
+            "code": row["code"],
+            "name": row["name"],
+            "balance_pence": row["balance"],
+        }
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "report_type": report_type,
+            "as_at": as_of.isoformat(),
+            "report": {
+                "buckets": [
+                    {
+                        "bucket": bucket.bucket,
+                        "count": bucket.count,
+                        "total_pence": bucket.total,
+                    }
+                    for bucket in aging.buckets
+                ],
+                "lines": _aging_lines(report_type, aging),
+                "total_outstanding_pence": aging.total_outstanding,
+                "ledger_balance": ledger_balance,
+                "note": AGING_NOTES[report_type],
+            },
+            "cross_check": {
+                "ok": None,
+                "diffs": [],
+                "note": AGING_CROSS_CHECK_NOTE,
+            },
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # GET /{report_type} — run the engine + Postgres cross-check
 # ---------------------------------------------------------------------------
@@ -129,8 +273,8 @@ async def _entity_fiscal_start(
     responses={
         422: {
             "description": (
-                "Invalid report type, missing period/as-at params, or "
-                "engine identity error: {type, message}"
+                "Invalid report type, missing period/as-at params, engine "
+                "identity error, or aging-service failure: {type, message}"
             )
         },
     },
@@ -151,10 +295,13 @@ async def formance_report(
     ),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
-    """Run one of the five F9 Formance reports and cross-check against Postgres.
+    """Run one of the seven Formance reports and cross-check against Postgres.
 
     pl / cash-flow / funds require period_start + period_end;
-    balance-sheet / trial-balance take as_at (default: today).
+    balance-sheet / trial-balance / aged-receivables / aged-payables take
+    as_at (default: today).  The aging reports combine the Postgres aging
+    services with the entity-scoped debtors/creditors ledger balance
+    (Contract F30).
     The balance sheet additionally receives the entity's fiscal-year start
     as ``period_start`` (Contract F24, None = inception) for its
     profit-for-period line. P&L/BS/TB additionally run
@@ -195,6 +342,13 @@ async def formance_report(
                 "message": exc.message,
             },
         )
+
+    # Contract F30 — aged receivables/payables take as_at only (like the
+    # balance types) and are served from the Postgres aging services plus
+    # the entity-scoped engine ledger balance; they never reach the engine
+    # dispatch below.
+    if report_type in AGING_TYPES:
+        return await _run_aging_report(db, report_type, scope_id, ledger, as_at)
 
     if report_type in FLOW_TYPES and (period_start is None or period_end is None):
         period_end = period_end or date.today()

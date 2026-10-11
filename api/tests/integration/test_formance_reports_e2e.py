@@ -38,6 +38,7 @@ Funds: sources 2,910,000 == applications 2,910,000 (fixed assets 400,000 +
 from __future__ import annotations
 
 import copy
+import json
 import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -51,6 +52,7 @@ from sqlalchemy.pool import StaticPool
 
 from src.config.database import Base
 from src.models.account import Account
+from src.routes.formance_reports import formance_report as formance_report_route
 from src.services.coa_service import CoaService
 from src.services.formance_reports import (
     generate_bs,
@@ -639,3 +641,68 @@ async def test_sabotage_mirror_amount_flags_identity_and_diff(ctx) -> None:
     codes = {d["line"] for d in tb_diffs}
     assert "account 1100" in codes
     assert "account 4000" in codes
+
+
+# ---------------------------------------------------------------------------
+# Contract F30 — aged payables through the route (real Postgres aging +
+# real entity-scoped engine TB).  The AR join needs contacts/invoices
+# tables this fixture does not create (Base.metadata.create_all fails on
+# SQLite and the fallback DDL has only four tables), so AR is covered by
+# the route tests plus the AP/AR service tests in test_reports.py.
+# ---------------------------------------------------------------------------
+
+
+async def test_aging_payables_route_buckets_and_ledger_balance(ctx) -> None:
+    await _seed_scenario(ctx)
+    db, fake = ctx["db"], ctx["fake"]
+    assert fake.transactions  # scenario really mirrored to the engine
+
+    resp = await formance_report_route(
+        report_type="aged-payables",
+        as_at=END,
+        entity_id=None,
+        db=db,
+    )
+
+    assert resp.status_code == 200, resp.body
+    body = json.loads(resp.body)
+    assert body["report_type"] == "aged-payables"
+    assert body["as_at"] == END.isoformat()
+    report = body["report"]
+
+    # Unmatched expense postings: supplier invoice Dr 5000 £900.00
+    # (2026-10-02) + depreciation Dr 6500 £100.00 (2026-10-31) — both 61-90
+    # days overdue against 2026-12-31.
+    buckets = {b["bucket"]: b for b in report["buckets"]}
+    assert buckets["61-90"] == {"bucket": "61-90", "count": 2, "total_pence": 100000}
+    assert buckets["0-30"] == {"bucket": "0-30", "count": 0, "total_pence": 0}
+    assert report["total_outstanding_pence"] == 100000
+    assert {line["ref"] for line in report["lines"]} == {
+        "JE-2026-0003",  # supplier invoice (NET 900.00 on 5000)
+        "JE-2026-0004",  # depreciation (100.00 on 6500)
+    }
+    assert all(
+        set(line) == {"contact_name", "ref", "due_date", "amount_pence", "days_overdue"}
+        for line in report["lines"]
+    )
+
+    # Creditors 2000: engine TB signs credit balances negative — the line
+    # matches the 2000 row of the trial balance exactly.
+    tb = await generate_tb(db, "main", as_at=END)
+    tb_2000 = next(row for row in tb["accounts"] if row["code"] == "2000")
+    assert report["ledger_balance"] == {
+        "code": "2000",
+        "name": "Trade Creditors",
+        "balance_pence": tb_2000["balance"],
+    }
+    assert report["ledger_balance"]["balance_pence"] == -108000
+    assert report["note"]
+    assert body["cross_check"] == {
+        "ok": None,
+        "diffs": [],
+        "note": (
+            "aging is invoice-derived (Postgres); ledger balance is "
+            "Formance-derived — the difference is unpaid-draft timing, "
+            "not a defect"
+        ),
+    }

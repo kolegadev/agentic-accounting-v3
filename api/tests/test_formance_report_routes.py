@@ -11,7 +11,7 @@ outputs and diff lists, and the route must shape the contract response.
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,6 +19,13 @@ from fastapi.testclient import TestClient
 
 from src.index import app
 from src.services.formance_reports import ReportEngineError
+from src.validators.report import (
+    AgedAPLine,
+    AgedAPReport,
+    AgedARLine,
+    AgedARReport,
+    AgingBucket,
+)
 
 PERIOD_START = date(2026, 1, 1)
 PERIOD_END = date(2026, 12, 31)
@@ -68,6 +75,82 @@ FUNDS_REPORT = {
 }
 
 NO_PG_CROSS_CHECK = {"diffs": [], "ok": None, "note": "no Postgres equivalent"}
+
+AGING_AS_AT = date(2026, 3, 31)
+
+AR_REPORT = AgedARReport(
+    report_type="aged_ar",
+    as_of_date=AGING_AS_AT,
+    lines=[
+        AgedARLine(
+            invoice_id=uuid.uuid4(),
+            invoice_reference="INV-2001",
+            contact_name="Acme Corp",
+            due_date=date(2026, 3, 1),
+            days_overdue=30,
+            bucket="0-30",
+            outstanding=120000,
+        )
+    ],
+    buckets=[
+        AgingBucket(bucket="0-30", count=1, total=120000),
+        AgingBucket(bucket="31-60", count=0, total=0),
+        AgingBucket(bucket="61-90", count=0, total=0),
+        AgingBucket(bucket="90+", count=0, total=0),
+    ],
+    total_outstanding=120000,
+    generated_at=datetime(2026, 3, 31, 12, 0, 0),
+)
+
+AP_REPORT = AgedAPReport(
+    report_type="aged_ap",
+    as_of_date=AGING_AS_AT,
+    lines=[
+        AgedAPLine(
+            transaction_id=uuid.uuid4(),
+            transaction_reference="INV-3001",
+            account_name="Stock purchases",
+            effective_date=date(2026, 2, 1),
+            days_overdue=58,
+            bucket="31-60",
+            outstanding=90000,
+        )
+    ],
+    buckets=[
+        AgingBucket(bucket="0-30", count=0, total=0),
+        AgingBucket(bucket="31-60", count=1, total=90000),
+        AgingBucket(bucket="61-90", count=0, total=0),
+        AgingBucket(bucket="90+", count=0, total=0),
+    ],
+    total_outstanding=90000,
+    generated_at=datetime(2026, 3, 31, 12, 0, 0),
+)
+
+AGING_TB = {
+    "report": "trial_balance",
+    "as_at": "2026-03-31",
+    "accounts": [
+        {
+            "code": "1100",
+            "name": "Trade Debtors",
+            "class": "Asset",
+            "balance": 120000,
+            "debit": 120000,
+            "credit": 0,
+        },
+        {
+            "code": "2000",
+            "name": "Trade Creditors",
+            "class": "Liability",
+            "balance": -108000,
+            "debit": 0,
+            "credit": 108000,
+        },
+    ],
+    "total_debits": 120000,
+    "total_credits": 120000,
+    "identity_ok": True,
+}
 
 
 @pytest.fixture
@@ -350,11 +433,13 @@ def test_funds_cross_check_note_and_no_verify(client: TestClient) -> None:
 
 
 def test_invalid_report_type_returns_422(client: TestClient) -> None:
-    response = client.get("/api/v1/reports/formance/aged-payables")
+    response = client.get("/api/v1/reports/formance/aged-receivable")
 
     assert response.status_code == 422
     body = response.json()
     assert body["type"] == "invalid_report_type"
+    # Contract F30: the message lists the aging types automatically.
+    assert "aged-receivables" in body["message"]
     assert "aged-payables" in body["message"]
 
 
@@ -426,3 +511,248 @@ def test_report_engine_error_maps_to_422(client: TestClient) -> None:
     assert body["type"] == "report_engine_error"
     assert "P&L section misassembled" in body["message"]
     verify.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Contract F30 — aged receivables / aged payables
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    (
+        "report_type",
+        "runner_attr",
+        "report",
+        "template_name",
+        "ledger_code",
+        "expected_line",
+    ),
+    [
+        (
+            "aged-receivables",
+            "run_ar_aging",
+            AR_REPORT,
+            "aged_ar",
+            "1100",
+            {
+                "contact_name": "Acme Corp",
+                "ref": "INV-2001",
+                "due_date": "2026-03-01",
+                "amount_pence": 120000,
+                "days_overdue": 30,
+            },
+        ),
+        (
+            "aged-payables",
+            "run_ap_aging",
+            AP_REPORT,
+            "aged_ap",
+            "2000",
+            {
+                "contact_name": "Stock purchases",
+                "ref": "INV-3001",
+                "due_date": "2026-02-01",
+                "amount_pence": 90000,
+                "days_overdue": 58,
+            },
+        ),
+    ],
+)
+def test_aging_report_shape(
+    client: TestClient,
+    report_type: str,
+    runner_attr: str,
+    report,
+    template_name: str,
+    ledger_code: str,
+    expected_line: dict,
+) -> None:
+    """Contract F30: as_at only (no period params), Postgres aging mapped
+    into the contract shape + the entity-scoped ledger balance, and the
+    engine dispatch is never reached."""
+    with (
+        patch(
+            "src.routes.formance_reports._resolve_scope", new_callable=AsyncMock
+        ) as resolve,
+        patch(
+            f"src.routes.formance_reports.ReportService.{runner_attr}",
+            new_callable=AsyncMock,
+        ) as runner,
+        patch(
+            "src.routes.formance_reports.generate_tb", new_callable=AsyncMock
+        ) as generate_tb,
+        patch(
+            "src.routes.formance_reports.generate_pl", new_callable=AsyncMock
+        ) as generate_pl,
+    ):
+        resolve.return_value = (None, "main")
+        runner.return_value = report
+        generate_tb.return_value = AGING_TB
+        response = client.get(
+            f"/api/v1/reports/formance/{report_type}",
+            params={"as_at": "2026-03-31"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["report_type"] == report_type
+    assert body["as_at"] == "2026-03-31"
+    assert set(body["report"]) == {
+        "buckets",
+        "lines",
+        "total_outstanding_pence",
+        "ledger_balance",
+        "note",
+    }
+    assert body["report"]["buckets"] == [
+        {"bucket": b.bucket, "count": b.count, "total_pence": b.total}
+        for b in report.buckets
+    ]
+    assert body["report"]["lines"] == [expected_line]
+    assert body["report"]["total_outstanding_pence"] == report.total_outstanding
+    assert body["report"]["ledger_balance"]["code"] == ledger_code
+    assert body["report"]["ledger_balance"]["balance_pence"] == (
+        AGING_TB["accounts"][0 if ledger_code == "1100" else 1]["balance"]
+    )
+    assert "not entity-scoped in this release" in body["report"]["note"]
+    assert body["cross_check"]["ok"] is None
+    assert body["cross_check"]["diffs"] == []
+    assert body["cross_check"]["note"]
+
+    runner.assert_awaited_once()
+    request = runner.await_args.args[1]
+    assert request.template_name == template_name
+    assert request.start_date == AGING_AS_AT
+    assert request.end_date == AGING_AS_AT
+    generate_tb.assert_awaited_once()
+    assert generate_tb.await_args.args[1] == "main"
+    assert generate_tb.await_args.kwargs == {
+        "as_at": AGING_AS_AT,
+        "entity_id": None,
+    }
+    generate_pl.assert_not_awaited()
+
+
+def test_aging_entity_scope_reaches_runner_and_generate_tb(
+    client: TestClient,
+) -> None:
+    entity_id = uuid.uuid4()
+    with (
+        patch(
+            "src.routes.formance_reports._resolve_scope", new_callable=AsyncMock
+        ) as resolve,
+        patch(
+            "src.routes.formance_reports.ReportService.run_ar_aging",
+            new_callable=AsyncMock,
+        ) as runner,
+        patch(
+            "src.routes.formance_reports.generate_tb", new_callable=AsyncMock
+        ) as generate_tb,
+    ):
+        resolve.return_value = (entity_id, "entity-abc123")
+        runner.return_value = AR_REPORT
+        generate_tb.return_value = AGING_TB
+        response = client.get(
+            "/api/v1/reports/formance/aged-receivables",
+            params={"as_at": "2026-03-31"},
+        )
+
+    assert response.status_code == 200
+    assert runner.await_args.args[1].entity_id == entity_id
+    assert generate_tb.await_args.args[1] == "entity-abc123"
+    assert generate_tb.await_args.kwargs == {
+        "as_at": AGING_AS_AT,
+        "entity_id": entity_id,
+    }
+
+
+def test_aging_missing_ledger_account_zero_and_flag(client: TestClient) -> None:
+    tb_without_1100 = {**AGING_TB, "accounts": [AGING_TB["accounts"][1]]}
+    with (
+        patch(
+            "src.routes.formance_reports._resolve_scope", new_callable=AsyncMock
+        ) as resolve,
+        patch(
+            "src.routes.formance_reports.ReportService.run_ar_aging",
+            new_callable=AsyncMock,
+        ) as runner,
+        patch(
+            "src.routes.formance_reports.generate_tb", new_callable=AsyncMock
+        ) as generate_tb,
+    ):
+        resolve.return_value = (None, "main")
+        runner.return_value = AR_REPORT
+        generate_tb.return_value = tb_without_1100
+        response = client.get(
+            "/api/v1/reports/formance/aged-receivables",
+            params={"as_at": "2026-03-31"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["report"]["ledger_balance"] == {
+        "code": "1100",
+        "name": "Trade Debtors",
+        "balance_pence": 0,
+        "ledger_account_missing": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("aging blew up"),
+        ReportEngineError("aging engine blew up"),
+    ],
+)
+def test_aging_runner_exception_maps_to_422(
+    client: TestClient, failure: Exception
+) -> None:
+    with (
+        patch(
+            "src.routes.formance_reports._resolve_scope", new_callable=AsyncMock
+        ) as resolve,
+        patch(
+            "src.routes.formance_reports.ReportService.run_ap_aging",
+            new_callable=AsyncMock,
+        ) as runner,
+        patch(
+            "src.routes.formance_reports.generate_tb", new_callable=AsyncMock
+        ) as generate_tb,
+    ):
+        resolve.return_value = (None, "main")
+        runner.side_effect = failure
+        response = client.get(
+            "/api/v1/reports/formance/aged-payables",
+            params={"as_at": "2026-03-31"},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "type": "report_engine_error",
+        "message": str(failure),
+    }
+    generate_tb.assert_not_awaited()
+
+
+def test_aging_defaults_as_at_to_today(client: TestClient) -> None:
+    with (
+        patch(
+            "src.routes.formance_reports._resolve_scope", new_callable=AsyncMock
+        ) as resolve,
+        patch(
+            "src.routes.formance_reports.ReportService.run_ar_aging",
+            new_callable=AsyncMock,
+        ) as runner,
+        patch(
+            "src.routes.formance_reports.generate_tb", new_callable=AsyncMock
+        ) as generate_tb,
+    ):
+        resolve.return_value = (None, "main")
+        runner.return_value = AR_REPORT
+        generate_tb.return_value = AGING_TB
+        response = client.get("/api/v1/reports/formance/aged-receivables")
+
+    assert response.status_code == 200
+    assert response.json()["as_at"] == date.today().isoformat()
+    assert runner.await_args.args[1].end_date == date.today()
+    assert generate_tb.await_args.kwargs["as_at"] == date.today()

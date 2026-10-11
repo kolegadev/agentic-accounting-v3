@@ -326,6 +326,7 @@
   }
   .report-error { color:var(--red); font-size:12px; line-height:1.5; }
   .report-empty { font-size:11.5px; color:var(--text-dim4); padding:6px 0; }
+  .report-note { font-size:11px; color:var(--text-dim3); padding:4px 0; line-height:1.4; }
   .report-crosscheck {
     flex:none; padding:10px 16px 14px; border-top:1px solid var(--border2);
     font-size:11.5px; line-height:1.5;
@@ -646,6 +647,8 @@
           <option value="pl">Profit &amp; Loss</option>
           <option value="balance-sheet">Balance Sheet</option>
           <option value="trial-balance">Trial Balance</option>
+          <option value="aged-receivables">Aged Receivables</option>
+          <option value="aged-payables">Aged Payables</option>
           <option value="cash-flow">Cash Flow</option>
           <option value="funds">Funds Statement</option>
         </select>
@@ -1572,6 +1575,24 @@ function renderFormanceReport(data) {
       '<td class="num">' + fmtMoney(r.total_debits) + '</td>' +
       '<td class="num">' + fmtMoney(r.total_credits) + '</td></tr>' +
       '</tbody></table>';
+  } else if (type === 'aged-receivables' || type === 'aged-payables') {
+    var bucketRows = ['| Bucket | Count | Total |', '| --- | --- | --- |'];
+    (r.buckets || []).forEach(function(b) {
+      bucketRows.push('| ' + b.bucket + ' | ' + b.count + ' | ' + fmtMoney(b.total_pence) + ' |');
+    });
+    html += renderTable(bucketRows.join('\n'));
+    html += '<table class="report-table"><tbody>' +
+      '<tr class="report-total-row"><td colspan="2">Total outstanding</td>' +
+      '<td class="num">' + fmtMoney(r.total_outstanding_pence) + '</td></tr>' +
+      '</tbody></table>';
+    var lb = r.ledger_balance || {};
+    var lbVal = Number(lb.balance_pence) || 0;
+    var lbLabel = lbVal < 0 ? fmtMoney(-lbVal) + ' (credit)' : fmtMoney(lbVal);
+    html += '<div class="report-note">Ledger balance — ' + esc(lb.code || '') + ' ' +
+      esc(lb.name || '') + ': ' + lbLabel +
+      (lb.ledger_account_missing ? ' (account missing from the chart of accounts)' : '') +
+      '</div>';
+    if (r.note) html += '<div class="report-note">' + esc(r.note) + '</div>';
   } else if (type === 'cash-flow') {
     var cs = r.sections || {};
     html += reportSectionBlock('Operating', cs.operating);
