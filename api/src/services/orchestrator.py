@@ -198,12 +198,17 @@ class RejectResult:
 # ---------------------------------------------------------------------------
 
 
-def build_system_prompt(history: list[dict[str, Any]] | None = None) -> str:
+def build_system_prompt(
+    history: list[dict[str, Any]] | None = None,
+    coa: list[dict[str, Any]] | None = None,
+) -> str:
     """System prompt listing all 10 skills with their Facts JSON schemas.
 
     Schemas come from the F4 pydantic models via ``.model_json_schema()``;
     rules enforce integer pence, ISO dates, the vat_rate enum, and the
-    closest-skill-or-clarification fallback.
+    closest-skill-or-clarification fallback.  When ``coa`` rows are
+    provided (code/name/category/type), they are listed as the ONLY valid
+    account codes so the LLM never hallucinates one.
     """
     skill_snippets: list[dict[str, Any]] = []
     for skill_id, model in FACTS_MODELS.items():
@@ -225,6 +230,18 @@ def build_system_prompt(history: list[dict[str, Any]] | None = None) -> str:
         context_lines.append(f"[{role}] {content}")
     context = "\n".join(context_lines) if context_lines else "(no prior conversation)"
 
+    coa_section = ""
+    if coa:
+        lines = [
+            f"- {r.get('code')} | {r.get('name')} | {r.get('category')} ({r.get('type')})"
+            for r in coa
+        ]
+        coa_section = (
+            "## Chart of accounts (the ONLY valid account codes)\n\n"
+            + "\n".join(lines)
+            + "\n\n"
+        )
+
     return (
         "You are the transaction orchestrator for Agentic Accounting, a "
         "double-entry accounting system for UK small businesses.\n\n"
@@ -235,6 +252,7 @@ def build_system_prompt(history: list[dict[str, Any]] | None = None) -> str:
         "— a deterministic constructor does that after you return facts.\n\n"
         "## Skills and their Facts JSON schemas\n\n"
         f"{skills_json}\n\n"
+        f"{coa_section}"
         "## Rules\n"
         "1. Respond with a single JSON object and nothing else:\n"
         '   {"skill_id": "<one of the skill ids above>", "facts": {<matching schema>}}\n'
@@ -244,9 +262,11 @@ def build_system_prompt(history: list[dict[str, Any]] | None = None) -> str:
         '4. vat_rate must be one of the enum values in the schema: '
         '"20%", "5%", "0%", "exempt".\n'
         "5. Account codes go ONLY into the facts fields that carry account "
-        "codes (e.g. bank_account_code, expense_account_code). Use the codes "
-        "the user mentions; the constructor resolves them against the chart "
-        "of accounts.\n"
+        "codes (e.g. bank_account_code, expense_account_code). They MUST "
+        "come from the Chart of accounts section above — NEVER invent a "
+        "code. If no listed account matches the message (e.g. buying a "
+        "laptop when only an Office Equipment expense account exists), pick "
+        "the CLOSEST listed account for that field.\n"
         "6. Choose the CLOSEST matching skill. Never invent a skill id.\n"
         '7. If the message is ambiguous or you cannot extract the required '
         'facts, respond with {"skill_id": null, "clarification": "<what you '
@@ -375,7 +395,19 @@ async def orchestrate_message(
     structured ``ambiguous_entity`` error (never a silent global draft).
     """
     transport: LLMTransport = llm or call_llm
-    system_prompt = build_system_prompt(history)
+
+    # ---- 0) entity scope + COA first, so the prompt is grounded in the
+    #         REAL chart of accounts (the LLM never hallucinates a code).
+    try:
+        scope_id: uuid.UUID | None = await resolve_entity_scope(db, entity_id)
+    except AmbiguousEntityError as exc:
+        return OrchestrateResult.failure("ambiguous_entity", exc.message)
+    accounts = await CoaService.list_accounts(db, entity_id=scope_id)
+    coa_rows = [
+        {"code": a.code, "name": a.name, "category": a.category, "type": a.type}
+        for a in accounts
+    ]
+    system_prompt = build_system_prompt(history, coa=coa_rows)
 
     # ---- 1) LLM classify + extract (never constructs money math) ---------
     try:
@@ -414,17 +446,8 @@ async def orchestrate_message(
     except ConstructorError as exc:
         return OrchestrateResult.failure("invalid_facts", str(exc))
 
-    # ---- 2b) entity scope (Contract F19): explicit > single-active > NULL.
-    #          More than one active entity without an explicit id is a
-    #          structured error — never a silent global draft.
-    try:
-        scope_id: uuid.UUID | None = await resolve_entity_scope(db, entity_id)
-    except AmbiguousEntityError as exc:
-        return OrchestrateResult.failure("ambiguous_entity", exc.message)
-
     # ---- 3) constructor = CONSTRUCTORS[skill_id] (F4) ---------------------
     try:
-        accounts = await CoaService.list_accounts(db, entity_id=scope_id)
         codes = resolve_from_coa(
             [{"code": a.code, "category": a.category, "type": a.type} for a in accounts]
         )

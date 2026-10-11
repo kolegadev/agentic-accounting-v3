@@ -319,7 +319,10 @@ async def test_orchestrate_invalid_facts_structured_error(mock_db: AsyncMock) ->
         '"lines": [{"description": "x", "net_pence": 1000, '
         '"vat_rate": "25%", "expense_account_code": "5000"}]}}'
     )
-
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=[]),  # list_accounts — empty COA (LLM-error paths)
+    ]
     result = await orchestrate_message(mock_db, "invoice", llm=llm)
 
     assert result.status == "error"
@@ -327,19 +330,22 @@ async def test_orchestrate_invalid_facts_structured_error(mock_db: AsyncMock) ->
     assert result.legs is None
     assert result.error["type"] == "invalid_facts"
     assert "vat_rate" in result.error["message"]
-    mock_db.execute.assert_not_called()
+    assert mock_db.execute.await_count >= 2  # scope + COA resolved before the LLM
 
 
 @pytest.mark.asyncio
 async def test_orchestrate_unknown_skill_error(mock_db: AsyncMock) -> None:
     llm = await _llm_returning('{"skill_id": "magic-wand", "facts": {}}')
-
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=[]),  # list_accounts — empty COA (LLM-error paths)
+    ]
     result = await orchestrate_message(mock_db, "wave wand", llm=llm)
 
     assert result.status == "error"
     assert result.error["type"] == "unknown_skill"
     assert "magic-wand" in result.error["message"]
-    mock_db.execute.assert_not_called()
+    assert mock_db.execute.await_count >= 2
 
 
 @pytest.mark.asyncio
@@ -347,12 +353,16 @@ async def test_orchestrate_llm_unreachable_structured_error(mock_db: AsyncMock) 
     async def broken_llm(system_prompt: str, user_message: str) -> str:
         raise LLMError("LLM API error: connection refused")
 
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=[]),  # list_accounts — empty COA (LLM-error paths)
+    ]
     result = await orchestrate_message(mock_db, "hi", llm=broken_llm)
 
     assert result.status == "error"
     assert result.error["type"] == "llm_unreachable"
     assert "connection refused" in result.error["message"]
-    mock_db.execute.assert_not_called()
+    assert mock_db.execute.await_count >= 2
 
 
 @pytest.mark.asyncio
@@ -362,6 +372,10 @@ async def test_orchestrate_llm_transport_raising_raw_exception(
     async def broken_llm(system_prompt: str, user_message: str) -> str:
         raise httpx.ConnectError("no route to host")
 
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=[]),  # list_accounts — empty COA (LLM-error paths)
+    ]
     result = await orchestrate_message(mock_db, "hi", llm=broken_llm)
 
     assert result.status == "error"
@@ -372,13 +386,16 @@ async def test_orchestrate_llm_transport_raising_raw_exception(
 @pytest.mark.asyncio
 async def test_orchestrate_llm_bad_json_structured_error(mock_db: AsyncMock) -> None:
     llm = await _llm_returning("I think you want to record something, but I am unsure")
-
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=[]),  # list_accounts — empty COA (LLM-error paths)
+    ]
     result = await orchestrate_message(mock_db, "hi", llm=llm)
 
     assert result.status == "error"
     assert result.error["type"] == "invalid_response"
     assert "not valid JSON" in result.error["message"]
-    mock_db.execute.assert_not_called()
+    assert mock_db.execute.await_count >= 2
 
 
 @pytest.mark.asyncio
@@ -388,7 +405,10 @@ async def test_orchestrate_clarification_error_preview_absent(
     llm = await _llm_returning(
         '{"skill_id": null, "clarification": "Which bank account should the money leave?"}'
     )
-
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=[]),  # list_accounts — empty COA (LLM-error paths)
+    ]
     result = await orchestrate_message(mock_db, "pay the supplier", llm=llm)
 
     assert result.status == "error"
@@ -396,10 +416,25 @@ async def test_orchestrate_clarification_error_preview_absent(
     assert "bank account" in result.error["message"]
     assert result.transaction_id is None
     assert result.legs is None
-    mock_db.execute.assert_not_called()
+    assert mock_db.execute.await_count >= 2  # scope + COA resolved before the LLM
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_no_skill_id_nor_clarification(
+    mock_db: AsyncMock,
+) -> None:
+    llm = await _llm_returning("{}")
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=[]),  # list_accounts — empty COA (LLM-error paths)
+    ]
+    result = await orchestrate_message(mock_db, "hi", llm=llm)
+
+    assert result.status == "error"
+    assert result.error["type"] == "invalid_response"
+    assert "neither a skill_id nor a clarification" in result.error["message"]
+
+
 async def test_orchestrate_constructor_error_structured(
     mock_db: AsyncMock, coa: dict[str, Account]
 ) -> None:
@@ -421,18 +456,6 @@ async def test_orchestrate_constructor_error_structured(
     assert result.error["type"] == "constructor_error"
     assert "9999" in result.error["message"]
     assert not [o for o in mock_db.added if isinstance(o, Transaction)]
-
-
-@pytest.mark.asyncio
-async def test_orchestrate_no_skill_id_nor_clarification(
-    mock_db: AsyncMock,
-) -> None:
-    llm = await _llm_returning('{"facts": {}}')
-
-    result = await orchestrate_message(mock_db, "hi", llm=llm)
-
-    assert result.status == "error"
-    assert result.error["type"] == "invalid_response"
 
 
 # ---------------------------------------------------------------------------
@@ -680,3 +703,19 @@ def test_constructor_error_is_still_an_exception() -> None:
 
 def test_discard_draft_is_on_transaction_service() -> None:
     assert callable(TransactionService.discard_draft)
+
+
+def test_build_system_prompt_includes_coa_when_provided() -> None:
+    """The prompt must ground account codes in the REAL chart of accounts."""
+    coa = [
+        {"code": "1000", "name": "Bank Current", "category": "Asset", "type": "Bank"},
+        {"code": "5000", "name": "Office Equipment", "category": "Expense", "type": "Expense"},
+    ]
+    prompt = build_system_prompt(coa=coa)
+    assert "## Chart of accounts" in prompt
+    assert "1000 | Bank Current | Asset (Bank)" in prompt
+    assert "5000 | Office Equipment | Expense (Expense)" in prompt
+    assert "NEVER invent a" in prompt
+
+    without = build_system_prompt()
+    assert "## Chart of accounts" not in without
