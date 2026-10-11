@@ -302,7 +302,7 @@ def test_create_entity_duplicate_name_409(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 def test_list_entities(client: TestClient) -> None:
-    _override_auth(make_user("viewer"))
+    """Contract F23: the list is PUBLIC — no token, no auth override."""
     with patch(
         "src.routes.entities.EntityService.list_entities",
         new_callable=AsyncMock,
@@ -314,6 +314,20 @@ def test_list_entities(client: TestClient) -> None:
     data = resp.json()
     assert len(data) == 1
     assert data[0]["id"] == str(ENTITY_ID)
+
+
+def test_list_entities_no_token_required(client: TestClient) -> None:
+    """F23 regression: a tokenless GET /entities is 200 (local-trust),
+    never a 401 from the dropped get_current_user dependency."""
+    with patch(
+        "src.routes.entities.EntityService.list_entities",
+        new_callable=AsyncMock,
+    ) as mock_list:
+        mock_list.return_value = [make_entity()]
+        resp = client.get("/api/v1/entities")
+
+    assert resp.status_code == 200
+    assert resp.json()[0]["name"] == "Acme Holdings Ltd"
 
 
 def test_get_entity(client: TestClient) -> None:
@@ -512,8 +526,7 @@ def test_entity_status_404(client: TestClient) -> None:
 
 
 def test_list_entities_filters_inactive(client: TestClient) -> None:
-    """GET /entities excludes inactive entities by default."""
-    _override_auth(make_user("viewer"))
+    """GET /entities excludes inactive entities by default (public route)."""
     with patch(
         "src.routes.entities.EntityService.list_entities",
         new_callable=AsyncMock,

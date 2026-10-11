@@ -61,6 +61,24 @@ ENTITY_ENDPOINTS = [
     "/api/entities",
 ]
 
+# Contract F23 — the Books-in-plain-English panel + the mock-world strings
+# that must be GONE from the rebuilt page.
+BOOKS_DOM_IDS = [
+    "books-panel",
+    "books-output",
+]
+
+BOOKS_ENDPOINTS = [
+    "/api/books",
+]
+
+FORBIDDEN_STRINGS = [
+    "brightwork",
+    "/api/companies",
+    "/api/dashboard",
+    "/ws/chat",
+]
+
 
 @pytest.fixture(scope="module")
 def html() -> str:
@@ -98,6 +116,24 @@ def test_js_references_entities_endpoint(html: str, endpoint: str) -> None:
     assert endpoint in html
 
 
+@pytest.mark.parametrize("dom_id", BOOKS_DOM_IDS)
+def test_required_books_dom_id_present(html: str, dom_id: str) -> None:
+    assert f'id="{dom_id}"' in html
+
+
+@pytest.mark.parametrize("endpoint", BOOKS_ENDPOINTS)
+def test_js_references_books_endpoint(html: str, endpoint: str) -> None:
+    assert endpoint in html
+
+
+@pytest.mark.parametrize("forbidden", FORBIDDEN_STRINGS)
+def test_mock_world_string_absent(html: str, forbidden: str) -> None:
+    """Contract F23: the mock world is gone — no mock company identifiers,
+    mock dashboard/companies endpoints, or the WS chat bridge may remain in
+    the rebuilt page."""
+    assert forbidden not in html
+
+
 def test_entity_id_query_wiring_present(html: str) -> None:
     """The JS wires ?entity_id=<selected> into EVERY orchestrator/report
     call when an entity is selected — pinned per call site so a future
@@ -112,3 +148,28 @@ def test_entity_id_query_wiring_present(html: str) -> None:
     # report fetch appends the entity param
     assert "var eqs = entityParam();" in html
     assert "'/api/reports/formance/'" in html
+
+
+def test_per_pane_generation_counters(html: str) -> None:
+    """Contract F23 — loadFormanceReport() and loadBooks() each own a
+    generation counter, and each loader guards BOTH of its DOM writes
+    (success path and catch path) against its own counter.
+
+    A single shared reqGen breaks the Formance pane: init() and
+    switchEntity() call loadFormanceReport() then loadBooks() synchronously,
+    so the books call's increment makes the formance response look stale
+    forever and the reports pane sticks on 'Loading…'.  Reverting to a
+    shared counter, or removing either guard, must fail this test."""
+    assert "var myGen = ++formanceGen" in html
+    assert "var myGen = ++booksGen" in html
+    assert html.count("myGen !== formanceGen") >= 2
+    assert html.count("myGen !== booksGen") >= 2
+
+
+def test_esc_escapes_double_quotes_for_attribute_contexts(html: str) -> None:
+    """Contract F23 — esc() escapes double quotes, so table-cell values
+    interpolated into data-value="…" attributes in renderTable cannot
+    inject attributes (e.g. a cell containing '" onmouseover=…')."""
+    assert ".replace(/\"/g, '&quot;')" in html
+    # pin that renderTable's data-value uses the ESCAPED cell (not the raw value)
+    assert "data-value=\"' + esc(cells[j].trim()) + '\"" in html

@@ -128,10 +128,14 @@ async def list_entities(
     include_inactive: bool = Query(
         False, description="Include inactive entities in the listing"
     ),
-    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[EntityResponse]:
-    """Return accounting entities, newest first. Active-only by default."""
+    """Return accounting entities, newest first. Active-only by default.
+
+    Contract F23: the LIST is public under the v2 local-trust model (the
+    chat UI populates its entity dropdown before any user session exists).
+    Detail, setup and status routes keep auth.
+    """
     entities = await EntityService.list_entities(db, include_inactive=include_inactive)
     return [EntityResponse.model_validate(e) for e in entities]
 

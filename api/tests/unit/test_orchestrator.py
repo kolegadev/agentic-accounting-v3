@@ -10,6 +10,7 @@ Nothing here touches a real LLM, database, or ledger.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -178,6 +179,16 @@ def test_build_system_prompt_lists_all_10_skills_with_schemas() -> None:
     assert '"20%", "5%", "0%", "exempt"' in prompt
     assert '"skill_id": null, "clarification"' in prompt
     assert "[user] hi" in prompt
+
+
+def test_build_system_prompt_grounds_in_todays_date() -> None:
+    """Contract F23: rule 3 carries the REAL current date so the LLM never
+    dates drafts 2024-01-01 (which pushed posted transactions outside the
+    report period)."""
+    prompt = build_system_prompt()
+    match = re.search(r"Today is (20\d\d-\d\d-\d\d)", prompt)
+    assert match is not None, f"no 'Today is <date>' in prompt: {prompt[-400:]}"
+    assert match.group(1) == datetime.now(UTC).date().isoformat()
 
 
 # ---------------------------------------------------------------------------

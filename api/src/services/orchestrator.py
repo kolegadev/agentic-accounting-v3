@@ -21,7 +21,7 @@ import os
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 import httpx
@@ -242,6 +242,10 @@ def build_system_prompt(
             + "\n\n"
         )
 
+    # Contract F23: ground the prompt in the REAL current date so the LLM
+    # never hallucinates a stale date (drafts were being dated 2024-01-01).
+    today = datetime.now(timezone.utc).date()
+
     return (
         "You are the transaction orchestrator for Agentic Accounting, a "
         "double-entry accounting system for UK small businesses.\n\n"
@@ -258,7 +262,7 @@ def build_system_prompt(
         '   {"skill_id": "<one of the skill ids above>", "facts": {<matching schema>}}\n'
         "2. ALL money amounts are INTEGER PENCE. £50.00 -> 5000. Never use "
         "floats or decimals for money.\n"
-        "3. Dates are ISO 8601 strings (YYYY-MM-DD).\n"
+        f"3. Dates are ISO 8601 (YYYY-MM-DD). Today is {today}.\n"
         '4. vat_rate must be one of the enum values in the schema: '
         '"20%", "5%", "0%", "exempt".\n'
         "5. Account codes go ONLY into the facts fields that carry account "

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 # chat-ui/server.py is a plain module next to this repo's chat-ui directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -312,7 +313,9 @@ def test_reports_upstream_unreachable_returns_502(
 
 
 # ---------------------------------------------------------------------------
-# Entities forwarding (Contract F20) — GET → /api/v1/entities, no mock
+# Entities forwarding (Contract F20/F23) — GET → /api/v1/entities/ (WITH the
+# trailing slash — the slash-less URL 307-redirects and returned an empty
+# body), no mock fallback.
 # ---------------------------------------------------------------------------
 
 
@@ -322,10 +325,10 @@ def test_entities_forwards_path_and_json(client: TestClient, upstream) -> None:
     assert resp.status_code == 200
     echo = resp.json()
     assert echo["method"] == "GET"
-    assert echo["path"] == "/api/v1/entities"
+    assert echo["path"] == "/api/v1/entities/"
     req = upstream[0]
     assert req.method == "GET"
-    assert req.url.path == "/api/v1/entities"
+    assert req.url.path == "/api/v1/entities/"
 
 
 def test_entities_upstream_error_status_and_json_passthrough(
@@ -360,3 +363,146 @@ def test_entities_upstream_unreachable_returns_502(
     # NO mock fallback — an unreachable backend is a hard 502, never
     # fabricated company/entity data.
     assert "companies" not in body
+
+
+# ---------------------------------------------------------------------------
+# Books in plain English (Contract F23) — GET /api/books fetches the REAL
+# Formance reports for the entity, then an LLM explanation.  entity_id is
+# forwarded on BOTH upstream calls; upstream failure → 502
+# upstream_unreachable; LLM failure → 502 llm_error.  No mock fallback.
+# ---------------------------------------------------------------------------
+
+BOOKS_ENTITY_ID = "8f0b3c9a-4444-4a2b-9c3d-000000000004"
+
+PL_BODY = {
+    "report_type": "pl",
+    "report": {"sections": {"revenue": []}, "profit": 120000},
+}
+BS_BODY = {
+    "report_type": "balance-sheet",
+    "report": {
+        "totals": {"assets": 500000, "liabilities_and_equity": 500000}
+    },
+}
+
+
+def _books_handler(captured: list) -> callable:
+    """MockTransport handler serving the pl + balance-sheet reports."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path.endswith("/pl"):
+            return httpx.Response(200, json=PL_BODY)
+        if request.url.path.endswith("/balance-sheet"):
+            return httpx.Response(200, json=BS_BODY)
+        return httpx.Response(404, json={"detail": "not found"})
+
+    return handler
+
+
+def test_books_forwards_entity_id_and_returns_llm_markdown(
+    client: TestClient, monkeypatch
+) -> None:
+    captured: list[httpx.Request] = []
+    _set_transport(monkeypatch, _books_handler(captured))
+    monkeypatch.setattr(
+        server,
+        "_llm_explain_books",
+        AsyncMock(return_value="**Healthy** business.\n- Revenue is up"),
+    )
+
+    resp = client.get("/api/books", params={"entity_id": BOOKS_ENTITY_ID})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["markdown"] == "**Healthy** business.\n- Revenue is up"
+    assert "pl" in body["sources"]
+    assert "balance_sheet" in body["sources"]
+
+    paths = [r.url.path for r in captured]
+    assert "/api/v1/reports/formance/pl" in paths
+    assert "/api/v1/reports/formance/balance-sheet" in paths
+    assert len(captured) == 2
+    for req in captured:
+        assert req.url.params.get("entity_id") == BOOKS_ENTITY_ID
+
+
+def test_books_llm_receives_the_real_report_bodies(
+    client: TestClient, monkeypatch
+) -> None:
+    _set_transport(monkeypatch, _books_handler([]))
+    mock_llm = AsyncMock(return_value="fine")
+    monkeypatch.setattr(server, "_llm_explain_books", mock_llm)
+
+    resp = client.get("/api/books", params={"entity_id": BOOKS_ENTITY_ID})
+
+    assert resp.status_code == 200
+    assert mock_llm.await_count == 1
+    pl_arg, bs_arg = mock_llm.await_args.args
+    assert pl_arg == PL_BODY
+    assert bs_arg == BS_BODY
+
+
+def test_books_upstream_unreachable_returns_502(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _set_transport(monkeypatch, handler)
+    resp = client.get("/api/books", params={"entity_id": BOOKS_ENTITY_ID})
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "upstream_unreachable"
+    assert "connection refused" in body["message"]
+    # NO mock fallback — the response carries no fabricated numbers.
+    assert "markdown" not in body
+
+
+def test_books_upstream_report_error_returns_502(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422, json={"type": "missing_period_params", "message": "requires period_start"}
+        )
+
+    _set_transport(monkeypatch, handler)
+    resp = client.get("/api/books", params={"entity_id": BOOKS_ENTITY_ID})
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "upstream_unreachable"
+    assert "pl=422" in body["message"]
+
+
+def test_books_llm_failure_returns_llm_error_502(
+    client: TestClient, monkeypatch
+) -> None:
+    _set_transport(monkeypatch, _books_handler([]))
+    monkeypatch.setattr(
+        server,
+        "_llm_explain_books",
+        AsyncMock(side_effect=server._BooksLLMError("LLM API error: boom")),
+    )
+
+    resp = client.get("/api/books", params={"entity_id": BOOKS_ENTITY_ID})
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "llm_error"
+    assert "boom" in body["message"]
+
+
+def test_books_missing_entity_id_returns_422(client: TestClient) -> None:
+    resp = client.get("/api/books")
+
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "missing_entity_id"
