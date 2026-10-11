@@ -680,7 +680,7 @@ class TransactionService:
                 postings=formance_postings,
                 reference=transaction.reference or str(transaction.id),
                 timestamp=(
-                    transaction.effective_date.isoformat()
+                    f"{transaction.effective_date.isoformat()}T00:00:00Z"
                     if transaction.effective_date
                     else None
                 ),

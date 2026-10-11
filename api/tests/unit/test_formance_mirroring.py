@@ -596,4 +596,4 @@ async def test_mirror_timestamp_uses_effective_date_not_wall_clock(monkeypatch) 
         result = await TransactionService._post_to_formance(db, tx)
 
     assert result is not None
-    assert posted[0]["timestamp"] == "2024-01-15"
+    assert posted[0]["timestamp"] == "2024-01-15T00:00:00Z"
