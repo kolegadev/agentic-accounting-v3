@@ -452,7 +452,6 @@ async def test_mini_scenario_bs_matches_expected_numbers(ctx) -> None:
     # designed to zero so it adds nothing to the identity.
     assert equity["profit_for_period"] == 0
     assert bs["vat_net"] == 2000
-    assert bs["vat_recoverable_asset"] == 0
 
 
 async def test_mini_scenario_tb_matches_expected_numbers(ctx) -> None:

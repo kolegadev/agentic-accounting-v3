@@ -701,7 +701,6 @@ async def test_bs_vat_net_positive_shown_as_liability(monkeypatch) -> None:
     try:
         report = await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
         assert report["vat_net"] == 12000
-        assert report["vat_recoverable_asset"] == 0
         vat_line = next(
             line for line in report["sections"]["current_liabilities"]
             if line["code"] == "VAT"
@@ -717,27 +716,31 @@ async def test_bs_vat_net_positive_shown_as_liability(monkeypatch) -> None:
         await world.close()
 
 
-async def test_bs_vat_net_negative_presented_as_1130_asset(monkeypatch) -> None:
+async def test_bs_vat_net_negative_reduces_liabilities(monkeypatch) -> None:
+    """F26: a negative VAT net stays a signed liability line (it is NEVER
+    reclassified to a 1130 asset) so the engine matches the Postgres
+    ReportService exactly."""
     balances = {"2210": "-80.00", "2220": "200.00", "1000": "120.00", "3000": "-240.00"}
     world = await _bs_world(monkeypatch, balances)
     try:
         report = await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
         assert report["vat_net"] == -12000
-        assert report["vat_recoverable_asset"] == 12000
         recoverable = [
             line for line in report["sections"]["current_assets"]
             if line["code"] == "1130"
         ]
-        assert len(recoverable) == 1
-        assert recoverable[0]["amount"] == 12000
+        # a zero-balance 1130 COA line may exist; the VAT amount must NOT
+        # be reclassified onto it
+        assert all(line["amount"] == 0 for line in recoverable)
         vat_line = next(
             line for line in report["sections"]["current_liabilities"]
             if line["code"] == "VAT"
         )
-        assert vat_line["amount"] == 0
-        assert report["totals"]["assets"] == 24000
-        assert report["totals"]["liabilities"] == 0
+        assert vat_line["amount"] == -12000
+        assert report["totals"]["assets"] == 12000
+        assert report["totals"]["liabilities"] == -12000
         assert report["totals"]["equity"] == 24000
+        assert report["totals"]["liabilities_and_equity"] == 12000
     finally:
         await world.close()
 
@@ -858,12 +861,12 @@ async def test_bs_current_profit_live_60_shape(monkeypatch) -> None:
         report = await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
         assert report["identity_ok"] is True
         assert _profit_line(report)["amount"] == -5000
-        assert report["vat_recoverable_asset"] == 1000
+        assert report["vat_net"] == -1000
         assert report["totals"] == {
-            "assets": 1000,
-            "liabilities": 6000,
+            "assets": 0,
+            "liabilities": 5000,
             "equity": -5000,
-            "liabilities_and_equity": 1000,
+            "liabilities_and_equity": 0,
         }
     finally:
         await world.close()

@@ -1079,6 +1079,7 @@ async function rejectPreview() {
       setPreviewStatus('Draft discarded — nothing was posted.', 'rejected');
       renderPreview(null);
       loadPendingDrafts();
+      loadBooks();
     } else {
       var detail = data.detail;
       var msg = typeof detail === 'string' ? detail : (detail && detail.message) || ('HTTP ' + resp.status);

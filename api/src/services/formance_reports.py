@@ -42,7 +42,8 @@ Known conventions (documented, deterministic):
   Dr 3020 (equity) / Cr 2040; debiting an expense account for the
   provision double-counts the charge in the P&L and breaks the CF
   identity (the engine raises loudly rather than fudge).
-- BS presents a negative VAT net as the ``1130`` VAT Recoverable asset (F8
+- BS presents VAT as one signed net liability line (F26 — matches the
+  Postgres ReportService exactly, so the cross-check is meaningful)
   presentation rule); this reclassification intentionally differs from the
   Postgres ReportService, which never reclassifies.
 
@@ -687,8 +688,8 @@ async def generate_bs(
 
     Formance balance = debits − credits, so credit-nature balances are
     negated for presentation: liabilities/equity positive, ``1360``
-    carried negative within assets, VAT net as a liability line (presented
-    as the ``1130`` asset when the net is negative — the F8 rule).
+    carried negative within assets; VAT always as one signed net liability
+    line (F26).
 
     Contract F24: the equity section gains a flow-derived
     ``profit_for_period`` line — the P&L net over
@@ -758,11 +759,13 @@ async def generate_bs(
         balances.get(c, 0) for c in _CONTRA_EQUITY_CODES
     )
 
-    vat_recoverable = max(-vat_net, 0)
-    vat_liability_line = max(vat_net, 0)
-
-    total_assets = bank_total + current_assets_total + fixed_net + vat_recoverable
-    total_liabilities = current_liab_total + vat_liability_line + lt_total
+    # F26: VAT is ALWAYS presented as one signed net line within
+    # liabilities (never reclassified to a 1130 recoverable asset) so the
+    # engine and the Postgres ReportService measure the same thing and the
+    # cross-check is exact. A negative net (recoverable) simply reduces
+    # liabilities.
+    total_assets = bank_total + current_assets_total + fixed_net
+    total_liabilities = current_liab_total + vat_net + lt_total
     equity_with_profit = equity_total + current_profit_pence
     liabilities_and_equity = total_liabilities + equity_with_profit
 
@@ -784,7 +787,7 @@ async def generate_bs(
             {
                 "code": "VAT",
                 "name": "VAT net (2210 - 2220)",
-                "amount": vat_liability_line,
+                "amount": vat_net,
             }
         ],
         "long_term_liabilities": neg_section(lt_codes),
@@ -799,32 +802,12 @@ async def generate_bs(
             "amount": current_profit_pence,
         }
     )
-    if vat_recoverable:
-        recoverable_line = next(
-            (
-                line
-                for line in sections["current_assets"]
-                if line["code"] == "1130"
-            ),
-            None,
-        )
-        if recoverable_line is not None:
-            recoverable_line["amount"] += vat_recoverable
-        else:
-            sections["current_assets"].append(
-                {
-                    "code": "1130",
-                    "name": "VAT Recoverable (1130)",
-                    "amount": vat_recoverable,
-                }
-            )
 
     return {
         "report": "balance_sheet",
         "as_at": as_at,
         "sections": sections,
         "vat_net": vat_net,
-        "vat_recoverable_asset": vat_recoverable,
         "totals": {
             "assets": total_assets,
             "liabilities": total_liabilities,
