@@ -18,7 +18,7 @@ Data sources (exact F8/F2 conventions):
   verifier), keep only transactions whose ``metadata.transaction_id`` belongs
   to a Postgres transaction with status ``posted`` or ``reversed`` (the F2
   scope rule), filter the period Python-side on the mirror ``timestamp``
-  (missing/unparseable timestamps are treated as in-scope), and accumulate
+  (mirrors carry the transaction's effective_date; missing/unparseable timestamps are treated as in-scope), and accumulate
   per-code flows: ``destination`` debited (+amount), ``source`` credited.
   Working-capital movements and the change-in-bank are period NET FLOWS of
   the relevant accounts — a period net flow IS the balance change, so no

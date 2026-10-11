@@ -8,7 +8,7 @@ contra account, exact decimal amounts, and preserved reference/metadata.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -554,3 +554,46 @@ async def test_reverse_transaction_skips_mirror_when_env_unset(monkeypatch) -> N
 
     assert reversing.status == "posted"
     mock_create.assert_not_called()
+
+
+async def test_mirror_timestamp_uses_effective_date_not_wall_clock(monkeypatch) -> None:
+    """The Formance mirror timestamp must be the transaction's EFFECTIVE
+    date — the report engine filters periods on it, and the Postgres
+    cross-check filters effective_date; a wall-clock (recorded_at)
+    timestamp makes the two sides disagree for back-dated entries."""
+    dr = make_account("1000")
+    cr = make_account("5000")
+    tx = Transaction(
+        id=uuid.uuid4(),
+        reference="JE-2026-0001",
+        description="test",
+        currency="GBP",
+        status="posted",
+        effective_date=date(2024, 1, 15),
+        total_amount=5000,
+    )
+    tx.postings = [
+        Posting(id=uuid.uuid4(), transaction_id=tx.id, account_id=dr.id,
+                debit_amount=5000, credit_amount=0),
+        Posting(id=uuid.uuid4(), transaction_id=tx.id, account_id=cr.id,
+                debit_amount=0, credit_amount=5000),
+    ]
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[accounts_result(dr, cr)])
+    db.refresh = AsyncMock()
+
+    posted: list[dict] = []
+
+    async def fake_create(ledger, postings, reference=None, timestamp=None, metadata=None):
+        posted.append({"timestamp": timestamp, "metadata": metadata})
+        return {"txid": 1}
+
+    monkeypatch.setenv("FORNANCE_LEDGER_URL", "http://formance:3068")
+    with patch(
+        "src.services.transaction_service.formance_client.create_transaction",
+        new=fake_create,
+    ):
+        result = await TransactionService._post_to_formance(db, tx)
+
+    assert result is not None
+    assert posted[0]["timestamp"] == "2024-01-15"
