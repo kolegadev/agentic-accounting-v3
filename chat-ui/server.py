@@ -197,6 +197,21 @@ def _get_upstream_client() -> httpx.AsyncClient:
     return _upstream_client
 
 
+_llm_upstream_client: httpx.AsyncClient | None = None
+
+
+def _get_llm_upstream_client() -> httpx.AsyncClient:
+    """Client for the LLM-bearing forward (message) — the classify call can
+    take ~30s (deepseek-flash + the prose retry); the shared 10s client
+    would 502 mid-classify (Contract F36)."""
+    global _llm_upstream_client
+    if _llm_upstream_client is None:
+        _llm_upstream_client = httpx.AsyncClient(
+            timeout=65.0, transport=_ColdBootRetryTransport()
+        )
+    return _llm_upstream_client
+
+
 async def _forward_orchestrator(
     action: str,
     body: dict | None,
@@ -212,7 +227,14 @@ async def _forward_orchestrator(
     spec = _ORCHESTRATOR_ROUTES[action]
     url = f"{API_BASE_URL}{spec['path']}"
     try:
-        client = _get_upstream_client()
+        # The message action runs the LLM classify (up to ~30s with the
+        # prose retry) — it needs the long-read client; everything else
+        # uses the shared 10s one (Contract F36).
+        client = (
+            _get_llm_upstream_client()
+            if action == "message"
+            else _get_upstream_client()
+        )
         if spec["method"] == "GET":
             resp = await client.get(url, params=params)
         else:

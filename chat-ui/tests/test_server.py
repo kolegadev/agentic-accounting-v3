@@ -56,21 +56,17 @@ def upstream(monkeypatch):
             },
         )
 
-    monkeypatch.setattr(
-        server,
-        "_upstream_client",
-        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(server, "_upstream_client", client)
+    monkeypatch.setattr(server, "_llm_upstream_client", client)
     return captured
 
 
 def _set_transport(monkeypatch, handler) -> None:
-    """Point the seam at a MockTransport with the given handler."""
-    monkeypatch.setattr(
-        server,
-        "_upstream_client",
-        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-    )
+    """Point both seams at a MockTransport with the given handler."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(server, "_upstream_client", client)
+    monkeypatch.setattr(server, "_llm_upstream_client", client)
 
 
 # ---------------------------------------------------------------------------
@@ -941,3 +937,38 @@ def test_llm_config_post_updates_runtime_config(client: TestClient, monkeypatch)
     assert saved and saved[0][1]["model"] == "deepseek-flash"
     # The push targets the accounting API's config route.
     assert saved[0][0].endswith("/api/v1/chat/llm-config")
+
+
+# ---------------------------------------------------------------------------
+# Client selection (Contract F36) — message uses the long-read LLM client
+# ---------------------------------------------------------------------------
+
+
+def test_message_uses_llm_client_pending_uses_standard(client: TestClient, monkeypatch) -> None:
+    llm_calls = []
+    std_calls = []
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        llm_calls.append(request.url.path)
+        return httpx.Response(200, json={"status": "preview", "preview": {}})
+
+    def std_handler(request: httpx.Request) -> httpx.Response:
+        std_calls.append(request.url.path)
+        return httpx.Response(200, json={"status": "ok", "pending": []})
+
+    monkeypatch.setattr(
+        server, "_llm_upstream_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)),
+    )
+    monkeypatch.setattr(
+        server, "_upstream_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(std_handler)),
+    )
+
+    r1 = client.post("/api/orchestrator/message", json={"message": "hi"})
+    assert r1.status_code == 200
+    r2 = client.get("/api/orchestrator/pending")
+    assert r2.status_code == 200
+
+    assert llm_calls == ["/api/v1/orchestrator/message"]
+    assert std_calls == ["/api/v1/orchestrator/pending"]
