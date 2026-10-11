@@ -58,7 +58,7 @@ income/expenses no longer needs closing entries to balance.
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import InvalidOperation
 from typing import Any, Optional
 import uuid
@@ -721,6 +721,15 @@ async def generate_bs(
     identity is assets == liabilities + equity + current_profit, exact in
     pence. A genuinely broken ledger still raises
     :class:`ReportEngineError`.
+
+    Contract F40: when ``period_start`` is set, the equity section also
+    gains a ``retained_earnings_brought_forward`` line — the P&L net over
+    ``[date.min, period_start - 1 day]`` (the SAME flow machinery) — and
+    the identity becomes
+    assets == liabilities + equity + prior_profit + current_profit. This
+    absorbs P&L postings that predate the fiscal window while the balance
+    side still reads all-time Formance balances. ``period_start=None``
+    keeps the legacy inception semantics (no prior line).
     """
     as_at = as_at or date.today()
     # F24: the current-profit line reuses the P&L flow machinery — the
@@ -731,6 +740,14 @@ async def generate_bs(
     current_profit_pence = _pl_from_flows(debit, credit, class_map, name_map)[
         "profit"
     ]
+    # F40: pre-fiscal-window P&L flows become the retained-earnings line
+    # (inception -> period_start - 1 day). Legacy (no window): zero.
+    prior_profit_pence = 0
+    if period_start is not None:
+        prior_end = period_start - timedelta(days=1)
+        prior_profit_pence = _pl_from_flows(
+            *(await _pl_net_flows(db, ledger, entity_id, None, prior_end))
+        )["profit"]
     balances = await _ledger_balances(ledger, class_map)
 
     def raw_section(codes: list[str]) -> list[dict[str, Any]]:
@@ -789,13 +806,16 @@ async def generate_bs(
     # liabilities.
     total_assets = bank_total + current_assets_total + fixed_net
     total_liabilities = current_liab_total + vat_net + lt_total
-    equity_with_profit = equity_total + current_profit_pence
+    equity_with_profit = (
+        equity_total + prior_profit_pence + current_profit_pence
+    )
     liabilities_and_equity = total_liabilities + equity_with_profit
 
     if total_assets != liabilities_and_equity:
         raise ReportEngineError(
             f"balance sheet identity violated: assets {total_assets} != "
             f"liabilities {total_liabilities} + equity {equity_total} "
+            f"+ prior profit {prior_profit_pence} "
             f"+ current profit {current_profit_pence} "
             f"= {liabilities_and_equity}"
         )
@@ -816,6 +836,16 @@ async def generate_bs(
         "long_term_liabilities": neg_section(lt_codes),
         "equity": neg_section(equity_codes) + neg_section(list(_CONTRA_EQUITY_CODES)),
     }
+    # F40: pre-fiscal-window profit opens the equity section (rendered
+    # whenever a window is set — even at zero, for transparency).
+    if period_start is not None:
+        sections["equity"].append(
+            {
+                "code": "retained_earnings_brought_forward",
+                "name": "Retained earnings brought forward",
+                "amount": prior_profit_pence,
+            }
+        )
     # F24: current-year profit/loss closes the equity section (flow-derived;
     # the equity ACCOUNTS alone no longer need to absorb P&L flows).
     sections["equity"].append(

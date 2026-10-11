@@ -751,8 +751,9 @@ async def test_bs_identity_violation_raises(monkeypatch) -> None:
     balances = {"1000": "100.00", "3000": "-101.00"}
     world = await _bs_world(monkeypatch, balances)
     try:
-        with pytest.raises(ReportEngineError, match="balance sheet identity violated"):
+        with pytest.raises(ReportEngineError, match="balance sheet identity violated") as exc_info:
             await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
+        assert "prior profit 0" in str(exc_info.value)
     finally:
         await world.close()
 
@@ -788,6 +789,14 @@ def _profit_line(report: dict) -> dict:
         line
         for line in report["sections"]["equity"]
         if line["code"] == "profit_for_period"
+    )
+
+
+def _retained_line(report: dict) -> dict:
+    return next(
+        line
+        for line in report["sections"]["equity"]
+        if line["code"] == "retained_earnings_brought_forward"
     )
 
 
@@ -875,10 +884,13 @@ async def test_bs_current_profit_live_60_shape(monkeypatch) -> None:
 
 
 async def test_bs_current_profit_period_start_filtering(monkeypatch) -> None:
-    """The fiscal-window ``period_start`` filters the profit flows: the
-    pre-window expense is excluded from profit_for_period (the balances
-    already close it into 3020), and dropping the window lets it leak in
-    and breaks the identity loudly."""
+    """Contract F40: the fiscal-window ``period_start`` splits the profit
+    flows — the pre-window expense lands on
+    ``retained_earnings_brought_forward`` and only the in-window flow
+    stays in ``profit_for_period``. The all-time balances need NO closing
+    entry (bank keeps carrying the pre-window cash effect); dropping the
+    window (legacy inception semantics) lets both expenses flow into the
+    single profit line and the identity still holds."""
     entries = [
         ("capital", "posted", "2026-01-05T09:00:00+00:00", [
             {"source": "3000", "destination": "1000", "amount": "1000.00", "asset": GBP},
@@ -890,9 +902,10 @@ async def test_bs_current_profit_period_start_filtering(monkeypatch) -> None:
             {"source": "1000", "destination": "6000", "amount": "20.00", "asset": GBP},
         ], {}),
     ]
-    # Balances as at 31 Dec: the pre-window expense is already closed into
-    # retained earnings (3020 carries the Dr 5,000p).
-    balances = {"1000": "930.00", "3000": "-1000.00", "3020": "50.00"}
+    # All-time Formance balances: NO closing entries — the pre-window
+    # expense's bank effect stays in 1000 and its P&L effect is absorbed
+    # by the retained-earnings line.
+    balances = {"1000": "930.00", "3000": "-1000.00"}
     world = await make_world(monkeypatch, entries=entries, balances=balances)
     try:
         report = await generate_bs(
@@ -902,6 +915,7 @@ async def test_bs_current_profit_period_start_filtering(monkeypatch) -> None:
             period_start=date(2026, 6, 1),
         )
         assert report["identity_ok"] is True
+        assert _retained_line(report)["amount"] == -5000
         assert _profit_line(report)["amount"] == -2000
         assert report["totals"] == {
             "assets": 93000,
@@ -909,10 +923,200 @@ async def test_bs_current_profit_period_start_filtering(monkeypatch) -> None:
             "equity": 93000,
             "liabilities_and_equity": 93000,
         }
-        # Inception (no window): both expenses flow into the profit line
-        # and the identity breaks loudly instead of being fudged.
-        with pytest.raises(ReportEngineError, match="balance sheet identity violated"):
-            await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
+        # Inception (no window): no prior line, both expenses flow into
+        # the profit line, and the identity still holds.
+        report = await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
+        assert report["identity_ok"] is True
+        assert _profit_line(report)["amount"] == -7000
+        assert all(
+            line["code"] != "retained_earnings_brought_forward"
+            for line in report["sections"]["equity"]
+        )
+        assert report["totals"]["equity"] == 93000
+    finally:
+        await world.close()
+
+
+# ---------------------------------------------------------------------------
+# Balance sheet — Contract F40: retained earnings brought forward
+# (prior-window profit; identity assets == liabilities + equity +
+# prior profit + current profit)
+# ---------------------------------------------------------------------------
+
+
+async def test_bs_live_regression_prior_wages_je(monkeypatch) -> None:
+    """The live 422 shape: a pre-fiscal-year wages JE (dr 6600 125,000p /
+    cr 1000 91,250p / cr 2030 33,750p) whose bank/PAYE effects stay in the
+    all-time balances while the P&L effect predates ``period_start``.
+    Without a prior line the identity is short by exactly 125,000p; with
+    it the numbers reconcile exactly:
+    1,956,750 == 196,750 + 1,000,000 + (−125,000) + 885,000."""
+    entries = [
+        ("capital", "posted", "2025-06-01T09:00:00+00:00", [
+            {"source": "3000", "destination": "1000", "amount": "10000.00", "asset": GBP},
+        ], {}),
+        ("wages_prior", "posted", "2025-08-31T09:00:00+00:00", [
+            {"source": "1000", "destination": "6600", "amount": "912.50", "asset": GBP},
+            {"source": "2030", "destination": "6600", "amount": "337.50", "asset": GBP},
+        ], {}),
+        ("loan", "posted", "2025-09-01T09:00:00+00:00", [
+            {"source": "2100", "destination": "1000", "amount": "1630.00", "asset": GBP},
+        ], {}),
+        ("revenue_in", "posted", "2026-07-01T09:00:00+00:00", [
+            {"source": "4000", "destination": "1100", "amount": "8900.00", "asset": GBP},
+        ], {}),
+        ("expense_in", "posted", "2026-08-01T09:00:00+00:00", [
+            {"source": "1000", "destination": "6000", "amount": "50.00", "asset": GBP},
+        ], {}),
+    ]
+    balances = {
+        "1000": "10667.50",
+        "1100": "8900.00",
+        "2030": "-337.50",
+        "2100": "-1630.00",
+        "3000": "-10000.00",
+        "4000": "-8900.00",
+        "6000": "50.00",
+        "6600": "1250.00",
+    }
+    world = await make_world(monkeypatch, entries=entries, balances=balances)
+    try:
+        report = await generate_bs(
+            world.db,
+            "main",
+            as_at=date(2026, 12, 31),
+            period_start=date(2026, 6, 4),
+        )
+        assert report["identity_ok"] is True
+        assert _retained_line(report) == {
+            "code": "retained_earnings_brought_forward",
+            "name": "Retained earnings brought forward",
+            "amount": -125000,
+        }
+        assert _profit_line(report)["amount"] == 885000
+        assert report["totals"] == {
+            "assets": 1956750,
+            "liabilities": 196750,
+            "equity": 1760000,
+            "liabilities_and_equity": 1956750,
+        }
+    finally:
+        await world.close()
+
+
+async def test_bs_prior_flows_net_revenue_minus_expense(monkeypatch) -> None:
+    """Pre-window flows net into the retained line: +50,000p revenue −
+    20,000p expense → prior 30,000p; the identity holds with the bank
+    carrying the net effect."""
+    entries = [
+        ("rev_prior", "posted", "2025-05-01T09:00:00+00:00", [
+            {"source": "4000", "destination": "1000", "amount": "500.00", "asset": GBP},
+        ], {}),
+        ("exp_prior", "posted", "2025-06-01T09:00:00+00:00", [
+            {"source": "1000", "destination": "6000", "amount": "200.00", "asset": GBP},
+        ], {}),
+    ]
+    balances = {"1000": "300.00", "4000": "-500.00", "6000": "200.00"}
+    world = await make_world(monkeypatch, entries=entries, balances=balances)
+    try:
+        report = await generate_bs(
+            world.db,
+            "main",
+            as_at=date(2026, 12, 31),
+            period_start=date(2026, 6, 4),
+        )
+        assert report["identity_ok"] is True
+        assert _retained_line(report)["amount"] == 30000
+        assert _profit_line(report)["amount"] == 0
+        assert report["totals"] == {
+            "assets": 30000,
+            "liabilities": 0,
+            "equity": 30000,
+            "liabilities_and_equity": 30000,
+        }
+    finally:
+        await world.close()
+
+
+async def test_bs_no_prior_flows_zero_line_still_present(monkeypatch) -> None:
+    """No pre-window flows: the retained line is present at zero (the
+    window is set) and the identity is unchanged."""
+    entries = [
+        ("sale", "posted", "2026-07-01T09:00:00+00:00", [_sale_posting("10.00")], {}),
+    ]
+    balances = {"1100": "10.00", "4000": "-10.00"}
+    world = await make_world(monkeypatch, entries=entries, balances=balances)
+    try:
+        report = await generate_bs(
+            world.db,
+            "main",
+            as_at=date(2026, 12, 31),
+            period_start=date(2026, 6, 4),
+        )
+        assert report["identity_ok"] is True
+        assert _retained_line(report) == {
+            "code": "retained_earnings_brought_forward",
+            "name": "Retained earnings brought forward",
+            "amount": 0,
+        }
+        assert _profit_line(report)["amount"] == 1000
+        assert report["totals"]["equity"] == 1000
+    finally:
+        await world.close()
+
+
+async def test_bs_period_start_none_keeps_legacy_identity(monkeypatch) -> None:
+    """Legacy inception semantics: with no ``period_start`` there is NO
+    retained line and the identity stays
+    assets == liabilities + equity + current_profit."""
+    entries = [
+        ("capital", "posted", "2026-01-05T09:00:00+00:00", [
+            {"source": "3000", "destination": "1000", "amount": "1000.00", "asset": GBP},
+        ], {}),
+        ("expense", "posted", "2026-02-01T09:00:00+00:00", [
+            {"source": "1000", "destination": "6000", "amount": "50.00", "asset": GBP},
+        ], {}),
+    ]
+    balances = {"1000": "950.00", "3000": "-1000.00"}
+    world = await make_world(monkeypatch, entries=entries, balances=balances)
+    try:
+        report = await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
+        assert report["identity_ok"] is True
+        assert all(
+            line["code"] != "retained_earnings_brought_forward"
+            for line in report["sections"]["equity"]
+        )
+        assert _profit_line(report)["amount"] == -5000
+        assert report["totals"] == {
+            "assets": 95000,
+            "liabilities": 0,
+            "equity": 95000,
+            "liabilities_and_equity": 95000,
+        }
+    finally:
+        await world.close()
+
+
+async def test_bs_boundary_timestamp_at_period_start_is_current(monkeypatch) -> None:
+    """A tx timestamped EXACTLY at ``period_start`` belongs to the CURRENT
+    window (inclusive start), never the prior window."""
+    entries = [
+        ("expense_at_start", "posted", "2026-06-04T00:00:00+00:00", [
+            {"source": "1000", "destination": "6000", "amount": "50.00", "asset": GBP},
+        ], {}),
+    ]
+    balances = {"1000": "-50.00", "6000": "50.00"}
+    world = await make_world(monkeypatch, entries=entries, balances=balances)
+    try:
+        report = await generate_bs(
+            world.db,
+            "main",
+            as_at=date(2026, 12, 31),
+            period_start=date(2026, 6, 4),
+        )
+        assert report["identity_ok"] is True
+        assert _retained_line(report)["amount"] == 0
+        assert _profit_line(report)["amount"] == -5000
     finally:
         await world.close()
 
