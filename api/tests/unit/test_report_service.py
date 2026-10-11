@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -501,6 +502,353 @@ class TestRunBS:
         assert result.equity.subtotal == 30_000_00
         assert result.total_liabilities_and_equity == 70_000_00
         assert result.balanced is True
+
+
+# ---------------------------------------------------------------------------
+# Balance Sheet — Contract F41: retained earnings brought forward
+# (flow-derived pre-fiscal-window P&L net as a synthetic equity line)
+# ---------------------------------------------------------------------------
+
+
+class TestRunBSRetainedEarnings:
+    """run_bs gains the pre-fiscal-year retained-earnings line when
+    ``entity_id`` is set; None keeps the legacy shape."""
+
+    @staticmethod
+    def _db_with(
+        transactions: list[Transaction],
+        entity_id=None,
+        fiscal_year_start: str = "04-06",
+    ) -> AsyncMock:
+        db = AsyncMock()
+        db.execute = AsyncMock(return_value=_mock_result(transactions))
+        db.commit = AsyncMock()
+        db.refresh = AsyncMock(side_effect=_make_refresh())
+        if entity_id is not None:
+            db.get = AsyncMock(
+                return_value=SimpleNamespace(fiscal_year_start=fiscal_year_start)
+            )
+        return db
+
+    @staticmethod
+    def _bs_request(as_of: date, entity_id=None) -> ReportRunRequest:
+        return ReportRunRequest(
+            template_name="balance_sheet",
+            start_date=as_of,
+            end_date=as_of,
+            entity_id=entity_id,
+        )
+
+    @staticmethod
+    def _retained_line(result) -> object:
+        return next(
+            line
+            for line in result.equity.accounts
+            if line.account_code == "retained_earnings_brought_forward"
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_regression_share_capital_plus_pre_fy_wages(self):
+        """The live numbers: share capital £10,000 + the pre-fiscal-year
+        wages JE (dr 6600 125,000p / cr 1000 91,250p / cr 2030 33,750p,
+        dated 2025-08-31) with fiscal 6-April and as-at 2026-10-11 →
+        equity subtotal 875,000p and retained −125,000p."""
+        entity_id = uuid.uuid4()
+        capital = _make_account(
+            id=uuid.uuid4(),
+            code="3000",
+            name="Share Capital",
+            category="Equity",
+            type="Equity",
+        )
+        bank = _make_account(
+            id=uuid.uuid4(),
+            code="1000",
+            name="Bank",
+            category="Asset",
+            type="Bank",
+        )
+        wages = _make_account(
+            id=uuid.uuid4(),
+            code="6600",
+            name="Wages",
+            category="Expense",
+            type="Expense",
+        )
+        paye = _make_account(
+            id=uuid.uuid4(),
+            code="2030",
+            name="PAYE/NIC",
+            category="Liability",
+            type="CurrentLiability",
+        )
+
+        capital_txn = _make_transaction(
+            uuid.uuid4(),
+            [
+                _make_posting(uuid.uuid4(), bank, debit=1_000_000, credit=0),
+                _make_posting(uuid.uuid4(), capital, debit=0, credit=1_000_000),
+            ],
+            effective_date=date(2025, 6, 1),
+        )
+        wages_txn = _make_transaction(
+            uuid.uuid4(),
+            [
+                _make_posting(uuid.uuid4(), wages, debit=125_000, credit=0),
+                _make_posting(uuid.uuid4(), bank, debit=0, credit=91_250),
+                _make_posting(uuid.uuid4(), paye, debit=0, credit=33_750),
+            ],
+            effective_date=date(2025, 8, 31),
+        )
+
+        db = self._db_with([capital_txn, wages_txn], entity_id=entity_id)
+        result = await ReportService.run_bs(
+            db, self._bs_request(date(2026, 10, 11), entity_id), entity_id=entity_id
+        )
+
+        retained = self._retained_line(result)
+        assert retained.amount == -125_000
+        assert retained.account_name == "Retained earnings brought forward"
+        assert result.equity.subtotal == 875_000
+        assert result.total_equity == 875_000
+        assert result.total_assets == 908_750
+        assert result.total_liabilities == 33_750
+        assert result.total_liabilities_and_equity == 908_750
+        assert result.balanced is True
+
+    @pytest.mark.asyncio
+    async def test_pre_fy_revenue_nets_against_pre_fy_expense(self):
+        """Pre-fiscal-window revenue nets against pre-fiscal-window
+        expense: +100,000p − 40,000p → retained 60,000p."""
+        entity_id = uuid.uuid4()
+        bank = _make_account(
+            id=uuid.uuid4(),
+            code="1000",
+            name="Bank",
+            category="Asset",
+            type="Bank",
+        )
+        revenue = _make_account(
+            id=uuid.uuid4(),
+            code="4000",
+            name="Sales",
+            category="Revenue",
+            type="Revenue",
+        )
+        expense = _make_account(
+            id=uuid.uuid4(),
+            code="6000",
+            name="Rent",
+            category="Expense",
+            type="Expense",
+        )
+
+        rev_txn = _make_transaction(
+            uuid.uuid4(),
+            [
+                _make_posting(uuid.uuid4(), bank, debit=100_000, credit=0),
+                _make_posting(uuid.uuid4(), revenue, debit=0, credit=100_000),
+            ],
+            effective_date=date(2025, 9, 30),
+        )
+        exp_txn = _make_transaction(
+            uuid.uuid4(),
+            [
+                _make_posting(uuid.uuid4(), expense, debit=40_000, credit=0),
+                _make_posting(uuid.uuid4(), bank, debit=0, credit=40_000),
+            ],
+            effective_date=date(2025, 10, 15),
+        )
+
+        db = self._db_with([rev_txn, exp_txn], entity_id=entity_id)
+        result = await ReportService.run_bs(
+            db, self._bs_request(date(2026, 10, 11), entity_id), entity_id=entity_id
+        )
+
+        assert self._retained_line(result).amount == 60_000
+        assert result.equity.subtotal == 60_000
+        assert result.total_equity == 60_000
+
+    @pytest.mark.asyncio
+    async def test_no_pre_fy_flows_zero_line_present(self):
+        """No pre-fiscal-window flows: the retained line is present at
+        zero and the equity subtotal is unchanged."""
+        entity_id = uuid.uuid4()
+        capital = _make_account(
+            id=uuid.uuid4(),
+            code="3000",
+            name="Share Capital",
+            category="Equity",
+            type="Equity",
+        )
+        bank = _make_account(
+            id=uuid.uuid4(),
+            code="1000",
+            name="Bank",
+            category="Asset",
+            type="Bank",
+        )
+
+        txn = _make_transaction(
+            uuid.uuid4(),
+            [
+                _make_posting(uuid.uuid4(), bank, debit=1_000_000, credit=0),
+                _make_posting(uuid.uuid4(), capital, debit=0, credit=1_000_000),
+            ],
+            effective_date=date(2026, 6, 1),
+        )
+
+        db = self._db_with([txn], entity_id=entity_id)
+        result = await ReportService.run_bs(
+            db, self._bs_request(date(2026, 10, 11), entity_id), entity_id=entity_id
+        )
+
+        assert self._retained_line(result).amount == 0
+        assert result.equity.subtotal == 1_000_000
+        assert result.total_equity == 1_000_000
+
+    @pytest.mark.asyncio
+    async def test_boundary_at_fiscal_start_is_current_year(self):
+        """A transaction exactly at the fiscal start belongs to the
+        CURRENT year — it never lands in retained earnings."""
+        entity_id = uuid.uuid4()
+        wages = _make_account(
+            id=uuid.uuid4(),
+            code="6600",
+            name="Wages",
+            category="Expense",
+            type="Expense",
+        )
+        bank = _make_account(
+            id=uuid.uuid4(),
+            code="1000",
+            name="Bank",
+            category="Asset",
+            type="Bank",
+        )
+
+        boundary_txn = _make_transaction(
+            uuid.uuid4(),
+            [
+                _make_posting(uuid.uuid4(), wages, debit=125_000, credit=0),
+                _make_posting(uuid.uuid4(), bank, debit=0, credit=125_000),
+            ],
+            effective_date=date(2026, 4, 6),
+        )
+        prior_txn = _make_transaction(
+            uuid.uuid4(),
+            [
+                _make_posting(uuid.uuid4(), wages, debit=25_000, credit=0),
+                _make_posting(uuid.uuid4(), bank, debit=0, credit=25_000),
+            ],
+            effective_date=date(2026, 4, 5),
+        )
+
+        db = self._db_with([boundary_txn, prior_txn], entity_id=entity_id)
+        result = await ReportService.run_bs(
+            db, self._bs_request(date(2026, 10, 11), entity_id), entity_id=entity_id
+        )
+
+        assert self._retained_line(result).amount == -25_000
+        assert result.equity.subtotal == -25_000
+
+    @pytest.mark.asyncio
+    async def test_entity_fiscal_year_start_is_honored(self):
+        """The entity's OWN fiscal year start (not the UK default) bounds
+        the retained window: fiscal 1-January keeps a 2025-12-31 expense
+        in the prior window even though it would be inside a 6-April
+        fiscal year."""
+        entity_id = uuid.uuid4()
+        wages = _make_account(
+            id=uuid.uuid4(),
+            code="6600",
+            name="Wages",
+            category="Expense",
+            type="Expense",
+        )
+        bank = _make_account(
+            id=uuid.uuid4(),
+            code="1000",
+            name="Bank",
+            category="Asset",
+            type="Bank",
+        )
+
+        txn = _make_transaction(
+            uuid.uuid4(),
+            [
+                _make_posting(uuid.uuid4(), wages, debit=40_000, credit=0),
+                _make_posting(uuid.uuid4(), bank, debit=0, credit=40_000),
+            ],
+            effective_date=date(2025, 12, 31),
+        )
+
+        db = self._db_with(
+            [txn], entity_id=entity_id, fiscal_year_start="01-01"
+        )
+        result = await ReportService.run_bs(
+            db, self._bs_request(date(2026, 10, 11), entity_id), entity_id=entity_id
+        )
+
+        assert self._retained_line(result).amount == -40_000
+        assert result.equity.subtotal == -40_000
+
+    @pytest.mark.asyncio
+    async def test_entity_none_keeps_legacy_shape(self):
+        """entity_id=None keeps the legacy behaviour: NO retained line and
+        the equity subtotal is the equity accounts only — even when
+        pre-window P&L flows exist."""
+        capital = _make_account(
+            id=uuid.uuid4(),
+            code="3000",
+            name="Share Capital",
+            category="Equity",
+            type="Equity",
+        )
+        wages = _make_account(
+            id=uuid.uuid4(),
+            code="6600",
+            name="Wages",
+            category="Expense",
+            type="Expense",
+        )
+        bank = _make_account(
+            id=uuid.uuid4(),
+            code="1000",
+            name="Bank",
+            category="Asset",
+            type="Bank",
+        )
+
+        capital_txn = _make_transaction(
+            uuid.uuid4(),
+            [
+                _make_posting(uuid.uuid4(), bank, debit=1_000_000, credit=0),
+                _make_posting(uuid.uuid4(), capital, debit=0, credit=1_000_000),
+            ],
+            effective_date=date(2025, 6, 1),
+        )
+        wages_txn = _make_transaction(
+            uuid.uuid4(),
+            [
+                _make_posting(uuid.uuid4(), wages, debit=125_000, credit=0),
+                _make_posting(uuid.uuid4(), bank, debit=0, credit=125_000),
+            ],
+            effective_date=date(2025, 8, 31),
+        )
+
+        db = self._db_with([capital_txn, wages_txn])
+        result = await ReportService.run_bs(
+            db, self._bs_request(date(2026, 10, 11))
+        )
+
+        assert all(
+            line.account_code != "retained_earnings_brought_forward"
+            for line in result.equity.accounts
+        )
+        assert result.equity.subtotal == 1_000_000
+        assert result.total_equity == 1_000_000
+        db.get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

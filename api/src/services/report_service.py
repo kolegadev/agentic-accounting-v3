@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.models.account import Account
+from src.models.entity import Entity
 from src.models.invoice import Invoice
 from src.models.report import ReportTemplate, ScheduledReport
 from src.models.transaction import Posting, Transaction
@@ -106,6 +107,13 @@ def _schedule_to_response(sched: ScheduledReport) -> ScheduledReportResponse:
 def _now() -> datetime:
     """Return current UTC datetime."""
     return datetime.now(timezone.utc)
+
+
+# Contract F41 — synthetic equity line carrying the pre-fiscal-year
+# retained earnings (flow-derived; there is no real account behind it).
+_RETAINED_EARNINGS_ACCOUNT_ID = uuid.UUID("00000000-0000-0000-0000-00000000f041")
+_RETAINED_EARNINGS_ACCOUNT_CODE = "retained_earnings_brought_forward"
+_RETAINED_EARNINGS_ACCOUNT_NAME = "Retained earnings brought forward"
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +290,86 @@ class ReportService:
             accounts[aid]["debit_total"] += p.debit_amount
             accounts[aid]["credit_total"] += p.credit_amount
         return accounts
+
+    # ------------------------------------------------------------------
+    # Contract F41 — prior-period P&L net (retained earnings brought forward)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _prior_period_pl_net(
+        db: AsyncSession,
+        as_of_date: date,
+        entity_id: Optional[uuid.UUID],
+        transactions: list[Transaction],
+    ) -> int:
+        """P&L net of posted transactions STRICTLY BEFORE the entity's
+        current fiscal window (Contract F41).
+
+        The window start is the most recent occurrence of the entity's
+        ``fiscal_year_start`` (MM-DD) on or before ``as_of_date``, with the
+        UK 6-April fallback when the entity has none or the lookup fails —
+        the same rule the Formance route's ``_entity_fiscal_start`` uses.
+        The prior window ends the day BEFORE the fiscal start, so a
+        transaction dated exactly at the fiscal start belongs to the
+        CURRENT year and is excluded.
+
+        ``entity_id=None`` keeps the legacy behaviour: no retained line (0).
+        ``transactions`` is the balance-scoped result ``run_bs`` already
+        loaded (posted, ``effective_date <= as_of_date``, entity-scoped);
+        the prior window is a strict subset of it, so no second query is
+        needed.
+
+        Classification and sign convention are the SAME as ``run_pl``:
+        revenue = credit − debit, direct costs / expenses = debit − credit,
+        net = revenue − direct costs − expenses (credit-positive profit).
+        """
+        if entity_id is None:
+            return 0
+
+        fiscal_year_start = "04-06"
+        try:
+            entity = await db.get(Entity, entity_id)
+        except Exception:  # noqa: BLE001 — resolution is best-effort
+            entity = None
+        if (
+            entity is not None
+            and isinstance(entity.fiscal_year_start, str)
+            and entity.fiscal_year_start
+        ):
+            fiscal_year_start = entity.fiscal_year_start
+
+        try:
+            month, day = (int(part) for part in fiscal_year_start.split("-"))
+            window_start = date(as_of_date.year, month, day)
+            if window_start > as_of_date:
+                window_start = date(as_of_date.year - 1, month, day)
+        except (TypeError, ValueError, AttributeError):
+            window_start = date(as_of_date.year, 4, 6)
+            if window_start > as_of_date:
+                window_start = date(as_of_date.year - 1, 4, 6)
+
+        prior_end = window_start - timedelta(days=1)
+
+        revenue = 0
+        direct_costs = 0
+        expenses = 0
+        for txn in transactions:
+            if txn.effective_date is None or txn.effective_date > prior_end:
+                continue
+            for posting in txn.postings:
+                if posting.account is None:
+                    continue
+                category = posting.account.category
+                if category == "Revenue":
+                    revenue += posting.credit_amount - posting.debit_amount
+                elif category == "Expense":
+                    if posting.account.type == "DirectCost":
+                        direct_costs += (
+                            posting.debit_amount - posting.credit_amount
+                        )
+                    else:
+                        expenses += posting.debit_amount - posting.credit_amount
+        return revenue - direct_costs - expenses
 
     # ------------------------------------------------------------------
     # run_pl — Profit & Loss
@@ -617,6 +705,22 @@ class ReportService:
                 amount=_net_balance(info, is_asset=False),
             ))
         eq_total = sum(l.amount for l in eq_lines)
+
+        # Contract F41: the pre-fiscal-window P&L net becomes a synthetic
+        # retained-earnings equity line so the Postgres equity matches the
+        # engine's ``retained_earnings_brought_forward``. entity_id=None
+        # keeps the legacy shape (no line, retained 0).
+        retained_pence = await ReportService._prior_period_pl_net(
+            db, as_of_date, entity_id, transactions
+        )
+        if entity_id is not None:
+            eq_lines.append(BSAccountLine(
+                account_id=_RETAINED_EARNINGS_ACCOUNT_ID,
+                account_code=_RETAINED_EARNINGS_ACCOUNT_CODE,
+                account_name=_RETAINED_EARNINGS_ACCOUNT_NAME,
+                amount=retained_pence,
+            ))
+            eq_total += retained_pence
 
         equity = BSSection(
             section_name="Equity",

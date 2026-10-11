@@ -27,13 +27,14 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from sqlalchemy import event, select, text
+from sqlalchemy import event, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from src.config.database import Base
 from src.models.account import Account
+from src.models.entity import Entity
 from src.models.transaction import Posting, Transaction
 from src.services import formance_reports as fr
 from src.services.formance_reports import (
@@ -108,6 +109,25 @@ _SQLITE_SCHEMA = [
         vat_amount INTEGER NOT NULL,
         net_amount INTEGER NOT NULL,
         vat_type VARCHAR(6) NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS entities (
+        id CHAR(36) PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
+        name VARCHAR(255) NOT NULL,
+        legal_type VARCHAR(30) NOT NULL DEFAULT 'limited_company',
+        framework VARCHAR(20) NOT NULL DEFAULT 'uk-gaap',
+        fiscal_year_start VARCHAR(5) NOT NULL DEFAULT '04-06',
+        vat_registered BOOLEAN NOT NULL DEFAULT 0,
+        vat_number VARCHAR(20),
+        vat_scheme VARCHAR(10),
+        currency VARCHAR(3) NOT NULL DEFAULT 'GBP',
+        ledger_name VARCHAR(64) NOT NULL,
+        setup_state VARCHAR(16) NOT NULL DEFAULT 'none',
+        created_by CHAR(36) NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
 ]
@@ -1869,6 +1889,100 @@ async def test_verify_against_postgres_null_scope_keeps_legacy_engine(monkeypatc
     run_tb.assert_awaited_once()
     assert run_tb.await_args.kwargs["entity_id"] is None
     assert run_tb.await_args.args[1].entity_id is None
+
+
+async def test_verify_bs_retained_earnings_brought_forward_reconciliation(
+    monkeypatch,
+) -> None:
+    """Contract F41: on the live regression fixture the balance-sheet
+    cross-check returns [] — the Postgres ``run_bs`` gains the flow-derived
+    retained-earnings line, so engine equity (accounts + retained) matches
+    ``pg.equity.subtotal`` (875,000p) exactly."""
+    entries = [
+        ("capital", "posted", "2025-06-01T09:00:00+00:00", [
+            {"source": "3000", "destination": "1000", "amount": "10000.00", "asset": GBP},
+        ], {}),
+        ("wages_prior", "posted", "2025-08-31T09:00:00+00:00", [
+            {"source": "1000", "destination": "6600", "amount": "912.50", "asset": GBP},
+            {"source": "2030", "destination": "6600", "amount": "337.50", "asset": GBP},
+        ], {}),
+    ]
+    balances = {
+        "1000": "9087.50",
+        "2030": "-337.50",
+        "3000": "-10000.00",
+        "6600": "1250.00",
+    }
+    world = await make_world(monkeypatch, entries=entries, balances=balances)
+    try:
+        now = datetime.now(UTC)
+        entity = Entity(
+            id=uuid.uuid4(),
+            name="Test Holdings Ltd",
+            legal_type="limited_company",
+            framework="uk-gaap",
+            fiscal_year_start="04-06",
+            vat_registered=False,
+            currency="GBP",
+            ledger_name="entity-test-holdings",
+            setup_state="complete",
+            created_by=uuid.uuid4(),
+            is_active=True,
+            created_at=now,
+            updated_at=now,
+        )
+        world.db.add(entity)
+        result = await world.db.execute(select(Account))
+        accounts = {a.code: a for a in result.scalars().all()}
+        effective_dates = {
+            "capital": date(2025, 6, 1),
+            "wages_prior": date(2025, 8, 31),
+        }
+        postings_by_key = {key: postings for key, _, _, postings, _ in entries}
+        # Scope the rows to the entity and stamp the real effective dates
+        # via Core UPDATE (never an ORM load — loading Transaction here
+        # would eagerly fetch its empty ``postings`` collection into the
+        # identity map and starve ``ReportService``'s later selectinload).
+        for key in ("capital", "wages_prior"):
+            await world.db.execute(
+                update(Transaction)
+                .where(Transaction.id == world.ids[key])
+                .values(
+                    entity_id=entity.id,
+                    effective_date=effective_dates[key],
+                )
+            )
+        for key, _, _, postings, _ in entries:
+            txid = world.ids[key]
+            for posting in postings:
+                amount = int(Decimal(posting["amount"]) * 100)
+                world.db.add(Posting(
+                    transaction_id=txid,
+                    account_id=accounts[posting["destination"]].id,
+                    debit_amount=amount,
+                    credit_amount=0,
+                ))
+                world.db.add(Posting(
+                    transaction_id=txid,
+                    account_id=accounts[posting["source"]].id,
+                    debit_amount=0,
+                    credit_amount=amount,
+                ))
+        await world.db.commit()
+
+        report = await generate_bs(
+            world.db,
+            "main",
+            as_at=date(2026, 10, 11),
+            period_start=date(2026, 4, 6),
+        )
+        assert report["identity_ok"] is True
+        assert _retained_line(report)["amount"] == -125000
+        assert await verify_against_postgres(
+            world.db, report, "bs", entity_id=entity.id
+        ) == []
+    finally:
+        await world.close()
 
 
 # ---------------------------------------------------------------------------
