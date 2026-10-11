@@ -232,6 +232,42 @@ class FormanceClient:
             "data": data,
         }
 
+    async def list_account_transactions(
+        self,
+        ledger: str,
+        address: str,
+        page_size: int = 1,
+    ) -> dict[str, Any]:
+        """List one account's transactions (normalised, like list_transactions).
+
+        Contract F39 — the delete guard asks for a single page
+        (``page_size=1``) to detect ANY Formance posting for an account
+        code.  Same wire convention as ``list_transactions``:
+        ``GET {base}/{ledger}/accounts/{address}/transactions``.
+        """
+        params: dict[str, Any] = {"pageSize": page_size}
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{self.base_url}/{ledger}/accounts/{address}/transactions",
+                params=params,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+
+        cursor, rows = _cursor_data(payload)
+        data = [
+            _normalise_transaction(row) for row in rows if isinstance(row, dict)
+        ]
+        return {
+            "cursor": {
+                "hasMore": bool(cursor.get("hasMore")),
+                "next": cursor.get("next"),
+                "pageSize": cursor.get("pageSize", page_size),
+            },
+            "data": data,
+        }
+
     async def get_balances(
         self, ledger: str, address: Optional[str] = None
     ) -> dict[str, Any]:

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import uuid
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.database import get_db
 from src.services.coa_service import (
+    AccountInUseError,
     AccountNotFoundError,
     CoaService,
     DuplicateCodeError,
@@ -37,10 +39,17 @@ router = APIRouter(prefix="/api/v1/coa", tags=["Chart of Accounts"])
 )
 async def list_accounts(
     include_inactive: bool = False,
+    entity_id: Optional[uuid.UUID] = None,
     db: AsyncSession = Depends(get_db),
 ) -> AccountListResponse:
-    """Return all active accounts, or all accounts if include_inactive=true."""
-    accounts = await CoaService.list_accounts(db, include_inactive=include_inactive)
+    """Return all active accounts, or all accounts if include_inactive=true.
+
+    ``entity_id`` (Contract F39, from the chat-ui proxy) scopes the listing
+    to one entity's COA; ``None`` keeps the legacy global listing.
+    """
+    accounts = await CoaService.list_accounts(
+        db, include_inactive=include_inactive, entity_id=entity_id
+    )
     return AccountListResponse(accounts=accounts, total=len(accounts))
 
 
@@ -77,11 +86,16 @@ async def get_account(
 )
 async def create_account(
     data: AccountCreate,
+    entity_id: Optional[uuid.UUID] = None,
     db: AsyncSession = Depends(get_db),
 ) -> AccountResponse:
-    """Create a new account. Code must be unique and in valid range for category."""
+    """Create a new account. Code must be unique and in valid range for category.
+
+    ``entity_id`` (Contract F39, from the chat-ui proxy) stamps the new
+    account with the entity scope; ``None`` keeps the legacy global stamp.
+    """
     try:
-        return await CoaService.create_account(db, data)
+        return await CoaService.create_account(db, data, entity_id=entity_id)
     except DuplicateCodeError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
     except InvalidCodeRangeError as exc:
@@ -120,16 +134,25 @@ async def update_account(
     response_model=AccountResponse,
     summary="Soft-delete an account",
     status_code=status.HTTP_200_OK,
-    responses={404: {"description": "Account not found"}},
+    responses={
+        404: {"description": "Account not found"},
+        409: {"description": "Account has transactions and cannot be deleted"},
+    },
 )
 async def soft_delete_account(
     account_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ) -> AccountResponse:
-    """Soft-delete an account by setting is_active=False."""
+    """Soft-delete an account by setting is_active=False.
+
+    Contract F39 — refused with 409 when the account has ANY transactions
+    (Postgres or Formance).
+    """
     try:
         return await CoaService.soft_delete_account(db, account_id)
     except AccountNotFoundError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    except AccountInUseError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
 

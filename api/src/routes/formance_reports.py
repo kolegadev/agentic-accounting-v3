@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import date
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.encoders import jsonable_encoder
@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.database import get_db
+from src.services.coa_service import CoaService
 from src.services.entity_service import (
     AmbiguousEntityError,
     EntityNotFoundError,
@@ -35,6 +36,7 @@ from src.services.entity_service import (
     require_active_entity,
     resolve_entity_scope,
 )
+from src.services.formance_client import formance_client
 from src.services.formance_reports import (
     ReportEngineError,
     generate_ap_aging,
@@ -46,6 +48,7 @@ from src.services.formance_reports import (
     generate_tb,
     verify_against_postgres,
 )
+from src.services.transaction_service import TransactionService
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +60,10 @@ BALANCE_TYPES = ("balance-sheet", "trial-balance")
 # Contract F37 — aging reports are LEDGER-DERIVED (the F9 engine's
 # generate_ar_aging / generate_ap_aging); as_at only, like balance types.
 AGING_TYPES = ("aged-receivables", "aged-payables")
-VALID_REPORT_TYPES = FLOW_TYPES + BALANCE_TYPES + AGING_TYPES
+# Contract F39 — the Chart of Accounts report joins the Postgres COA with
+# Formance balances and a per-account "used" flag (not engine-derived).
+COA_TYPES = ("chart-of-accounts",)
+VALID_REPORT_TYPES = FLOW_TYPES + BALANCE_TYPES + AGING_TYPES + COA_TYPES
 
 NO_POSTGRES_NOTE = "no Postgres equivalent"
 
@@ -65,6 +71,11 @@ AGING_CROSS_CHECK_NOTE = (
     "aging is ledger-derived (the same posted ledger the Balance Sheet "
     "reads) and reconciles to the trial-balance balance by construction — "
     "there is no separate Postgres equivalent to diff against"
+)
+
+COA_CROSS_CHECK_NOTE = (
+    "CoA rows are the Postgres source of record; balances are read from "
+    "the Formance ledger."
 )
 
 
@@ -182,6 +193,105 @@ async def _run_aging_report(
     )
 
 
+async def _run_coa_report(
+    db: AsyncSession,
+    scope_id: Optional[uuid.UUID],
+    ledger: str,
+    as_at: Optional[date],
+) -> JSONResponse:
+    """Contract F39 — the Chart of Accounts report.
+
+    The rows are the Postgres COA (active, entity-scoped, ordered by code —
+    the source of record); ``balance``/``balances`` come from the Formance
+    ledger (address == account code, the engine's mapping) and ``used`` is
+    True when the account has ANY transactions (Postgres posted scope OR a
+    Formance posting).  A Formance read failure degrades to empty balances
+    and used=False — the report never crashes because the ledger is down
+    (the same no-crash contract as the sibling reports' missing scope).
+    """
+    as_of = as_at or date.today()
+
+    accounts = await CoaService.list_accounts(db, entity_id=scope_id)
+
+    balance_by_address: dict[str, dict[str, str]] = {}
+    try:
+        raw_balances = await formance_client.get_balances(ledger)
+    except Exception as exc:  # noqa: BLE001 — degrade, never crash
+        logger.warning(
+            "_run_coa_report: Formance balances for ledger '%s' failed (%s); "
+            "serving the report without balances",
+            ledger,
+            exc,
+        )
+        raw_balances = {"data": []}
+    for item in (raw_balances or {}).get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        address = str(item.get("address") or "")
+        balances = item.get("balances")
+        if isinstance(balances, dict):
+            balance_by_address[address] = {
+                str(asset): str(value) for asset, value in balances.items()
+            }
+
+    rows: list[dict[str, Any]] = []
+    for account in accounts:
+        balances = balance_by_address.get(account.code, {})
+        # The engine's asset convention is "GBP/2" (ledger_parity's
+        # DEFAULT_EXPECTED_ASSET); prefer it, fall back to a plain "GBP".
+        balance = balances.get("GBP/2", balances.get("GBP"))
+
+        used = False
+        postgres = await TransactionService.list_for_account(
+            db, account.code, entity_id=scope_id, limit=1
+        )
+        if postgres is not None and postgres.get("items"):
+            used = True
+        else:
+            try:
+                formance = await formance_client.list_account_transactions(
+                    ledger, account.code, page_size=1
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade, never crash
+                logger.warning(
+                    "_run_coa_report: Formance usage check for code '%s' "
+                    "failed (%s); Postgres remains authoritative",
+                    account.code,
+                    exc,
+                )
+                formance = {"data": []}
+            if formance.get("data"):
+                used = True
+
+        rows.append(
+            {
+                "id": str(account.id),
+                "code": account.code,
+                "name": account.name,
+                "category": account.category,
+                "type": account.type,
+                "vat_rate": account.vat_rate,
+                "balance": balance,
+                "balances": balances,
+                "used": used,
+            }
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "report_type": "chart-of-accounts",
+            "as_at": as_of.isoformat(),
+            "report": {"accounts": rows},
+            "cross_check": {
+                "ok": None,
+                "diffs": [],
+                "note": COA_CROSS_CHECK_NOTE,
+            },
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # GET /{report_type} — run the engine + Postgres cross-check
 # ---------------------------------------------------------------------------
@@ -217,11 +327,11 @@ async def formance_report(
     ),
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
-    """Run one of the seven Formance reports and cross-check against Postgres.
+    """Run one of the eight Formance reports and cross-check against Postgres.
 
     pl / cash-flow / funds require period_start + period_end;
-    balance-sheet / trial-balance / aged-receivables / aged-payables take
-    as_at (default: today).  The aging reports are ledger-derived (the F37
+    balance-sheet / trial-balance / aged-receivables / aged-payables /
+    chart-of-accounts take as_at (default: today).  The aging reports are ledger-derived (the F37
     engine generators) and reconcile to the trial-balance debtors /
     creditors balance by construction.
     The balance sheet additionally receives the entity's fiscal-year start
@@ -270,6 +380,12 @@ async def formance_report(
     # aging generators; they never reach the engine dispatch below.
     if report_type in AGING_TYPES:
         return await _run_aging_report(db, report_type, scope_id, ledger, as_at)
+
+    # Contract F39 — the Chart of Accounts report is served straight from
+    # the Postgres COA + the Formance balances; it never reaches the
+    # engine dispatch below.
+    if report_type in COA_TYPES:
+        return await _run_coa_report(db, scope_id, ledger, as_at)
 
     if report_type in FLOW_TYPES and (period_start is None or period_end is None):
         period_end = period_end or date.today()

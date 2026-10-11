@@ -420,6 +420,15 @@
     font-size:12.5px; font-weight:500; cursor:pointer; font-family:inherit;
   }
   .modal-btn-secondary:hover { background:#1f2228; }
+  /* ── Chart of Accounts in-report CRUD (F39) ── */
+  .coa-toolbar { display:flex; justify-content:flex-end; margin-bottom:10px; gap:8px; }
+  .coa-row-btn {
+    background:var(--surface2); border:1px solid var(--border4); color:var(--text2);
+    border-radius:6px; padding:3px 8px; font-size:12px; cursor:pointer; margin-left:4px;
+  }
+  .coa-row-btn:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  .coa-row-btn:disabled { opacity:.4; cursor:not-allowed; }
+  .coa-actions { white-space:nowrap; }
   .settings-form label {
     font-size:12px; color:var(--text-dim3); display:block;
     margin-bottom:4px; text-transform:uppercase; letter-spacing:.5px;
@@ -677,6 +686,7 @@
           <option value="pl">Profit &amp; Loss</option>
           <option value="balance-sheet">Balance Sheet</option>
           <option value="trial-balance">Trial Balance</option>
+          <option value="chart-of-accounts">Chart of Accounts</option>
           <option value="aged-receivables">Aged Receivables</option>
           <option value="aged-payables">Aged Payables</option>
           <option value="cash-flow">Cash Flow</option>
@@ -891,6 +901,86 @@
       <div id="account-modal-body"><div class="report-empty">Loading…</div></div>
       <div class="modal-btn-row" style="justify-content:flex-end">
         <button class="modal-btn-secondary" onclick="closeAccount()">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ ADD ACCOUNT MODAL (F39) ═══════════ -->
+<div class="modal-overlay" id="coa-add-overlay" onclick="closeCoaAdd()">
+  <div class="modal-panel" style="width:90%;max-width:440px" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2 style="font-size:18px;color:var(--accent);margin:0">Add account</h2>
+      <button class="modal-close" onclick="closeCoaAdd()">✕</button>
+    </div>
+    <div class="modal-body admin-form">
+      <div>
+        <label>Code (4 digits)</label>
+        <input type="text" id="coa-add-code" class="admin-input" maxlength="10" placeholder="e.g. 5210" />
+      </div>
+      <div>
+        <label>Name</label>
+        <input type="text" id="coa-add-name" class="admin-input" maxlength="255" placeholder="Account name" />
+      </div>
+      <div>
+        <label>Category</label>
+        <select id="coa-add-category" class="admin-select">
+          <option value="Asset">Asset</option>
+          <option value="Liability">Liability</option>
+          <option value="Equity">Equity</option>
+          <option value="Revenue">Revenue</option>
+          <option value="Expense">Expense</option>
+        </select>
+      </div>
+      <div>
+        <label>Type</label>
+        <select id="coa-add-type" class="admin-select">
+          <option value="Bank">Bank</option>
+          <option value="CurrentAsset">Current Asset</option>
+          <option value="FixedAsset">Fixed Asset</option>
+          <option value="CurrentLiability">Current Liability</option>
+          <option value="LongTermLiability">Long-Term Liability</option>
+          <option value="Equity">Equity</option>
+          <option value="Revenue">Revenue</option>
+          <option value="DirectCost">Direct Cost</option>
+          <option value="Expense">Expense</option>
+        </select>
+      </div>
+      <div>
+        <label>VAT rate (optional)</label>
+        <select id="coa-add-vat" class="admin-select">
+          <option value="">—</option>
+          <option value="20%">20%</option>
+          <option value="5%">5%</option>
+          <option value="0%">0%</option>
+          <option value="exempt">exempt</option>
+        </select>
+      </div>
+      <div class="admin-error" id="coa-add-error"></div>
+      <div class="modal-btn-row" style="justify-content:flex-end">
+        <button class="modal-btn-secondary" onclick="closeCoaAdd()" style="flex:none">Cancel</button>
+        <button class="modal-btn-primary" id="coa-add-submit" onclick="submitCoaAdd()" style="flex:none">Add account</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ RENAME ACCOUNT MODAL (F39) ═══════════ -->
+<div class="modal-overlay" id="coa-rename-overlay" onclick="closeCoaRename()">
+  <div class="modal-panel" style="width:90%;max-width:440px" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2 style="font-size:18px;color:var(--accent);margin:0">Rename account <span id="coa-rename-code" style="color:var(--text-dim3);font-size:13px"></span></h2>
+      <button class="modal-close" onclick="closeCoaRename()">✕</button>
+    </div>
+    <div class="modal-body admin-form">
+      <div>
+        <label>Name</label>
+        <input type="text" id="coa-rename-name" class="admin-input" maxlength="255" placeholder="Account name" />
+      </div>
+      <div class="admin-error" id="coa-rename-error"></div>
+      <div class="modal-btn-row" style="justify-content:flex-end">
+        <button class="modal-btn-secondary" onclick="closeCoaRename()" style="flex:none">Cancel</button>
+        <button class="modal-btn-primary" onclick="submitCoaRename()" style="flex:none">Save</button>
       </div>
     </div>
   </div>
@@ -1829,6 +1919,14 @@ function renderFormanceReport(data) {
       '<td class="num">' + fmtMoney(r.total_debits) + '</td>' +
       '<td class="num">' + fmtMoney(r.total_credits) + '</td></tr>' +
       '</tbody></table>';
+  } else if (type === 'chart-of-accounts') {
+    // F39: the Postgres CoA joined with Formance balances + a "used" flag;
+    // add / rename / delete actions, delete disabled when used.
+    html += '<div class="coa-toolbar">' +
+      '<button class="modal-btn-primary" onclick="openCoaAdd()" style="padding:7px 12px;flex:none">+ Add account</button>' +
+      '</div>';
+    html += renderCoaTable(r.accounts || []);
+    if (!(r.accounts || []).length) html += '<div class="report-empty">No accounts in the Chart of Accounts.</div>';
   } else if (type === 'aged-receivables' || type === 'aged-payables') {
     // F37: ledger-derived aging — items, buckets, total, and the
     // reconciliation badge against the Balance Sheet.
@@ -1953,6 +2051,162 @@ document.getElementById('report-period-start').value = new Date().getFullYear() 
 document.getElementById('report-period-end').value = defaultIsoDate();
 document.getElementById('report-as-at').value = defaultIsoDate();
 reportDateFields();
+
+// ═══════════════════════════════════════════
+//  CHART OF ACCOUNTS IN-REPORT CRUD (F39)
+//  Add / rename / delete from the Chart of Accounts report.  Delete is
+//  refused by the API (409) whenever the account has transactions —
+//  Postgres or Formance — so the row button is already disabled when the
+//  report's "used" flag is set.  Every value passes through esc()/textContent
+//  before it reaches the DOM, and every successful mutation re-fetches the
+//  report.
+// ═══════════════════════════════════════════
+var _coaRows = {};
+var _coaRenameId = null;
+
+function coaBalanceCell(b) {
+  if (b === null || b === undefined || b === '') return '<td class="num"></td>';
+  var n = Number(b);
+  if (isNaN(n)) return '<td class="num">' + esc(String(b)) + '</td>';
+  var sign = n < 0 ? '-' : '';
+  var abs = Math.abs(n);
+  return '<td class="num">' + sign + '\u00a3' + abs.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '</td>';
+}
+
+function renderCoaTable(accounts) {
+  _coaRows = {};
+  var rows = (accounts || []).map(function(a) {
+    _coaRows[a.id] = a;
+    return '<tr>' +
+      '<td class="leg-code">' + accountCodeCell(a.code) + '</td>' +
+      '<td>' + esc(a.name || '') + '</td>' +
+      '<td>' + esc(a.category || '') + '</td>' +
+      '<td>' + esc(a.type || '') + '</td>' +
+      coaBalanceCell(a.balance) +
+      '<td class="coa-actions">' +
+        '<button class="coa-row-btn" onclick="openCoaRename(\'' + esc(a.id) + '\')" title="rename account">✎</button>' +
+        '<button class="coa-row-btn" onclick="deleteCoaAccount(\'' + esc(a.id) + '\')"' +
+          (a.used ? ' disabled title="account has transactions"' : ' title="delete account"') + '>🗑</button>' +
+      '</td>' +
+      '</tr>';
+  }).join('');
+  return '<table class="report-table"><thead><tr>' +
+    '<th>Code</th><th>Name</th><th>Category</th><th>Type</th><th class="num">Balance</th><th>Actions</th>' +
+    '</tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
+function apiErrorMessage(data, status) {
+  if (data) {
+    var d = data.detail || data.message || data.type;
+    if (typeof d === 'string') return d;
+    if (Array.isArray(d)) {
+      return d.map(function(x) { return x.msg || JSON.stringify(x); }).join('; ');
+    }
+    if (d) return JSON.stringify(d);
+  }
+  return 'HTTP ' + status;
+}
+
+function openCoaAdd() {
+  document.getElementById('coa-add-code').value = '';
+  document.getElementById('coa-add-name').value = '';
+  document.getElementById('coa-add-category').value = 'Asset';
+  document.getElementById('coa-add-type').value = 'Bank';
+  document.getElementById('coa-add-vat').value = '';
+  document.getElementById('coa-add-error').textContent = '';
+  document.getElementById('coa-add-overlay').classList.add('open');
+}
+
+function closeCoaAdd() {
+  document.getElementById('coa-add-overlay').classList.remove('open');
+}
+
+async function submitCoaAdd() {
+  var errEl = document.getElementById('coa-add-error');
+  errEl.textContent = '';
+  var code = document.getElementById('coa-add-code').value.trim();
+  var name = document.getElementById('coa-add-name').value.trim();
+  var category = document.getElementById('coa-add-category').value;
+  var type = document.getElementById('coa-add-type').value;
+  var vat = document.getElementById('coa-add-vat').value;
+  if (!/^\d{4}$/.test(code)) { errEl.textContent = 'Code must be exactly 4 digits.'; return; }
+  if (!name) { errEl.textContent = 'Name is required.'; return; }
+  var body = { code: code, name: name, category: category, type: type };
+  if (vat) body.vat_rate = vat;
+  var qs = entityParam();
+  var url = '/api/accounts' + (qs ? '?' + qs : '');
+  var btn = document.getElementById('coa-add-submit');
+  btn.disabled = true;
+  try {
+    var resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    var data = await resp.json().catch(function() { return null; });
+    if (!resp.ok) {
+      errEl.textContent = apiErrorMessage(data, resp.status);
+      return;
+    }
+    closeCoaAdd();
+    loadFormanceReport();
+  } catch (e) {
+    errEl.textContent = 'Accounts unavailable: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function openCoaRename(id) {
+  var a = _coaRows[id];
+  if (!a) return;
+  _coaRenameId = id;
+  document.getElementById('coa-rename-code').textContent = a.code || '';
+  document.getElementById('coa-rename-name').value = a.name || '';
+  document.getElementById('coa-rename-error').textContent = '';
+  document.getElementById('coa-rename-overlay').classList.add('open');
+}
+
+function closeCoaRename() {
+  document.getElementById('coa-rename-overlay').classList.remove('open');
+}
+
+async function submitCoaRename() {
+  var errEl = document.getElementById('coa-rename-error');
+  errEl.textContent = '';
+  var name = document.getElementById('coa-rename-name').value.trim();
+  if (!name) { errEl.textContent = 'Name is required.'; return; }
+  try {
+    var resp = await fetch('/api/accounts/' + encodeURIComponent(_coaRenameId), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name })
+    });
+    var data = await resp.json().catch(function() { return null; });
+    if (!resp.ok) { errEl.textContent = apiErrorMessage(data, resp.status); return; }
+    closeCoaRename();
+    loadFormanceReport();
+  } catch (e) {
+    errEl.textContent = 'Accounts unavailable: ' + e.message;
+  }
+}
+
+async function deleteCoaAccount(id) {
+  var a = _coaRows[id];
+  if (!a || a.used) return;
+  if (!confirm('Delete account ' + (a.code || '') + ' ' + (a.name || '') + '?')) return;
+  try {
+    var resp = await fetch('/api/accounts/' + encodeURIComponent(id), { method: 'DELETE' });
+    var data = await resp.json().catch(function() { return null; });
+    if (!resp.ok) {
+      alert(apiErrorMessage(data, resp.status));
+      return;
+    }
+    loadFormanceReport();
+  } catch (e) {
+    alert('Accounts unavailable: ' + e.message);
+  }
+}
 
 // ═══════════════════════════════════════════
 //  SETTINGS MODAL (kept from v2 — backend URL + LLM config)

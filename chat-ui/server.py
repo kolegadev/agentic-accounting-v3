@@ -576,6 +576,113 @@ async def forward_account_transactions(code: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Chart of Accounts CRUD forwarding (Contract F39) — real pipeline only.
+#
+# The report pane's Chart of Accounts report lets John add / rename / delete
+# accounts; these proxies forward to the accounting API's CoA endpoints
+# (/api/v1/coa/…).  Query params (incl. entity_id) and JSON bodies pass
+# through untouched; the upstream status rides through so a 409 (account
+# has transactions) and 422 (bad code/category) reach the UI.  An
+# unreachable upstream is 502 JSON.  Same injectable _upstream_client test
+# seam as the F7 routes.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/accounts")
+async def forward_accounts_list(request: Request):
+    """GET → /api/v1/coa/ (query params pass through, incl. entity_id)."""
+    url = f"{API_BASE_URL}/api/v1/coa/"
+    try:
+        client = _get_upstream_client()
+        resp = await client.get(url, params=dict(request.query_params))
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "type": "upstream_unreachable",
+                "message": f"Accounting API unreachable: {exc}",
+            },
+        )
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=payload)
+
+
+@app.post("/api/accounts")
+async def forward_account_create(data: dict, request: Request):
+    """POST → /api/v1/coa/ (JSON body; query params pass through)."""
+    url = f"{API_BASE_URL}/api/v1/coa/"
+    try:
+        client = _get_upstream_client()
+        resp = await client.post(
+            url, json=data, params=dict(request.query_params)
+        )
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "type": "upstream_unreachable",
+                "message": f"Accounting API unreachable: {exc}",
+            },
+        )
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=payload)
+
+
+@app.patch("/api/accounts/{account_id}")
+async def forward_account_update(account_id: str, data: dict):
+    """PATCH → /api/v1/coa/{account_id} (JSON body; status passthrough)."""
+    url = f"{API_BASE_URL}/api/v1/coa/{account_id}"
+    try:
+        client = _get_upstream_client()
+        resp = await client.patch(url, json=data)
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "type": "upstream_unreachable",
+                "message": f"Accounting API unreachable: {exc}",
+            },
+        )
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=payload)
+
+
+@app.delete("/api/accounts/{account_id}")
+async def forward_account_delete(account_id: str):
+    """DELETE → /api/v1/coa/{account_id} (409 passes through to the UI)."""
+    url = f"{API_BASE_URL}/api/v1/coa/{account_id}"
+    try:
+        client = _get_upstream_client()
+        resp = await client.delete(url)
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "type": "upstream_unreachable",
+                "message": f"Accounting API unreachable: {exc}",
+            },
+        )
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=payload)
+
+
+# ---------------------------------------------------------------------------
 # Books in plain English (Contract F23) — real pipeline only, NO mock fallback.
 #
 # GET /api/books?entity_id=<uuid> fetches the REAL Formance P&L and balance

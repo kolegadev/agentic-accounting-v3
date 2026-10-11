@@ -1161,3 +1161,123 @@ def test_document_uses_llm_client(client: TestClient, monkeypatch) -> None:
 
     assert resp.status_code == 200
     assert llm_calls == ["/api/v1/orchestrator/document"]
+
+
+# ---------------------------------------------------------------------------
+# Chart of Accounts CRUD forwarding (Contract F39) —
+# GET/POST /api/accounts → /api/v1/coa/, PATCH/DELETE /api/accounts/{id} →
+# /api/v1/coa/{id}; query/body passthrough; 409 reaches the UI; 502 on an
+# unreachable upstream.  Same injectable seam as the F37 drill-down.
+# ---------------------------------------------------------------------------
+
+
+def test_accounts_list_forwards_path_and_query(client: TestClient, upstream) -> None:
+    resp = client.get(
+        "/api/accounts", params={"entity_id": "entity-1", "include_inactive": "false"}
+    )
+
+    assert resp.status_code == 200
+    echo = resp.json()
+    assert echo["method"] == "GET"
+    assert echo["path"] == "/api/v1/coa/"
+    req = upstream[0]
+    assert req.method == "GET"
+    assert req.url.path == "/api/v1/coa/"
+    assert req.url.params.get("entity_id") == "entity-1"
+    assert req.url.params.get("include_inactive") == "false"
+
+
+def test_accounts_create_forwards_body_and_query(
+    client: TestClient, upstream
+) -> None:
+    body = {"code": "5210", "name": "Marketing", "category": "Expense", "type": "Expense"}
+    resp = client.post(
+        "/api/accounts", json=body, params={"entity_id": "entity-1"}
+    )
+
+    assert resp.status_code == 200
+    echo = resp.json()
+    assert echo["method"] == "POST"
+    assert echo["path"] == "/api/v1/coa/"
+    req = upstream[0]
+    assert req.method == "POST"
+    assert req.url.path == "/api/v1/coa/"
+    assert req.url.params.get("entity_id") == "entity-1"
+    assert json.loads(req.content.decode()) == body
+
+
+def test_accounts_update_forwards_body(client: TestClient, upstream) -> None:
+    body = {"name": "Marketing Spend"}
+    resp = client.patch("/api/accounts/acc-123", json=body)
+
+    assert resp.status_code == 200
+    echo = resp.json()
+    assert echo["method"] == "PATCH"
+    assert echo["path"] == "/api/v1/coa/acc-123"
+    req = upstream[0]
+    assert req.method == "PATCH"
+    assert req.url.path == "/api/v1/coa/acc-123"
+    assert json.loads(req.content.decode()) == body
+
+
+def test_accounts_delete_forwards_path(client: TestClient, upstream) -> None:
+    resp = client.delete("/api/accounts/acc-123")
+
+    assert resp.status_code == 200
+    echo = resp.json()
+    assert echo["method"] == "DELETE"
+    assert echo["path"] == "/api/v1/coa/acc-123"
+    assert upstream[0].method == "DELETE"
+    assert upstream[0].url.path == "/api/v1/coa/acc-123"
+
+
+def test_accounts_delete_upstream_409_passthrough(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "detail": "Account '1000' has transactions and cannot be deleted",
+            },
+        )
+
+    _set_transport(monkeypatch, handler)
+    resp = client.delete("/api/accounts/acc-123")
+
+    assert resp.status_code == 409
+    assert resp.json() == {
+        "detail": "Account '1000' has transactions and cannot be deleted",
+    }
+
+
+def test_accounts_create_upstream_422_passthrough(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "Code '9999' invalid"})
+
+    _set_transport(monkeypatch, handler)
+    resp = client.post(
+        "/api/accounts",
+        json={"code": "9999", "name": "X", "category": "Asset", "type": "Bank"},
+    )
+
+    assert resp.status_code == 422
+    assert resp.json() == {"detail": "Code '9999' invalid"}
+
+
+def test_accounts_crud_upstream_unreachable_returns_502(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _set_transport(monkeypatch, handler)
+    resp = client.delete("/api/accounts/acc-123")
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "upstream_unreachable"
+    assert "connection refused" in body["message"]

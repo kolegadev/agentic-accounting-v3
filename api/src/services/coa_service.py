@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -12,7 +13,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.account import Account, CATEGORY_CODE_RANGES
+from src.services.entity_service import get_ledger_for_entity
+from src.services.formance_client import formance_client
 from src.validators.account import AccountCreate, AccountResponse, AccountUpdate
+
+logger = logging.getLogger(__name__)
 
 COA_TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "coa_templates"
 
@@ -55,6 +60,16 @@ class InvalidCodeRangeError(CoaServiceError):
         super().__init__(
             f"Code '{code}' is not in valid range {min_val}-{max_val} for category '{category}'",
             status_code=422,
+        )
+
+
+class AccountInUseError(CoaServiceError):
+    """Account has transactions and cannot be deleted (Contract F39)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(
+            f"Account '{code}' has transactions and cannot be deleted",
+            status_code=409,
         )
 
 
@@ -196,16 +211,69 @@ class CoaService:
         return CoaService._account_to_response(account)
 
     @staticmethod
+    async def account_in_use(
+        db: AsyncSession,
+        code: str,
+        *,
+        entity_id: Optional[uuid.UUID] = None,
+    ) -> bool:
+        """True when the account has ANY transactions (Postgres or Formance).
+
+        Contract F39 — the delete guard behind ``soft_delete_account``.
+        Postgres is checked via ``TransactionService.list_for_account``
+        (posted + reversed scope, limit 1 = existence).  The Formance leg
+        catches ledger postings the app has no Postgres row for; it needs
+        the account's entity ledger, so legacy (NULL-scope) accounts check
+        Postgres only.  A Formance transport failure degrades to
+        not-in-use (Postgres remains authoritative) — the guard never
+        blocks a delete because the ledger is unreachable.
+        """
+        from src.services.transaction_service import TransactionService
+
+        postgres = await TransactionService.list_for_account(
+            db, code, entity_id=entity_id, limit=1
+        )
+        if postgres is not None and postgres.get("items"):
+            return True
+
+        if entity_id is None:
+            return False
+
+        try:
+            ledger = await get_ledger_for_entity(db, entity_id)
+            formance = await formance_client.list_account_transactions(
+                ledger, code, page_size=1
+            )
+        except Exception as exc:  # noqa: BLE001 — guard degrades, never blocks
+            logger.warning(
+                "account_in_use: Formance check for code '%s' failed (%s); "
+                "treating as not in use (Postgres remains authoritative)",
+                code,
+                exc,
+            )
+            return False
+        return bool(formance.get("data"))
+
+    @staticmethod
     async def soft_delete_account(
         db: AsyncSession,
         account_id: uuid.UUID,
     ) -> AccountResponse:
-        """Soft-delete an account by setting is_active=False."""
+        """Soft-delete an account by setting is_active=False.
+
+        Contract F39 — refuses with :class:`AccountInUseError` (409) when
+        the account has ANY transactions (Postgres or Formance).
+        """
         stmt = select(Account).where(Account.id == account_id)
         result = await db.execute(stmt)
         account = result.scalar_one_or_none()
         if account is None:
             raise AccountNotFoundError(str(account_id))
+
+        if await CoaService.account_in_use(
+            db, account.code, entity_id=account.entity_id
+        ):
+            raise AccountInUseError(account.code)
 
         account.is_active = False
         await db.commit()
