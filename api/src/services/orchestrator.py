@@ -43,6 +43,7 @@ from src.services.entity_service import (
 )
 from src.services.formance_reports import generate_tb
 from src.services.ledger_parity import ParityReport, verify_parity
+from src.services import llm_config as llm_cfg
 from src.services.transaction_service import (
     TransactionService,
     TransactionServiceError,
@@ -380,11 +381,12 @@ async def call_llm(system_prompt: str, user_message: str) -> str:
     response shape is unexpected — never a raw httpx exception.
     """
     headers: dict[str, str] = {"Content-Type": "application/json"}
-    if LLM_API_KEY:
-        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+    api_key = llm_cfg.get_api_key()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     payload = {
-        "model": LLM_MODEL,
+        "model": llm_cfg.get_model(),
         "temperature": 0,
         "max_tokens": LLM_MAX_TOKENS,
         "messages": [
@@ -395,7 +397,7 @@ async def call_llm(system_prompt: str, user_message: str) -> str:
 
     try:
         async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
-            response = await client.post(LLM_API_URL, json=payload, headers=headers)
+            response = await client.post(llm_cfg.get_api_url(), json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
             content = data["choices"][0]["message"]["content"]

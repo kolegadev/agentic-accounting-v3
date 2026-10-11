@@ -13,6 +13,7 @@ import logging
 logger = logging.getLogger("accounting-api.chat")
 from pydantic import BaseModel
 
+from src.services import llm_config as llm_cfg
 from src.services.chat_service import ChatService
 from src.services.skill_registry import SkillRegistry
 from src.validators.chat import (
@@ -255,3 +256,48 @@ async def reload_skills() -> ReloadResponse:
         total=len(skills),
         message=f"Reloaded {len(skills)} skills from registry.yaml",
     )
+
+
+# ---------------------------------------------------------------------------
+# LLM configuration (Contract F33) — runtime store with optional persistence
+# ---------------------------------------------------------------------------
+
+
+class LLMConfigUpdate(BaseModel):
+    api_url: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+
+
+def _masked_config() -> dict[str, Any]:
+    cfg = llm_cfg.get_config()
+    key = cfg.get("api_key", "")
+    return {
+        "api_url": cfg["api_url"],
+        "model": cfg["model"],
+        "has_key": bool(key),
+        "api_key": (key[:8] + "***") if key else "",
+    }
+
+
+@router.get("/chat/llm-config")
+async def get_llm_config() -> dict[str, Any]:
+    """Current LLM configuration (key masked)."""
+    return _masked_config()
+
+
+@router.post("/chat/llm-config")
+async def update_llm_config(body: LLMConfigUpdate) -> dict[str, Any]:
+    """Update the runtime LLM configuration; takes effect immediately."""
+    llm_cfg.update_config(
+        {
+            k: v
+            for k, v in {
+                "api_url": body.api_url,
+                "model": body.model,
+                "api_key": body.api_key,
+            }.items()
+            if v
+        }
+    )
+    return {"status": "ok", "config": _masked_config()}

@@ -15,6 +15,7 @@ from typing import Any
 
 import httpx
 
+from src.services import llm_config as llm_cfg
 from src.services.skill_registry import SkillRegistry
 from src.services.instrument import log_event, get_correlation_id
 from src.services.prompt_assembler import assemble_system_prompt
@@ -273,12 +274,14 @@ class LLMRouter:
 
     async def _call_llm(self, system_prompt: str, user_message: str) -> str:
         """Call the LLM API and return the raw response text."""
+        model = llm_cfg.get_model()
         headers: dict[str, str] = {"Content-Type": "application/json"}
-        if LLM_API_KEY:
-            headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+        api_key = llm_cfg.get_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
 
         payload = {
-            "model": LLM_MODEL,
+            "model": model,
             "temperature": LLM_TEMPERATURE,
             "max_tokens": LLM_MAX_TOKENS,
             "messages": [
@@ -294,7 +297,7 @@ class LLMRouter:
                 "system_prompt_chars": len(system_prompt),
                 "user_message_chars": len(user_message),
                 "total_payload_chars": len(system_prompt) + len(user_message),
-                "model": LLM_MODEL,
+                "model": model,
                 "temperature": LLM_TEMPERATURE,
                 "max_tokens": LLM_MAX_TOKENS,
             },
@@ -302,7 +305,9 @@ class LLMRouter:
 
         try:
             async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
-                response = await client.post(LLM_API_URL, json=payload, headers=headers)
+                response = await client.post(
+                    llm_cfg.get_api_url(), json=payload, headers=headers
+                )
                 response.raise_for_status()
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
