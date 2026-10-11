@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import httpx
@@ -460,6 +461,63 @@ class _BooksLLMError(Exception):
     """The LLM explanation call failed (transport or response shape)."""
 
 
+def _pounds(pence) -> str:
+    """Exact pence -> pounds string (integer pence in, two-decimal string out)."""
+    try:
+        return str((Decimal(int(pence)) / 100).quantize(Decimal("0.01")))
+    except (ValueError, TypeError, InvalidOperation, ArithmeticError):
+        return "0.00"
+
+
+def _books_pounds_summary(pl: dict, bs: dict) -> dict:
+    """Deterministic pence->pounds summary of the two raw reports.
+
+    The LLM NEVER does money math: every amount it sees is already in
+    pounds sterling with two decimals.
+    """
+    pl_r = pl.get("report", {}) if isinstance(pl, dict) else {}
+    bs_r = bs.get("report", {}) if isinstance(bs, dict) else {}
+
+    def pl_lines() -> list[dict]:
+        out: list[dict] = []
+        for sec, lines in (pl_r.get("sections") or {}).items():
+            for line in lines or []:
+                out.append({
+                    "section": sec,
+                    "name": line.get("name"),
+                    "amount_pounds": _pounds(line.get("amount", 0)),
+                })
+        return out
+
+    def bs_lines() -> list[dict]:
+        out: list[dict] = []
+        for sec, lines in (bs_r.get("sections") or {}).items():
+            for line in lines or []:
+                out.append({
+                    "section": sec,
+                    "name": line.get("name"),
+                    "code": line.get("code"),
+                    "amount_pounds": _pounds(line.get("amount", 0)),
+                })
+        return out
+
+    totals = bs_r.get("totals") or {}
+    pl_totals = pl_r.get("totals") or {}
+    return {
+        "period": pl_r.get("period"),
+        "as_at": bs_r.get("as_at"),
+        "profit_or_loss_pounds": _pounds(pl_r.get("profit", 0)),
+        "revenue_total_pounds": _pounds(pl_totals.get("revenue", 0)),
+        "expenses_total_pounds": _pounds(
+            pl_totals.get("expenses", pl_totals.get("direct_costs", 0))
+        ),
+        "pl_lines": pl_lines(),
+        "bs_lines": bs_lines(),
+        "bs_totals_pounds": {k: _pounds(v) for k, v in totals.items()},
+        "vat_net_pounds": _pounds(bs_r.get("vat_net", 0)),
+    }
+
+
 async def _llm_explain_books(pl: dict, bs: dict) -> str:
     """Ask the configured LLM to explain the entity's books in plain English."""
     llm_url = os.getenv("LLM_API_URL") or LLM_CONFIG["api_url"]
@@ -472,16 +530,17 @@ async def _llm_explain_books(pl: dict, bs: dict) -> str:
 
     system_prompt = (
         "You explain the books of a UK small business in plain English for "
-        "a non-accountant owner. Use ONLY the Profit & Loss and Balance "
-        "Sheet figures supplied — never invent numbers. Keep it short: a "
-        "2-3 sentence summary, then 3-5 '- ' bullets with the key figures "
+        "a non-accountant owner. Use ONLY the figures supplied — never "
+        "invent numbers. IMPORTANT: every amount in the supplied summary is "
+        "ALREADY in pounds sterling (GBP) with two decimals — do not "
+        "multiply, divide, or convert any figure. Keep it short: a 2-3 "
+        "sentence summary, then 3-5 '- ' bullets with the key figures "
         "(**bold**), then one sentence of practical advice."
     )
+    summary = _books_pounds_summary(pl, bs)
     user_message = (
-        "Profit & Loss report:\n"
-        + json.dumps(pl, indent=2)
-        + "\n\nBalance Sheet report:\n"
-        + json.dumps(bs, indent=2)
+        "Books summary (all amounts already in pounds sterling):\n"
+        + json.dumps(summary, indent=2)
     )
     payload = {
         "model": llm_model,

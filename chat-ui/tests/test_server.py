@@ -778,3 +778,55 @@ def test_admin_proxy_upstream_error_passthrough(
 
     assert resp.status_code == 409
     assert resp.json() == {"type": "duplicate_name", "message": "already exists"}
+
+
+def test_books_pounds_summary_converts_pence_to_pounds_exactly() -> None:
+    """The books LLM must never see pence: every amount becomes a
+    two-decimal pounds string (the pence-as-pounds display bug)."""
+    pl = {
+        "report": {
+            "period": {"start": "2026-04-06", "end": "2026-10-11"},
+            "profit": -5000,
+            "totals": {"revenue": 0, "expenses": 5000},
+            "sections": {
+                "expenses": [{"name": "Office Supplies", "amount": 5000}]
+            },
+        }
+    }
+    bs = {
+        "report": {
+            "as_at": "2026-10-11",
+            "vat_net": -1000,
+            "totals": {
+                "assets": 1000000,
+                "liabilities": 5000,
+                "equity": 995000,
+                "liabilities_and_equity": 1000000,
+            },
+            "sections": {
+                "bank": [{"name": "Bank Current Account", "code": "1000", "amount": 1000000}]
+            },
+        }
+    }
+    summary = server._books_pounds_summary(pl, bs)
+    assert summary["profit_or_loss_pounds"] == "-50.00"
+    assert summary["revenue_total_pounds"] == "0.00"
+    assert summary["expenses_total_pounds"] == "50.00"
+    assert summary["vat_net_pounds"] == "-10.00"
+    assert summary["bs_totals_pounds"] == {
+        "assets": "10000.00",
+        "liabilities": "50.00",
+        "equity": "9950.00",
+        "liabilities_and_equity": "10000.00",
+    }
+    assert summary["pl_lines"][0]["amount_pounds"] == "50.00"
+    assert summary["bs_lines"][0]["amount_pounds"] == "10000.00"
+
+
+def test_books_pounds_summary_degrades_to_zero_on_garbage() -> None:
+    """Unparseable amounts degrade to '0.00' — never crash the books pane."""
+    summary = server._books_pounds_summary(
+        {"report": {"profit": "not-a-number"}}, {"report": {"vat_net": None}}
+    )
+    assert summary["profit_or_loss_pounds"] == "0.00"
+    assert summary["vat_net_pounds"] == "0.00"
