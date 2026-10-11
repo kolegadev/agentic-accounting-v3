@@ -1147,6 +1147,7 @@ function sendMessage() {
   var text = input.value.trim();
   if (!text || input.disabled) return;
   addMessage('user', text);
+  pushChatHistory('user', text);
   input.value = '';
   setIsProcessing(true);
   addTyping();
@@ -1163,6 +1164,17 @@ sendBtn.addEventListener('click', sendMessage);
 //  Right pane: draft preview, approve/reject, pending drafts.
 // ═══════════════════════════════════════════
 var OrchState = { transactionId: null };
+
+// Conversation history for the orchestrator (Contract F35): the chat LLM
+// only ever sees ONE message, so the UI carries the last few turns and
+// sends them with each request — without this the clarification loop
+// "forgets" what was already agreed and re-asks endlessly.
+var chatHistory = [];
+function pushChatHistory(role, content) {
+  if (!content) return;
+  chatHistory.push({ role: role, content: String(content).slice(0, 500) });
+  if (chatHistory.length > 14) chatHistory = chatHistory.slice(chatHistory.length - 14);
+}
 
 function setPreviewStatus(text, tone) {
   var el = document.getElementById('preview-status');
@@ -1328,6 +1340,7 @@ async function requestOrchestratorPreview(text) {
   try {
     setPreviewStatus('Classifying & constructing draft…', 'working');
     var body = { message: text };
+    if (chatHistory.length) body.history = chatHistory;
     if (AppState.entityId) body.entity_id = AppState.entityId;
     var resp = await fetch('/api/orchestrator/message', {
       method: 'POST',
@@ -1358,6 +1371,7 @@ async function requestOrchestratorPreview(text) {
       // (preview.contact is refreshed unconditionally when absent — the
       // refresh is idempotent and cheap.)
       if (!p.contact || p.contact.created) loadContacts();
+      pushChatHistory('assistant', 'Draft ready — ' + (p.skill_id || 'entry') + ' for ' + fmtMoney(p.total_pence) + '.');
       addMessage('assistant', 'Draft ready — **' + (p.skill_id || 'entry') + '** for ' + fmtMoney(p.total_pence) + '. Review the legs, then approve or reject in the preview pane.');
       return;
     }
@@ -1366,6 +1380,7 @@ async function requestOrchestratorPreview(text) {
       var clar = err.message || 'I need a bit more detail to construct this entry.';
       setPreviewStatus(clar, 'clarify');
       renderPreview(null);
+      pushChatHistory('assistant', clar);
       addMessage('system', clar);
       return;
     }

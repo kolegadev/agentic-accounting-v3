@@ -181,6 +181,16 @@ def test_entity_id_query_wiring_present(html: str) -> None:
     assert "'/api/reports/formance/'" in html
 
 
+def test_message_carries_conversation_history(html: str) -> None:
+    """Contract F35 — every orchestrator message carries the bounded
+    conversation history (user turns + clarification/preview assistant
+    turns), so the clarification loop remembers what was already agreed."""
+    assert "body.history = chatHistory" in html
+    assert "pushChatHistory('user', text)" in html
+    assert "pushChatHistory('assistant', clar)" in html
+    assert "chatHistory.length > 14" in html
+
+
 def test_per_pane_generation_counters(html: str) -> None:
     """Contract F23 — loadFormanceReport() and loadBooks() each own a
     generation counter, and each loader guards BOTH of its DOM writes
