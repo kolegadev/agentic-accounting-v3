@@ -12,7 +12,11 @@ from src.config.database import get_db
 from src.middleware.auth import get_current_user, require_role
 from src.models.user import User
 from src.services.coa_service import CoaServiceError
-from src.services.entity_service import EntityService, EntityServiceError
+from src.services.entity_service import (
+    EntityNotFoundError,
+    EntityService,
+    EntityServiceError,
+)
 from src.services.setup_service import (
     SetupError,
     get_entity_status,
@@ -23,6 +27,7 @@ from src.validators.entity import (
     EntityResponse,
     EntitySetupResponse,
     EntityStatus,
+    EntityUpdate,
     SetupRequest,
     SetupResult,
 )
@@ -159,6 +164,40 @@ async def get_entity_route(
     entity = await EntityService.get_entity(db, entity_id)
     if entity is None:
         raise HTTPException(status_code=404, detail=f"Entity '{entity_id}' not found")
+    return EntityResponse.model_validate(entity)
+
+
+# ---------------------------------------------------------------------------
+# PATCH /{entity_id} — Update entity details (Contract F27)
+# ---------------------------------------------------------------------------
+@router.patch(
+    "/{entity_id}",
+    response_model=EntityResponse,
+    summary="Update entity details",
+    status_code=status.HTTP_200_OK,
+    responses={
+        404: {"description": "Entity not found"},
+        409: {"description": "Duplicate entity name"},
+        403: {"description": "Insufficient role"},
+    },
+)
+async def update_entity_route(
+    entity_id: uuid.UUID,
+    data: EntityUpdate,
+    current_user: User = Depends(require_role("owner", "admin")),
+    db: AsyncSession = Depends(get_db),
+) -> EntityResponse:
+    """Partially update an entity's details. Owner/Admin only.
+
+    Contract F27: 404 EntityNotFoundError mapping, 200 with the updated
+    EntityResponse, 403 from the role guard.
+    """
+    try:
+        entity = await EntityService.update_entity(db, entity_id, data)
+    except EntityNotFoundError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    except EntityServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
     return EntityResponse.model_validate(entity)
 
 

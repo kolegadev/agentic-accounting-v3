@@ -10,6 +10,7 @@ source (the LLM over the real reports, via /api/books).
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -19,6 +20,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://accounting-api:8000")
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Agentic Accounting Chat UI", version="0.2.0")
 
@@ -258,6 +261,154 @@ async def entities():
     except ValueError:
         payload = {"detail": resp.text}
     return JSONResponse(status_code=resp.status_code, content=payload)
+
+
+# ---------------------------------------------------------------------------
+# Admin forwarding (Contract F27) — owner-token injection + proxies for
+# entity creation/update, the global contacts list and the users list.
+# Real pipeline only, NO mock fallback.
+#
+# The owner logs in ONCE (lazy, cached — first admin-proxied request wins)
+# with OWNER_EMAIL/OWNER_PASSWORD and the token rides as the Authorization
+# header on every admin-proxied call.  A failed login logs a warning and
+# degrades to EMPTY headers: the upstream answers 401 and the UI shows that
+# message.  Contacts are global + unauthenticated upstream, so they forward
+# WITHOUT a token.  Status/JSON pass through untouched; an unreachable
+# upstream is 502 upstream_unreachable.  Same injectable _upstream_client
+# test seam as the F7 routes.
+# ---------------------------------------------------------------------------
+
+OWNER_EMAIL = os.getenv("OWNER_EMAIL", "john@kolega.ai")
+OWNER_PASSWORD = os.getenv("OWNER_PASSWORD", "TestAccounting123!")
+
+_admin_token: str | None = None
+_admin_login_tried: bool = False
+
+
+async def _admin_login() -> str | None:
+    """Log in with the owner credentials ONCE and cache the access token.
+
+    The first call performs POST /api/v1/auth/login; every later call
+    returns the cached token (or None).  A failed login logs a warning and
+    returns None — no further attempts are made.
+    """
+    global _admin_token, _admin_login_tried
+    if _admin_token is not None or _admin_login_tried:
+        return _admin_token
+    _admin_login_tried = True
+    try:
+        client = _get_upstream_client()
+        resp = await client.post(
+            f"{API_BASE_URL}/api/v1/auth/login",
+            json={"email": OWNER_EMAIL, "password": OWNER_PASSWORD},
+        )
+        payload = resp.json()
+    except httpx.HTTPError as exc:
+        logger.warning("Owner login failed (upstream unreachable): %s", exc)
+        return None
+    except ValueError as exc:
+        logger.warning("Owner login failed (non-JSON response): %s", exc)
+        return None
+    token = payload.get("access_token") if resp.status_code == 200 else None
+    if not token:
+        logger.warning(
+            "Owner login failed (HTTP %s): %s", resp.status_code, payload
+        )
+        return None
+    _admin_token = token
+    return token
+
+
+async def _admin_auth_headers() -> dict[str, str]:
+    """Authorization header carrying the owner token; EMPTY on login failure."""
+    token = await _admin_login()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _admin_unreachable(exc: httpx.HTTPError) -> JSONResponse:
+    """502 JSON for a transport failure reaching the accounting API."""
+    return JSONResponse(
+        status_code=502,
+        content={
+            "status": "error",
+            "type": "upstream_unreachable",
+            "message": f"Accounting API unreachable: {exc}",
+        },
+    )
+
+
+def _admin_passthrough(resp: httpx.Response) -> JSONResponse:
+    """Mirror the upstream status + JSON (non-JSON bodies become detail)."""
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=payload)
+
+
+@app.post("/api/entities")
+async def create_entity(data: dict, request: Request):
+    """POST → /api/v1/entities/ (body + admin header; query string forwarded)."""
+    url = f"{API_BASE_URL}/api/v1/entities/"
+    headers = await _admin_auth_headers()
+    try:
+        client = _get_upstream_client()
+        resp = await client.post(
+            url, json=data, headers=headers, params=dict(request.query_params)
+        )
+    except httpx.HTTPError as exc:
+        return _admin_unreachable(exc)
+    return _admin_passthrough(resp)
+
+
+@app.patch("/api/entities/{entity_id}")
+async def update_entity(entity_id: str, data: dict):
+    """PATCH → /api/v1/entities/{entity_id} (body + admin header)."""
+    url = f"{API_BASE_URL}/api/v1/entities/{entity_id}"
+    headers = await _admin_auth_headers()
+    try:
+        client = _get_upstream_client()
+        resp = await client.patch(url, json=data, headers=headers)
+    except httpx.HTTPError as exc:
+        return _admin_unreachable(exc)
+    return _admin_passthrough(resp)
+
+
+@app.get("/api/contacts")
+async def list_contacts(request: Request):
+    """GET → /api/v1/contacts/ (global, unauthenticated — no token)."""
+    url = f"{API_BASE_URL}/api/v1/contacts/"
+    try:
+        client = _get_upstream_client()
+        resp = await client.get(url, params=dict(request.query_params))
+    except httpx.HTTPError as exc:
+        return _admin_unreachable(exc)
+    return _admin_passthrough(resp)
+
+
+@app.post("/api/contacts")
+async def create_contact(data: dict):
+    """POST → /api/v1/contacts/ (global, unauthenticated — no token)."""
+    url = f"{API_BASE_URL}/api/v1/contacts/"
+    try:
+        client = _get_upstream_client()
+        resp = await client.post(url, json=data)
+    except httpx.HTTPError as exc:
+        return _admin_unreachable(exc)
+    return _admin_passthrough(resp)
+
+
+@app.get("/api/users")
+async def list_users():
+    """GET → /api/v1/auth/users (admin header)."""
+    url = f"{API_BASE_URL}/api/v1/auth/users"
+    headers = await _admin_auth_headers()
+    try:
+        client = _get_upstream_client()
+        resp = await client.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        return _admin_unreachable(exc)
+    return _admin_passthrough(resp)
 
 
 # ---------------------------------------------------------------------------

@@ -72,6 +72,27 @@ BOOKS_ENDPOINTS = [
     "/api/books",
 ]
 
+# Contract F27 — the restored admin surface: add company, company details,
+# contacts (global) and the users list, all wired to the real pipeline.
+ADMIN_DOM_IDS = [
+    "add-company-btn",
+    "add-company-overlay",
+    "company-admin-btn",
+    "company-admin-overlay",
+    "contacts-panel",
+    "contacts-list",
+    "contact-name",
+    "contact-type",
+    "contact-email",
+    "contact-add",
+    "users-list",
+]
+
+ADMIN_ENDPOINTS = [
+    "/api/contacts",
+    "/api/users",
+]
+
 FORBIDDEN_STRINGS = [
     "brightwork",
     "/api/companies",
@@ -126,6 +147,16 @@ def test_js_references_books_endpoint(html: str, endpoint: str) -> None:
     assert endpoint in html
 
 
+@pytest.mark.parametrize("dom_id", ADMIN_DOM_IDS)
+def test_required_admin_dom_id_present(html: str, dom_id: str) -> None:
+    assert f'id="{dom_id}"' in html
+
+
+@pytest.mark.parametrize("endpoint", ADMIN_ENDPOINTS)
+def test_js_references_admin_endpoint(html: str, endpoint: str) -> None:
+    assert endpoint in html
+
+
 @pytest.mark.parametrize("forbidden", FORBIDDEN_STRINGS)
 def test_mock_world_string_absent(html: str, forbidden: str) -> None:
     """Contract F23: the mock world is gone — no mock company identifiers,
@@ -173,3 +204,38 @@ def test_esc_escapes_double_quotes_for_attribute_contexts(html: str) -> None:
     assert ".replace(/\"/g, '&quot;')" in html
     # pin that renderTable's data-value uses the ESCAPED cell (not the raw value)
     assert "data-value=\"' + esc(cells[j].trim()) + '\"" in html
+
+
+def test_setup_template_formula_pinned(html: str) -> None:
+    """Contract F27 — the COA template name is derived client-side as
+    'uk_' + legalType + (vatRegistered ? '_vat' : '_no_vat').  Pinning the
+    literal expression keeps the fuzzy template loader in step with the
+    admin UI: inverting _vat/_no_vat (or swapping the branches) must fail
+    this test."""
+    assert (
+        "template_name: 'uk_' + legalType + (vatRegistered ? '_vat' : '_no_vat')"
+        in html
+    )
+
+
+def test_opening_balance_pounds_to_pence(html: str) -> None:
+    """Contract F27 — the add-company opening balance is converted from
+    pounds to pence with Math.round(parseFloat(...) * 100) before it
+    becomes the bank opening_balance (pence) in the setup payload."""
+    assert "Math.round(parseFloat(openingStr || '0') * 100)" in html
+    assert "opening_balance: openingPence" in html
+
+
+def test_fiscal_year_start_never_null(html: str) -> None:
+    """Contract F27 — fiscal_year_start defaults to '04-06' in BOTH admin
+    saves; null must never reach the API (the backend fiscal-year parser
+    crashes on NULL)."""
+    assert "fiscal_year_start: fys || '04-06'" in html
+    assert (
+        "fiscal_year_start: document.getElementById('co-fys').value.trim() || '04-06'"
+        in html
+    )
+    assert (
+        "fiscal_year_start: document.getElementById('co-fys').value.trim() || null"
+        not in html
+    )

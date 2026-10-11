@@ -12,6 +12,7 @@ status code and JSON straight through — with a 502 when upstream fails.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -506,3 +507,274 @@ def test_books_missing_entity_id_returns_422(client: TestClient) -> None:
     body = resp.json()
     assert body["status"] == "error"
     assert body["type"] == "missing_entity_id"
+
+
+# ---------------------------------------------------------------------------
+# Admin forwarding (Contract F27) — owner token injection + proxies for
+# entity creation/update, global contacts and the users list.
+#
+# The owner logs in ONCE (lazy, cached); the token rides as the
+# Authorization header on the admin-proxied calls.  Contacts forward
+# WITHOUT a token.  A failed login degrades to empty headers (the upstream
+# 401 passes through).  Transport failure → 502 upstream_unreachable.
+# ---------------------------------------------------------------------------
+
+ADMIN_ENTITY_BODY = {
+    "name": "Acme Holdings Ltd",
+    "legal_type": "limited_company",
+    "framework": "uk-gaap",
+    "fiscal_year_start": "04-06",
+    "vat_registered": True,
+    "vat_number": "GB123456789",
+    "vat_scheme": "standard",
+    "setup": {
+        "template_name": "uk_limited_company_vat",
+        "bank_accounts": [{"name": "Barclays", "opening_balance": 300000}],
+        "opening_balances": {
+            "opening_date": "2026-04-06",
+            "equity_account_code": "3000",
+            "assets": [{"code": "1000", "balance_pence": 300000}],
+        },
+    },
+}
+
+ENTITY_PATCH_ID = "8f0b3c9a-5555-4a2b-9c3d-000000000005"
+
+
+@pytest.fixture
+def admin_upstream(monkeypatch):
+    """Seam transport serving the owner login + echoing admin-proxied calls.
+
+    Resets the module-level login cache so each test starts cold.
+    """
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path == "/api/v1/auth/login":
+            return httpx.Response(
+                200, json={"access_token": "tok-owner-1", "user": {}}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "method": request.method,
+                "path": request.url.path,
+                "auth": request.headers.get("authorization", ""),
+                "body": request.content.decode(),
+            },
+        )
+
+    monkeypatch.setattr(server, "_admin_token", None)
+    monkeypatch.setattr(server, "_admin_login_tried", False)
+    monkeypatch.setattr(
+        server,
+        "_upstream_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    return captured
+
+
+def _reset_admin_login(monkeypatch) -> None:
+    monkeypatch.setattr(server, "_admin_token", None)
+    monkeypatch.setattr(server, "_admin_login_tried", False)
+
+
+def test_owner_login_uses_default_demo_credentials() -> None:
+    """The demo defaults are wired: john@kolega.ai / TestAccounting123!."""
+    assert server.OWNER_EMAIL == "john@kolega.ai"
+    assert server.OWNER_PASSWORD == "TestAccounting123!"
+
+
+def test_owner_login_uses_env_credentials(
+    client: TestClient, admin_upstream, monkeypatch
+) -> None:
+    """The login call carries OWNER_EMAIL/OWNER_PASSWORD from env."""
+    monkeypatch.setattr(server, "OWNER_EMAIL", "owner@example.com")
+    monkeypatch.setattr(server, "OWNER_PASSWORD", "s3cret-pass")
+    client.get("/api/users")
+
+    logins = [r for r in admin_upstream if r.url.path == "/api/v1/auth/login"]
+    assert len(logins) == 1
+    assert json.loads(logins[0].content) == {
+        "email": "owner@example.com",
+        "password": "s3cret-pass",
+    }
+
+
+def test_post_entities_forwards_body_and_admin_header(
+    client: TestClient, admin_upstream
+) -> None:
+    resp = client.post("/api/entities", json=ADMIN_ENTITY_BODY)
+
+    assert resp.status_code == 200
+    reqs = [r for r in admin_upstream if r.url.path == "/api/v1/entities/"]
+    assert len(reqs) == 1
+    req = reqs[0]
+    assert req.method == "POST"
+    assert json.loads(req.content) == ADMIN_ENTITY_BODY
+    assert req.headers.get("authorization") == "Bearer tok-owner-1"
+
+
+def test_patch_entities_forwards_body_and_admin_header(
+    client: TestClient, admin_upstream
+) -> None:
+    patch_body = {"name": "Acme Renamed Ltd"}
+    resp = client.patch(f"/api/entities/{ENTITY_PATCH_ID}", json=patch_body)
+
+    assert resp.status_code == 200
+    reqs = [
+        r
+        for r in admin_upstream
+        if r.url.path == f"/api/v1/entities/{ENTITY_PATCH_ID}"
+    ]
+    assert len(reqs) == 1
+    req = reqs[0]
+    assert req.method == "PATCH"
+    assert json.loads(req.content) == patch_body
+    assert req.headers.get("authorization") == "Bearer tok-owner-1"
+
+
+def test_post_entities_forwards_query_string(
+    client: TestClient, admin_upstream
+) -> None:
+    resp = client.post(
+        "/api/entities", json=ADMIN_ENTITY_BODY, params={"dry_run": "1"}
+    )
+
+    assert resp.status_code == 200
+    reqs = [r for r in admin_upstream if r.url.path == "/api/v1/entities/"]
+    assert len(reqs) == 1
+    assert reqs[0].url.params.get("dry_run") == "1"
+
+
+def test_get_contacts_forwards_without_token(
+    client: TestClient, admin_upstream
+) -> None:
+    resp = client.get("/api/contacts")
+
+    assert resp.status_code == 200
+    reqs = [r for r in admin_upstream if r.url.path == "/api/v1/contacts/"]
+    assert len(reqs) == 1
+    assert reqs[0].method == "GET"
+    assert "authorization" not in reqs[0].headers
+    # No owner login happens for the unauthenticated contacts proxy.
+    logins = [r for r in admin_upstream if r.url.path == "/api/v1/auth/login"]
+    assert logins == []
+
+
+def test_post_contacts_forwards_body_without_token(
+    client: TestClient, admin_upstream
+) -> None:
+    body = {"name": "Acme Corp", "type": "customer", "email": "ap@acme.test"}
+    resp = client.post("/api/contacts", json=body)
+
+    assert resp.status_code == 200
+    reqs = [r for r in admin_upstream if r.url.path == "/api/v1/contacts/"]
+    assert len(reqs) == 1
+    assert reqs[0].method == "POST"
+    assert json.loads(reqs[0].content) == body
+    assert "authorization" not in reqs[0].headers
+
+
+def test_get_users_forwards_admin_header(client: TestClient, admin_upstream) -> None:
+    resp = client.get("/api/users")
+
+    assert resp.status_code == 200
+    reqs = [r for r in admin_upstream if r.url.path == "/api/v1/auth/users"]
+    assert len(reqs) == 1
+    assert reqs[0].method == "GET"
+    assert reqs[0].headers.get("authorization") == "Bearer tok-owner-1"
+
+
+def test_owner_login_called_once_across_requests(
+    client: TestClient, admin_upstream
+) -> None:
+    """F27: the token is fetched ONCE and cached across admin calls."""
+    client.post("/api/entities", json=ADMIN_ENTITY_BODY)
+    client.get("/api/users")
+    client.patch(f"/api/entities/{ENTITY_PATCH_ID}", json={"name": "X Ltd"})
+
+    logins = [r for r in admin_upstream if r.url.path == "/api/v1/auth/login"]
+    assert len(logins) == 1
+
+
+def test_failed_owner_login_degrades_to_empty_headers(
+    client: TestClient, monkeypatch, caplog
+) -> None:
+    """A failed login logs a warning and the admin call forwards WITHOUT a
+    token — the upstream 401 passes through to the UI."""
+    _reset_admin_login(monkeypatch)
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.url.path == "/api/v1/auth/login":
+            return httpx.Response(401, json={"detail": "Invalid credentials"})
+        return httpx.Response(401, json={"detail": "Not authenticated"})
+
+    _set_transport(monkeypatch, handler)
+    with caplog.at_level(logging.WARNING):
+        resp = client.post("/api/entities", json=ADMIN_ENTITY_BODY)
+
+    assert resp.status_code == 401
+    assert resp.json() == {"detail": "Not authenticated"}
+    entity_reqs = [r for r in captured if r.url.path == "/api/v1/entities/"]
+    assert len(entity_reqs) == 1
+    assert "authorization" not in entity_reqs[0].headers
+    assert any("Owner login failed" in r.message for r in caplog.records)
+
+
+def test_admin_proxy_upstream_unreachable_returns_502(
+    client: TestClient, monkeypatch
+) -> None:
+    _reset_admin_login(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _set_transport(monkeypatch, handler)
+    resp = client.post("/api/entities", json=ADMIN_ENTITY_BODY)
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "upstream_unreachable"
+    assert "connection refused" in body["message"]
+
+
+def test_contacts_proxy_upstream_unreachable_returns_502(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host", request=request)
+
+    _set_transport(monkeypatch, handler)
+    resp = client.get("/api/contacts")
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "upstream_unreachable"
+    assert "no route to host" in body["message"]
+
+
+def test_admin_proxy_upstream_error_passthrough(
+    client: TestClient, monkeypatch
+) -> None:
+    """Upstream 409/422 JSON passes through untouched (no mock fallback)."""
+    _reset_admin_login(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/auth/login":
+            return httpx.Response(200, json={"access_token": "tok-owner-1"})
+        return httpx.Response(
+            409, json={"type": "duplicate_name", "message": "already exists"}
+        )
+
+    _set_transport(monkeypatch, handler)
+    resp = client.post("/api/entities", json=ADMIN_ENTITY_BODY)
+
+    assert resp.status_code == 409
+    assert resp.json() == {"type": "duplicate_name", "message": "already exists"}

@@ -356,6 +356,75 @@ def test_get_entity_404(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PATCH /{entity_id} — update entity details (Contract F27)
+# ---------------------------------------------------------------------------
+
+def test_update_entity_requires_admin_role(client: TestClient) -> None:
+    """viewer role -> 403 on PATCH (role guard)."""
+    _override_auth(make_user("viewer"))
+    resp = client.patch(
+        f"/api/v1/entities/{ENTITY_ID}", json={"name": "Renamed Ltd"}
+    )
+    assert resp.status_code == 403
+
+
+def test_update_entity_success(client: TestClient) -> None:
+    """owner role -> 200 with the updated EntityResponse."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.EntityService.update_entity",
+        new_callable=AsyncMock,
+    ) as mock_update:
+        mock_update.return_value = make_entity(name="Acme Renamed Ltd")
+        resp = client.patch(
+            f"/api/v1/entities/{ENTITY_ID}",
+            json={"name": "Acme Renamed Ltd", "vat_registered": False},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["id"] == str(ENTITY_ID)
+    assert data["name"] == "Acme Renamed Ltd"
+    mock_update.assert_awaited_once()
+    args = mock_update.await_args.args
+    assert args[1] == ENTITY_ID
+    assert args[2].name == "Acme Renamed Ltd"
+    assert args[2].vat_registered is False
+
+
+def test_update_entity_not_found_404(client: TestClient) -> None:
+    """F27: unknown entity -> 404 with the EntityNotFoundError detail."""
+    _override_auth(make_user("admin"))
+    with patch(
+        "src.routes.entities.EntityService.update_entity",
+        new_callable=AsyncMock,
+    ) as mock_update:
+        mock_update.side_effect = EntityNotFoundError(ENTITY_ID)
+        resp = client.patch(
+            f"/api/v1/entities/{ENTITY_ID}", json={"name": "Renamed Ltd"}
+        )
+
+    assert resp.status_code == 404
+    body = resp.json()
+    assert "not found" in body["detail"]
+
+
+def test_update_entity_duplicate_name_409(client: TestClient) -> None:
+    """F27: a duplicate name surfaces as a 409."""
+    _override_auth(make_user("owner"))
+    with patch(
+        "src.routes.entities.EntityService.update_entity",
+        new_callable=AsyncMock,
+    ) as mock_update:
+        mock_update.side_effect = DuplicateEntityNameError("Taken Ltd")
+        resp = client.patch(
+            f"/api/v1/entities/{ENTITY_ID}", json={"name": "Taken Ltd"}
+        )
+
+    assert resp.status_code == 409
+
+
+# ---------------------------------------------------------------------------
 # POST /{id}/setup
 # ---------------------------------------------------------------------------
 

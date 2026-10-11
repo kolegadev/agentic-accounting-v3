@@ -432,6 +432,67 @@
   }
   .status-dot.off { background:var(--red); box-shadow:0 0 6px rgba(244,71,71,.4); }
 
+  /* ── Admin (F27): add company, company details, contacts, users ── */
+  .contacts-panel {
+    flex:none; border-top:1px solid var(--border2);
+    display:flex; flex-direction:column; max-height:46%; min-height:0;
+  }
+  .contacts-list {
+    flex:1; min-height:0; overflow-y:auto; padding:8px 12px;
+    display:flex; flex-direction:column; gap:5px;
+  }
+  .contacts-empty { font-size:11.5px; color:var(--text-dim4); padding:6px 2px; line-height:1.5; }
+  .contact-item {
+    background:var(--surface2); border:1px solid var(--border4);
+    border-radius:8px; padding:7px 9px;
+  }
+  .contact-name { display:block; font-size:12px; font-weight:600; }
+  .contact-meta { display:block; font-size:10.5px; color:var(--text-dim3); }
+  .contacts-add {
+    flex:none; padding:8px 12px 12px; border-top:1px solid var(--border2);
+    display:flex; flex-direction:column; gap:6px;
+  }
+  .admin-input, .admin-select {
+    width:100%; background:var(--bg); border:1px solid var(--border4);
+    border-radius:var(--radius); padding:8px 10px; color:var(--text);
+    font-size:12.5px; font-family:inherit; outline:none;
+    transition:border-color .15s;
+  }
+  .admin-input:focus, .admin-select:focus { border-color:var(--accent); }
+  .admin-form { display:flex; flex-direction:column; gap:11px; }
+  .admin-form label {
+    font-size:11px; color:var(--text-dim3); display:block;
+    margin-bottom:4px; text-transform:uppercase; letter-spacing:.5px;
+  }
+  .admin-row { display:flex; gap:9px; align-items:flex-end; }
+  .admin-row > div { flex:1; min-width:0; }
+  .admin-error { color:var(--red); font-size:12px; line-height:1.5; min-height:16px; }
+  .detail-row {
+    display:flex; justify-content:space-between; gap:12px;
+    padding:7px 0; border-bottom:1px solid var(--border2); font-size:12.5px;
+  }
+  .detail-key { color:var(--text-dim3); flex:none; }
+  .detail-val { color:var(--text2); text-align:right; overflow-wrap:anywhere; }
+  .users-list {
+    display:flex; flex-direction:column; gap:5px; margin-top:8px;
+    max-height:210px; overflow-y:auto;
+  }
+  .user-item {
+    background:var(--surface2); border:1px solid var(--border4);
+    border-radius:8px; padding:7px 9px; font-size:12px;
+  }
+  .user-name { font-weight:600; }
+  .user-email { display:block; color:var(--text-dim3); font-size:10.5px; font-family:var(--mono); }
+  .user-role { color:var(--accent); font-size:10.5px; font-family:var(--mono); }
+  .admin-check {
+    display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--text2);
+  }
+  .admin-check input { accent-color:var(--accent); }
+  .admin-section-title {
+    font-size:11px; text-transform:uppercase; letter-spacing:.07em;
+    color:var(--text-dim4); margin:16px 0 0; font-weight:700;
+  }
+
   /* ── Responsive ── */
   @media (max-width:900px) {
     .body-columns { flex-direction:column; }
@@ -464,6 +525,8 @@
     <div class="topbar-spacer"></div>
 
     <div style="display:flex;align-items:center;gap:8px;margin-left:4px">
+      <button class="topbar-pill" id="add-company-btn" title="Add a company — creates the entity, chart of accounts, bank account and opening balances" style="cursor:pointer;font-family:inherit">+ Add company</button>
+      <button class="topbar-pill" id="company-admin-btn" title="Company details & users" style="cursor:pointer;font-family:inherit">🏢 Company</button>
       <button class="topbar-pill" id="settings-btn" title="Settings" style="cursor:pointer;font-family:inherit;font-size:14px;padding:7px 10px">⚙</button>
       <div class="status-dot" id="status-dot"></div>
       <span id="status-text" style="font-size:12px;color:var(--text-dim3)">connecting...</span>
@@ -486,6 +549,33 @@
         <div class="books-empty">Select an entity to read its books.</div>
       </div>
       <div class="books-sources" id="books-sources"></div>
+
+      <div class="contacts-panel" id="contacts-panel">
+        <div class="pane-header" style="padding:10px 14px">
+          <div class="pane-avatar" style="width:26px;height:26px;font-size:13px">👥</div>
+          <div>
+            <div class="pane-header-title">Contacts</div>
+            <div class="pane-header-sub">Global — shared across all entities</div>
+          </div>
+        </div>
+        <div class="contacts-list sb" id="contacts-list">
+          <div class="contacts-empty">Loading…</div>
+        </div>
+        <div class="contacts-add">
+          <input class="admin-input" id="contact-name" type="text" placeholder="Contact name" />
+          <div style="display:flex;gap:6px">
+            <select class="admin-select" id="contact-type" style="flex:none;width:100px">
+              <option value="customer">customer</option>
+              <option value="supplier">supplier</option>
+              <option value="both">both</option>
+              <option value="other">other</option>
+            </select>
+            <input class="admin-input" id="contact-email" type="text" placeholder="Email (optional)" style="flex:1;min-width:0" />
+          </div>
+          <button class="modal-btn-primary" id="contact-add" style="padding:8px">Add contact</button>
+          <div class="admin-error" id="contact-error"></div>
+        </div>
+      </div>
     </div>
 
     <!-- ── MIDDLE: CHAT ── -->
@@ -614,6 +704,149 @@
   </div>
 </div>
 
+<!-- ═══════════ ADD COMPANY MODAL (F27) ═══════════ -->
+<div class="modal-overlay" id="add-company-overlay" onclick="closeAddCompany()">
+  <div class="modal-panel" style="width:90%;max-width:460px" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2 style="font-size:18px;color:var(--accent);margin:0">Add company</h2>
+      <button class="modal-close" onclick="closeAddCompany()">✕</button>
+    </div>
+    <div class="modal-body admin-form">
+      <div>
+        <label>Company name</label>
+        <input class="admin-input" id="add-company-name" type="text" placeholder="e.g. Acme Holdings Ltd" />
+      </div>
+      <div class="admin-row">
+        <div>
+          <label>Legal type</label>
+          <select class="admin-select" id="add-company-legal-type">
+            <option value="limited_company">limited_company</option>
+            <option value="sole_trader">sole_trader</option>
+            <option value="partnership">partnership</option>
+            <option value="micro_entity">micro_entity</option>
+            <option value="property_landlord">property_landlord</option>
+            <option value="other">other</option>
+          </select>
+        </div>
+        <div>
+          <label>Framework</label>
+          <select class="admin-select" id="add-company-framework">
+            <option value="uk-gaap">uk-gaap</option>
+            <option value="ifrs">ifrs</option>
+          </select>
+        </div>
+      </div>
+      <div class="admin-row">
+        <div>
+          <label>Fiscal year start (MM-DD)</label>
+          <input class="admin-input" id="add-company-fys" type="text" placeholder="04-06" maxlength="5" />
+        </div>
+        <div>
+          <label>VAT scheme</label>
+          <select class="admin-select" id="add-company-vat-scheme">
+            <option value="">none</option>
+            <option value="standard">standard</option>
+            <option value="cash">cash</option>
+            <option value="flat_rate">flat_rate</option>
+          </select>
+        </div>
+      </div>
+      <label class="admin-check" style="margin:0;text-transform:none"><input type="checkbox" id="add-company-vat" /> VAT registered</label>
+      <div>
+        <label>VAT number</label>
+        <input class="admin-input" id="add-company-vat-number" type="text" placeholder="GB… (if VAT registered)" />
+      </div>
+      <div class="admin-row">
+        <div>
+          <label>Bank account name (optional)</label>
+          <input class="admin-input" id="add-company-bank-name" type="text" placeholder="e.g. Barclays business" />
+        </div>
+        <div>
+          <label>Opening balance £ (optional)</label>
+          <input class="admin-input" id="add-company-opening" type="number" min="0" step="0.01" placeholder="0.00" />
+        </div>
+      </div>
+      <div class="admin-error" id="add-company-error"></div>
+      <div class="modal-btn-row">
+        <button class="modal-btn-secondary" onclick="closeAddCompany()">Cancel</button>
+        <button class="modal-btn-primary" id="add-company-submit" onclick="submitAddCompany()">Create company</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ COMPANY DETAILS MODAL (F27) ═══════════ -->
+<div class="modal-overlay" id="company-admin-overlay" onclick="closeCompanyAdmin()">
+  <div class="modal-panel" style="width:90%;max-width:520px" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2 style="font-size:18px;color:var(--accent);margin:0">Company details</h2>
+      <button class="modal-close" onclick="closeCompanyAdmin()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="company-details-view"></div>
+      <div class="admin-form" id="company-details-edit" style="display:none">
+        <div>
+          <label>Company name</label>
+          <input class="admin-input" id="co-name" type="text" />
+        </div>
+        <div class="admin-row">
+          <div>
+            <label>Legal type</label>
+            <select class="admin-select" id="co-legal-type">
+              <option value="limited_company">limited_company</option>
+              <option value="sole_trader">sole_trader</option>
+              <option value="partnership">partnership</option>
+              <option value="micro_entity">micro_entity</option>
+              <option value="property_landlord">property_landlord</option>
+              <option value="other">other</option>
+            </select>
+          </div>
+          <div>
+            <label>Framework</label>
+            <select class="admin-select" id="co-framework">
+              <option value="uk-gaap">uk-gaap</option>
+              <option value="ifrs">ifrs</option>
+            </select>
+          </div>
+        </div>
+        <div class="admin-row">
+          <div>
+            <label>Fiscal year start (MM-DD)</label>
+            <input class="admin-input" id="co-fys" type="text" maxlength="5" />
+          </div>
+          <div>
+            <label>VAT scheme</label>
+            <select class="admin-select" id="co-vat-scheme">
+              <option value="">none</option>
+              <option value="standard">standard</option>
+              <option value="cash">cash</option>
+              <option value="flat_rate">flat_rate</option>
+            </select>
+          </div>
+        </div>
+        <label class="admin-check" style="margin:0;text-transform:none"><input type="checkbox" id="co-vat" /> VAT registered</label>
+        <div>
+          <label>VAT number</label>
+          <input class="admin-input" id="co-vat-number" type="text" />
+        </div>
+        <div class="admin-error" id="company-admin-error"></div>
+        <div class="modal-btn-row">
+          <button class="modal-btn-secondary" onclick="cancelCompanyEdit()">Cancel</button>
+          <button class="modal-btn-primary" onclick="saveCompanyEdit()">Save</button>
+        </div>
+      </div>
+      <div class="modal-btn-row" id="company-view-actions">
+        <button class="modal-btn-secondary" onclick="startCompanyEdit()">Edit</button>
+        <button class="modal-btn-secondary" onclick="closeCompanyAdmin()">Close</button>
+      </div>
+      <div class="admin-section-title">Users</div>
+      <div class="users-list sb" id="users-list">
+        <div class="contacts-empty">Loading…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 // ═══════════════════════════════════════════
 //  APP STATE (Contract F23 — one selector: the entity)
@@ -712,6 +945,10 @@ function switchEntity(entityId) {
   loadPendingDrafts();
   loadFormanceReport();
   loadBooks();
+  // F27: the company-details modal shows the SELECTED entity — re-render
+  // it if it happens to be open during a switch.
+  var adminOverlay = document.getElementById('company-admin-overlay');
+  if (adminOverlay && adminOverlay.classList.contains('open')) renderCompanyDetails();
 }
 
 // ═══════════════════════════════════════════
@@ -1420,11 +1657,346 @@ document.getElementById('modal-overlay').addEventListener('click', function(e) {
 });
 
 // ═══════════════════════════════════════════
+//  ADMIN (F27) — add company, company details, users, contacts (global)
+//  Everything is backed by the REAL API through the chat-ui proxies:
+//  POST/PATCH /api/entities (owner token injected server-side),
+//  GET /api/users, GET/POST /api/contacts (global, no entity scoping).
+//  Every interpolated value goes through esc() — no raw innerHTML with
+//  unsanitized data anywhere in this section.
+// ═══════════════════════════════════════════
+
+function adminErrorMessage(data, status) {
+  var detail = data && data.detail;
+  if (typeof detail === 'string' && detail) return detail;
+  var msg = data && (data.message || data.type);
+  return msg || ('HTTP ' + status);
+}
+
+// ── Add company (entity + COA + bank + opening balances) ──
+window.openAddCompany = function() {
+  var err = document.getElementById('add-company-error');
+  if (err) err.textContent = '';
+  document.getElementById('add-company-overlay').classList.add('open');
+};
+
+window.closeAddCompany = function() {
+  document.getElementById('add-company-overlay').classList.remove('open');
+};
+
+function resetAddCompanyForm() {
+  document.getElementById('add-company-name').value = '';
+  document.getElementById('add-company-legal-type').value = 'limited_company';
+  document.getElementById('add-company-framework').value = 'uk-gaap';
+  document.getElementById('add-company-fys').value = '';
+  document.getElementById('add-company-vat').checked = false;
+  document.getElementById('add-company-vat-number').value = '';
+  document.getElementById('add-company-vat-scheme').value = '';
+  document.getElementById('add-company-bank-name').value = '';
+  document.getElementById('add-company-opening').value = '';
+}
+
+window.submitAddCompany = async function() {
+  var err = document.getElementById('add-company-error');
+  var submit = document.getElementById('add-company-submit');
+  err.textContent = '';
+  var name = document.getElementById('add-company-name').value.trim();
+  if (!name) { err.textContent = 'Company name is required.'; return; }
+  var legalType = document.getElementById('add-company-legal-type').value;
+  var framework = document.getElementById('add-company-framework').value;
+  var fys = document.getElementById('add-company-fys').value.trim();
+  var vatRegistered = document.getElementById('add-company-vat').checked;
+  var vatNumber = document.getElementById('add-company-vat-number').value.trim();
+  var vatScheme = document.getElementById('add-company-vat-scheme').value;
+  var bankName = document.getElementById('add-company-bank-name').value.trim();
+  var openingStr = document.getElementById('add-company-opening').value.trim();
+  var openingPence = Math.round(parseFloat(openingStr || '0') * 100);
+  if (isNaN(openingPence) || openingPence < 0) {
+    err.textContent = 'Opening balance must be a positive amount in pounds.';
+    return;
+  }
+
+  // The setup payload is built client-side: the COA template name is
+  // derived from the legal type + VAT flag (uk_<type>_vat / _no_vat, the
+  // same names the fuzzy template loader resolves), the optional opening
+  // balance becomes one bank asset (code 1000) balanced by equity 3000,
+  // in pence, and the optional bank name creates the bank account.
+  var body = {
+    name: name,
+    legal_type: legalType,
+    framework: framework,
+    fiscal_year_start: fys || '04-06',
+    vat_registered: vatRegistered,
+    vat_number: vatNumber || null,
+    vat_scheme: vatScheme || null,
+    setup: {
+      template_name: 'uk_' + legalType + (vatRegistered ? '_vat' : '_no_vat')
+    }
+  };
+  if (bankName || openingPence > 0) {
+    body.setup.bank_accounts = [{
+      name: bankName || 'Business bank account',
+      opening_balance: openingPence
+    }];
+  }
+  if (openingPence > 0) {
+    body.setup.opening_balances = {
+      opening_date: new Date().toISOString().slice(0, 10),
+      equity_account_code: '3000',
+      assets: [{ code: '1000', balance_pence: openingPence }]
+    };
+  }
+
+  submit.disabled = true;
+  submit.textContent = 'Creating…';
+  try {
+    var resp = await fetch('/api/entities', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    var data = await resp.json().catch(function() { return null; });
+    if (!resp.ok) {
+      err.textContent = 'Could not create the company: ' + adminErrorMessage(data, resp.status);
+      return;
+    }
+    var newId = data && data.entity && data.entity.id;
+    closeAddCompany();
+    resetAddCompanyForm();
+    await loadEntitiesFromAPI();
+    if (newId) AppState.entityId = String(newId);
+    switchEntity(AppState.entityId);
+  } catch (e) {
+    err.textContent = 'Could not create the company: ' + e.message;
+  } finally {
+    submit.disabled = false;
+    submit.textContent = 'Create company';
+  }
+};
+
+document.getElementById('add-company-btn').addEventListener('click', window.openAddCompany);
+
+// ── Company details (view / edit / save) + users list ──
+function currentEntity() {
+  if (!AppState.entityId || !_apiEntitiesCache) return null;
+  for (var i = 0; i < _apiEntitiesCache.length; i++) {
+    if (String(_apiEntitiesCache[i].id) === String(AppState.entityId)) {
+      return _apiEntitiesCache[i];
+    }
+  }
+  return null;
+}
+
+function companyDetailRows(e) {
+  var rows = [
+    ['Name', e.name],
+    ['Legal type', e.legal_type],
+    ['Framework', e.framework],
+    ['Fiscal year start', e.fiscal_year_start],
+    ['VAT registered', e.vat_registered ? 'Yes' : 'No'],
+    ['VAT number', e.vat_number || '—'],
+    ['VAT scheme', e.vat_scheme || '—']
+  ];
+  return rows.map(function(row) {
+    return '<div class="detail-row"><span class="detail-key">' + esc(row[0]) + '</span>' +
+      '<span class="detail-val">' + esc(row[1] == null ? '' : row[1]) + '</span></div>';
+  }).join('');
+}
+
+function renderCompanyDetails() {
+  var view = document.getElementById('company-details-view');
+  if (!view) return;
+  var e = currentEntity();
+  if (!e) {
+    view.innerHTML = '<div class="admin-error">Select an entity in the topbar first.</div>';
+    return;
+  }
+  view.innerHTML = companyDetailRows(e);
+}
+
+window.openCompanyAdmin = async function() {
+  var err = document.getElementById('company-admin-error');
+  if (err) err.textContent = '';
+  cancelCompanyEdit();
+  renderCompanyDetails();
+  document.getElementById('company-admin-overlay').classList.add('open');
+  loadUsers();
+};
+
+window.closeCompanyAdmin = function() {
+  document.getElementById('company-admin-overlay').classList.remove('open');
+};
+
+function fillCompanyEditFrom(e) {
+  document.getElementById('co-name').value = e.name || '';
+  document.getElementById('co-legal-type').value = e.legal_type || '';
+  document.getElementById('co-framework').value = e.framework || '';
+  document.getElementById('co-fys').value = e.fiscal_year_start || '';
+  document.getElementById('co-vat').checked = !!e.vat_registered;
+  document.getElementById('co-vat-number').value = e.vat_number || '';
+  document.getElementById('co-vat-scheme').value = e.vat_scheme || '';
+}
+
+window.startCompanyEdit = function() {
+  var e = currentEntity();
+  if (!e) return;
+  fillCompanyEditFrom(e);
+  var err = document.getElementById('company-admin-error');
+  if (err) err.textContent = '';
+  document.getElementById('company-details-view').style.display = 'none';
+  document.getElementById('company-details-edit').style.display = 'flex';
+  document.getElementById('company-view-actions').style.display = 'none';
+};
+
+window.cancelCompanyEdit = function() {
+  var e = currentEntity();
+  if (e) fillCompanyEditFrom(e);
+  var edit = document.getElementById('company-details-edit');
+  var view = document.getElementById('company-details-view');
+  var actions = document.getElementById('company-view-actions');
+  if (edit) edit.style.display = 'none';
+  if (view) view.style.display = 'block';
+  if (actions) actions.style.display = 'flex';
+};
+
+window.saveCompanyEdit = async function() {
+  var e = currentEntity();
+  if (!e) return;
+  var err = document.getElementById('company-admin-error');
+  err.textContent = '';
+  var name = document.getElementById('co-name').value.trim();
+  if (!name) { err.textContent = 'Company name is required.'; return; }
+  var body = {
+    name: name,
+    legal_type: document.getElementById('co-legal-type').value,
+    framework: document.getElementById('co-framework').value,
+    fiscal_year_start: document.getElementById('co-fys').value.trim() || '04-06',
+    vat_registered: document.getElementById('co-vat').checked,
+    vat_number: document.getElementById('co-vat-number').value.trim() || null,
+    vat_scheme: document.getElementById('co-vat-scheme').value || null
+  };
+  try {
+    var resp = await fetch('/api/entities/' + encodeURIComponent(e.id), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    var data = await resp.json().catch(function() { return null; });
+    if (!resp.ok) {
+      err.textContent = 'Could not save: ' + adminErrorMessage(data, resp.status);
+      return;
+    }
+    if (data && _apiEntitiesCache) {
+      for (var i = 0; i < _apiEntitiesCache.length; i++) {
+        if (String(_apiEntitiesCache[i].id) === String(data.id)) {
+          _apiEntitiesCache[i] = data;
+        }
+      }
+    }
+    cancelCompanyEdit();
+    renderCompanyDetails();
+    syncEntitySelect();
+  } catch (e2) {
+    err.textContent = 'Could not save: ' + e2.message;
+  }
+};
+
+async function loadUsers() {
+  var list = document.getElementById('users-list');
+  if (!list) return;
+  list.innerHTML = '<div class="contacts-empty">Loading…</div>';
+  try {
+    var resp = await fetch('/api/users');
+    var data = await resp.json().catch(function() { return null; });
+    if (!resp.ok) throw new Error(adminErrorMessage(data, resp.status));
+    var users = (data && data.users) || [];
+    if (!users.length) {
+      list.innerHTML = '<div class="contacts-empty">No users found.</div>';
+      return;
+    }
+    list.innerHTML = users.map(function(u) {
+      return '<div class="user-item">' +
+        '<span class="user-name">' + esc(u.display_name || '') + '</span>' +
+        ' <span class="user-role">' + esc(u.role || '') + '</span>' +
+        '<span class="user-email">' + esc(u.email || '') + '</span>' +
+        '</div>';
+    }).join('');
+  } catch (e) {
+    list.innerHTML = '<div class="admin-error">Users unavailable: ' + esc(e.message) + '</div>';
+  }
+}
+
+document.getElementById('company-admin-btn').addEventListener('click', window.openCompanyAdmin);
+
+// ── Contacts (global — not entity-scoped) ──
+async function loadContacts() {
+  var list = document.getElementById('contacts-list');
+  if (!list) return;
+  try {
+    var resp = await fetch('/api/contacts');
+    var data = await resp.json().catch(function() { return null; });
+    if (!resp.ok) throw new Error(adminErrorMessage(data, resp.status));
+    var contacts = (data && data.contacts) || [];
+    if (!contacts.length) {
+      list.innerHTML = '<div class="contacts-empty">No contacts yet — add one below. Contacts are global, shared across all entities.</div>';
+      return;
+    }
+    list.innerHTML = contacts.map(function(c) {
+      return '<div class="contact-item">' +
+        '<span class="contact-name">' + esc(c.name) + '</span>' +
+        '<span class="contact-meta">' + esc(c.type || '') + (c.email ? ' · ' + esc(c.email) : '') + '</span>' +
+        '</div>';
+    }).join('');
+  } catch (e) {
+    list.innerHTML = '<div class="contacts-empty">Contacts unavailable: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function addContact() {
+  var err = document.getElementById('contact-error');
+  var nameInput = document.getElementById('contact-name');
+  var typeInput = document.getElementById('contact-type');
+  var emailInput = document.getElementById('contact-email');
+  var btn = document.getElementById('contact-add');
+  var name = nameInput.value.trim();
+  if (!name) { err.textContent = 'Contact name is required.'; return; }
+  err.textContent = '';
+  btn.disabled = true;
+  try {
+    var resp = await fetch('/api/contacts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: name,
+        type: typeInput.value,
+        email: emailInput.value.trim() || null
+      })
+    });
+    var data = await resp.json().catch(function() { return null; });
+    if (!resp.ok) {
+      err.textContent = 'Could not add the contact: ' + adminErrorMessage(data, resp.status);
+      return;
+    }
+    nameInput.value = '';
+    emailInput.value = '';
+    await loadContacts();
+  } catch (e) {
+    err.textContent = 'Could not add the contact: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('contact-add').addEventListener('click', addContact);
+
+// ═══════════════════════════════════════════
 //  INIT — entities first (they set the scope), then every pane fans out
-//  under that scope, then the backend status poll.
+//  under that scope, then the backend status poll.  Contacts are GLOBAL
+//  (not entity-scoped): fetched once per page load, then again after
+//  each successful add.
 // ═══════════════════════════════════════════
 (async function init() {
   await loadEntitiesFromAPI();
+  loadContacts();
   loadPendingDrafts();
   loadFormanceReport();
   loadBooks();
