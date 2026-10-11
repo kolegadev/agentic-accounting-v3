@@ -693,7 +693,7 @@
       <input type="text" id="settings-llm-url" placeholder="https://api.deepseek.com/v1/chat/completions" />
 
       <label>LLM Model</label>
-      <input type="text" id="settings-llm-model" placeholder="deepseek-v4-pro" />
+      <input type="text" id="settings-llm-model" placeholder="deepseek-flash" />
 
       <label>LLM API Key</label>
       <input type="password" id="settings-llm-key" placeholder="sk-..." />
@@ -702,7 +702,7 @@
         <button class="modal-btn-secondary" onclick="closeSettings()" style="flex:none">Cancel</button>
         <button class="modal-btn-primary" onclick="saveSettings()" style="flex:none">Save &amp; Reconnect</button>
       </div>
-      <div class="saved-msg" id="saved-msg">Saved! Reconnecting...</div>
+      <div class="saved-msg" id="saved-msg">Saved ✓</div>
     </div>
   </div>
 </div>
@@ -1710,7 +1710,7 @@ window.openSettings = async function() {
     var dot = document.getElementById('settings-dot');
     dot.className = dot.className.replace(' off', '');
     if (!data.backend_configured) dot.className += ' off';
-    document.getElementById('settings-api-url').value = '';
+    document.getElementById('settings-api-url').value = data.api_base_url || '';
     try {
       var llmResp = await fetch('/api/llm-config');
       var llmData = await llmResp.json();
@@ -1767,7 +1767,7 @@ window.saveSettings = async function() {
       if (ldata.status !== 'ok') throw new Error(ldata.message || 'LLM config save failed');
     }
     savedMsg.style.color = 'var(--green)';
-    savedMsg.textContent = 'Saved! Reconnecting...';
+    savedMsg.textContent = 'Saved ✓';
     savedMsg.style.display = 'block';
     setTimeout(checkBackend, 800);
   } catch (e) {
@@ -1780,6 +1780,9 @@ window.saveSettings = async function() {
   }
   saveBtn.textContent = 'Save & Reconnect';
   saveBtn.disabled = false;
+  setTimeout(function() {
+    if (savedMsg.textContent === 'Saved ✓') savedMsg.style.display = 'none';
+  }, 3000);
 };
 
 document.getElementById('settings-btn').addEventListener('click', window.openSettings);
