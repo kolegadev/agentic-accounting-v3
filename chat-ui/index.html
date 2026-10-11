@@ -150,6 +150,29 @@
   }
   .chat-send-btn:hover { filter:brightness(1.1); }
   .chat-send-btn:disabled { opacity:.4; cursor:not-allowed; }
+  /* Contract F38 — paperclip: upload a PDF/JPG invoice into the chat. */
+  .chat-attach-btn {
+    flex:none; width:44px; height:44px; padding:0; line-height:1;
+    background:var(--surface3); color:var(--text-dim3);
+    border:1px solid var(--border5); border-radius:var(--radius-lg);
+    font-size:17px; cursor:pointer; font-family:inherit; transition:all .15s;
+  }
+  .chat-attach-btn:hover:not(:disabled) { border-color:var(--accent); color:var(--text); }
+  .chat-attach-btn:disabled { opacity:.4; cursor:not-allowed; }
+  /* Contract F38 — collapsible extracted-document-text panel (escaped). */
+  .extract-panel {
+    margin-top:12px; border:1px solid var(--border3);
+    border-radius:var(--radius-lg); background:var(--surface3);
+  }
+  .extract-panel summary {
+    cursor:pointer; padding:8px 12px; font-size:12.5px;
+    font-weight:600; color:var(--text-dim3);
+  }
+  .extract-panel pre {
+    margin:0; padding:0 12px 12px; white-space:pre-wrap;
+    word-break:break-word; font-size:12px; color:var(--text4);
+    max-height:220px; overflow:auto; font-family:var(--mono);
+  }
 
   /* ── Chat Messages ── */
   .msg { display:flex; flex-direction:column; max-width:90%; animation:rise .25s ease; }
@@ -593,7 +616,9 @@
 
       <div class="chat-input-bar">
         <div class="chat-input-row">
+          <button class="chat-attach-btn" id="attach-btn" type="button" title="Upload a PDF or image (invoice, bill, payroll record)" aria-label="Upload a document" disabled>📎</button>
           <input class="chat-input" id="msg-input" type="text" placeholder="Record a transaction, e.g. “paid £50 for office supplies”…" disabled />
+          <input type="file" id="file-input" accept=".pdf,.jpg,.jpeg,.png" style="display:none" disabled />
           <button class="chat-send-btn" id="send-btn" disabled>Send</button>
         </div>
       </div>
@@ -616,6 +641,11 @@
         <div id="preview-legs"></div>
         <div class="orch-total" id="preview-total"></div>
         <div id="preview-formance"></div>
+        <!-- Contract F38 — what was read from the uploaded document. -->
+        <details class="extract-panel" id="extract-panel" style="display:none">
+          <summary>Extracted text</summary>
+          <pre id="extract-text"></pre>
+        </details>
       </div>
 
       <div class="orch-actions">
@@ -1026,6 +1056,9 @@ async function loadBooks() {
 var chat = document.getElementById('chat');
 var input = document.getElementById('msg-input');
 var sendBtn = document.getElementById('send-btn');
+// Contract F38 — paperclip + hidden file input for document uploads.
+var attachBtn = document.getElementById('attach-btn');
+var fileInput = document.getElementById('file-input');
 var isProcessing = false;
 
 function setStatus(ok, text) {
@@ -1043,15 +1076,21 @@ async function checkBackend() {
     setStatus(ok, ok ? 'connected' : 'backend unreachable');
     if (input) input.disabled = !ok;
     if (sendBtn) sendBtn.disabled = !ok || isProcessing;
+    if (attachBtn) attachBtn.disabled = !ok || isProcessing;
+    if (fileInput) fileInput.disabled = !ok || isProcessing;
   } catch (e) {
     setStatus(false, 'server unreachable');
     if (input) input.disabled = true;
     if (sendBtn) sendBtn.disabled = true;
+    if (attachBtn) attachBtn.disabled = true;
+    if (fileInput) fileInput.disabled = true;
   }
 }
 
 function setIsProcessing(processing) {
   isProcessing = processing;
+  if (attachBtn) attachBtn.disabled = processing;
+  if (fileInput) fileInput.disabled = processing;
   if (!sendBtn) return;
   if (processing) {
     sendBtn.textContent = '…';
@@ -1237,6 +1276,88 @@ input.addEventListener('keydown', function(e) {
 sendBtn.addEventListener('click', sendMessage);
 
 // ═══════════════════════════════════════════
+//  DOCUMENT UPLOAD (Contract F38)
+//  The paperclip posts a PDF/JPG/PNG as multipart to the proxy
+//  (/api/orchestrator/document).  The API extracts the text and drives the
+//  SAME classify → construct → preview flow as a chat message, so the
+//  preview/approve pane, the contact badge, pending refresh and
+//  pushChatHistory all work unchanged.  The document's TEXT — never an
+//  image — reaches the LLM, and nothing posts without approval.
+// ═══════════════════════════════════════════
+if (attachBtn && fileInput) {
+  attachBtn.addEventListener('click', function() {
+    if (isProcessing) return;
+    fileInput.click();
+  });
+  fileInput.addEventListener('change', function() {
+    if (fileInput.files && fileInput.files[0]) uploadDocument(fileInput.files[0]);
+  });
+}
+
+async function uploadDocument(file) {
+  if (!file || isProcessing) return;
+  var label = 'Uploaded ' + file.name;
+  addMessage('user', label);
+  pushChatHistory('user', label);   // the conversation stays coherent (F35)
+  setIsProcessing(true);
+  addTyping();
+  setPreviewStatus('Reading document…', 'working');
+  try {
+    var form = new FormData();
+    form.append('file', file, file.name);
+    if (AppState.entityId) form.append('entity_id', AppState.entityId);
+    if (chatHistory.length) form.append('history', JSON.stringify(chatHistory));
+    var resp = await fetch('/api/orchestrator/document', { method: 'POST', body: form });
+    var data = await resp.json().catch(function() { return null; });
+    removeTyping();
+    if (resp.status === 413 || resp.status === 415 || resp.status === 422) {
+      var msgDoc = ((data && data.type) ? data.type + ': ' : '') +
+        ((data && data.message) || 'This document could not be read.');
+      setPreviewStatus(msgDoc, 'error');
+      renderPreview(null);
+      addMessage('system', msgDoc, true);
+      return;
+    }
+    if (data && data.status === 'answer') {
+      renderAnswer(data);   // defensive: a document normally previews
+      return;
+    }
+    if (data && data.status === 'preview') {
+      renderPreview(data);   // shows the "Extracted text" panel (escaped)
+      loadPendingDrafts();
+      var p = data.preview || {};
+      if (!p.contact || p.contact.created) loadContacts();
+      pushChatHistory('assistant', 'Draft ready — ' + (p.skill_id || 'entry') + ' for ' + fmtMoney(p.total_pence) + '.');
+      addMessage('assistant', 'Read **' + (data.filename || file.name) + '** — draft ready: **' + (p.skill_id || 'entry') + '** for ' + fmtMoney(p.total_pence) + '. Review the legs and the extracted text, then approve or reject.');
+      return;
+    }
+    if (data && data.status === 'clarification') {
+      var errDoc = data.error || {};
+      var clarDoc = errDoc.message || 'I need a bit more detail to construct this entry.';
+      setPreviewStatus(clarDoc, 'clarify');
+      renderPreview(null);
+      pushChatHistory('assistant', clarDoc);
+      addMessage('system', clarDoc);
+      return;
+    }
+    var msgUnexpected = (data && data.error && data.error.message) ||
+      ('Unexpected orchestrator response (' + resp.status + ')');
+    setPreviewStatus(msgUnexpected, 'error');
+    renderPreview(null);
+    addMessage('system', msgUnexpected, true);
+  } catch (e) {
+    removeTyping();
+    var msgUnreachable = 'Orchestrator unreachable: ' + e.message;
+    setPreviewStatus(msgUnreachable, 'error');
+    renderPreview(null);  // verifier fix-list: no stale preview on failure
+    addMessage('system', msgUnreachable, true);
+  } finally {
+    setIsProcessing(false);
+    fileInput.value = '';   // re-selecting the same file must re-fire change
+  }
+}
+
+// ═══════════════════════════════════════════
 //  ORCHESTRATOR PREVIEW / APPROVAL (F7)
 //  Right pane: draft preview, approve/reject, pending drafts.
 // ═══════════════════════════════════════════
@@ -1268,6 +1389,7 @@ function renderPreview(data) {
     if (body) body.style.display = 'none';
     if (approveBtn) approveBtn.disabled = true;
     if (rejectBtn) rejectBtn.disabled = true;
+    hideExtractedText();
     OrchState.transactionId = null;
     return;
   }
@@ -1328,7 +1450,28 @@ function renderPreview(data) {
   if (body) body.style.display = 'flex';
   if (approveBtn) approveBtn.disabled = false;
   if (rejectBtn) rejectBtn.disabled = false;
+  // Contract F38 — a document preview carries source_text (the extracted
+  // text): show it in the collapsible panel, escaped, or hide the panel
+  // for message/pending previews that have none.
+  if (data.source_text) showExtractedText(data.source_text);
+  else hideExtractedText();
   setPreviewStatus('Draft ready — review the legs, then approve or reject.', 'ready');
+}
+
+// Contract F38 — the "Extracted text" panel (uploaded documents only).
+// innerHTML is fed ONLY esc()'d text — never raw document content.
+function showExtractedText(sourceText) {
+  var panel = document.getElementById('extract-panel');
+  var textEl = document.getElementById('extract-text');
+  if (textEl) textEl.innerHTML = esc(sourceText);
+  if (panel) panel.style.display = '';
+}
+
+function hideExtractedText() {
+  var panel = document.getElementById('extract-panel');
+  var textEl = document.getElementById('extract-text');
+  if (textEl) textEl.textContent = '';
+  if (panel) panel.style.display = 'none';
 }
 
 // ═══════════════════════════════════════════

@@ -45,6 +45,7 @@ from src.services.formance_reports import generate_tb
 from src.services.ledger_parity import ParityReport, verify_parity
 from src.services import llm_config as llm_cfg
 from src.services.transaction_service import (
+    TransactionNotFoundError,
     TransactionService,
     TransactionServiceError,
 )
@@ -60,8 +61,10 @@ __all__ = [
     "PreviewLeg",
     "RejectResult",
     "approve_entry",
+    "build_document_system_prompt",
     "build_system_prompt",
     "call_llm",
+    "orchestrate_document",
     "orchestrate_message",
     "reject_entry",
 ]
@@ -208,6 +211,9 @@ class OrchestrateResult:
     # Contract F29 — the deterministic query answer (status == "answer").
     query_type: str | None = None
     data: dict[str, Any] | None = None
+    # Contract F38 — the uploaded document's extracted text (first ~500
+    # chars) for the UI's "Extracted text" panel; None for chat messages.
+    source_text: str | None = None
     error: dict[str, str] | None = None
 
     @classmethod
@@ -369,6 +375,50 @@ def build_system_prompt(
         "ledger data.\n\n"
         "## Conversation history\n\n"
         f"{context}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Contract F38 — document mode (uploaded PDF/JPG text → ONE transaction)
+# ---------------------------------------------------------------------------
+
+#: The extracted document text is truncated to this many characters before
+#: it enters the prompt (a long scan must not blow the context window).
+DOCUMENT_TEXT_CHAR_LIMIT = 6000
+
+#: ``source_text`` carried on the preview result for the UI panel.
+DOCUMENT_SOURCE_TEXT_CHARS = 500
+
+#: The user turn for a document extraction.  The document text itself
+#: rides in the SYSTEM prompt (the same transport seam as /message).
+DOCUMENT_USER_MESSAGE = (
+    "Extract the transaction from the attached document. If anything is "
+    "ambiguous, ask a clarification. Respond ONLY with JSON."
+)
+
+
+def build_document_system_prompt(
+    history: list[dict[str, Any]] | None = None,
+    *,
+    filename: str,
+    text: str,
+    coa: list[dict[str, Any]] | None = None,
+) -> str:
+    """The chat system prompt PLUS the uploaded document's extracted text.
+
+    Same skills/schemas/rules as :func:`build_system_prompt`; the document
+    section names the file and carries the text (truncated to
+    :data:`DOCUMENT_TEXT_CHAR_LIMIT`) so the LLM classifies ONE
+    transaction from it — the text, never an image, goes to the model.
+    """
+    base = build_system_prompt(history, coa=coa)
+    document_text = (text or "").strip()[:DOCUMENT_TEXT_CHAR_LIMIT]
+    return (
+        base
+        + "\n\n## Document text (extract ONE transaction from it)\n\n"
+        + f"Filename: {filename}\n\n"
+        + "Extracted text:\n"
+        + f"{document_text}\n"
     )
 
 
@@ -761,9 +811,89 @@ async def orchestrate_message(
     ]
     system_prompt = build_system_prompt(history, coa=coa_rows)
 
+    # ---- 1) the shared classify → construct → preview path (Contract F38)
+    return await _classify_and_preview(
+        db,
+        message,
+        system_prompt=system_prompt,
+        scope_id=scope_id,
+        accounts=accounts,
+        transport=transport,
+    )
+
+
+async def orchestrate_document(
+    db: Any,
+    text: str,
+    *,
+    filename: str,
+    entity_id: uuid.UUID | None = None,
+    history: list[dict[str, Any]] | None = None,
+    llm: LLMTransport | None = None,
+) -> OrchestrateResult:
+    """Orchestrate ONE uploaded document (Contract F38).
+
+    ``text`` is the text extracted by
+    :func:`src.services.document_extract.extract_document_text` — the
+    document itself never reaches the LLM.  Scope resolution, the COA
+    grounding and the classify → construct → contact → preview path are
+    EXACTLY those of :func:`orchestrate_message` (shared
+    :func:`_classify_and_preview`): same prose-retry, same clarification
+    passthrough, same contact auto-creation, same structured errors.  The
+    draft description is the extracted text (first 300 chars).
+
+    On a preview, :attr:`OrchestrateResult.source_text` carries the first
+    ~500 chars of the extracted text for the UI's "Extracted text" panel.
+    """
+    transport: LLMTransport = llm or call_llm
+
+    try:
+        scope_id: uuid.UUID | None = await resolve_entity_scope(db, entity_id)
+    except AmbiguousEntityError as exc:
+        return OrchestrateResult.failure("ambiguous_entity", exc.message)
+    accounts = await CoaService.list_accounts(db, entity_id=scope_id)
+    coa_rows = [
+        {"code": a.code, "name": a.name, "category": a.category, "type": a.type}
+        for a in accounts
+    ]
+    system_prompt = build_document_system_prompt(
+        history, filename=filename, text=text, coa=coa_rows
+    )
+
+    result = await _classify_and_preview(
+        db,
+        DOCUMENT_USER_MESSAGE,
+        system_prompt=system_prompt,
+        scope_id=scope_id,
+        accounts=accounts,
+        transport=transport,
+        description=text,
+    )
+    if result.status == "preview":
+        result.source_text = text.strip()[:DOCUMENT_SOURCE_TEXT_CHARS]
+    return result
+
+
+async def _classify_and_preview(
+    db: Any,
+    user_message: str,
+    *,
+    system_prompt: str,
+    scope_id: uuid.UUID | None,
+    accounts: list[Any],
+    transport: LLMTransport,
+    description: str | None = None,
+) -> OrchestrateResult:
+    """The shared classify → construct → contact → preview path (F38).
+
+    Used by :func:`orchestrate_message` (``description`` defaults to the
+    message) and :func:`orchestrate_document` (the extracted text).  The
+    LLM only ever classifies/extracts facts here; every amount, account
+    code and posting leg is deterministic (F4 constructors, F6 pipeline).
+    """
     # ---- 1) LLM classify + extract (never constructs money math) ---------
     try:
-        raw = await transport(system_prompt, message)
+        raw = await transport(system_prompt, user_message)
     except LLMError as exc:
         return OrchestrateResult.failure("llm_unreachable", str(exc))
     except Exception as exc:  # noqa: BLE001 — injected transports raise raw errors
@@ -781,7 +911,7 @@ async def orchestrate_message(
             "(no prose, no markdown)."
         )
         try:
-            raw = await transport(retry_prompt, message)
+            raw = await transport(retry_prompt, user_message)
             payload = _parse_llm_json(raw)
         except LLMError as exc:
             return OrchestrateResult.failure(
@@ -863,7 +993,9 @@ async def orchestrate_message(
         )
 
     total_pence = sum(leg.debit_amount for leg in entry.legs)
-    description = message.strip()[:300] or skill_id
+    description_text = (
+        description if description is not None else user_message
+    ).strip()[:300] or skill_id
 
     # ---- 5) contact auto-creation (Contract F29) — best-effort: the
     #         counterparty is resolved/created and stamped on the draft,
@@ -887,7 +1019,7 @@ async def orchestrate_message(
         transaction = await TransactionService.create_transaction(
             db,
             TransactionCreate(
-                description=description,
+                description=description_text,
                 contact_id=contact_id,
                 effective_date=_derive_effective_date(facts),
                 idempotency_key=uuid.uuid4(),

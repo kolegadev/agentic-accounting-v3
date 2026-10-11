@@ -6,24 +6,35 @@ pending never touch it.  Orchestrator structured errors map to 422 with
 {type, message}; service exceptions map to 404 / 422.
 
 Contract F19: every endpoint accepts an optional ``entity_id`` (the
-message body for /message, a query param for approve/reject/pending).
+message body for /message, a query param for approve/reject/pending, a
+form field for the F38 multipart /document upload).
 The scope resolves explicit > single-active > NULL legacy; more than one
 active entity without an explicit id is a 409 {type: ambiguous_entity} —
 never a silent global fallback.
+
+Contract F38: POST /document takes a multipart PDF/JPG/PNG upload,
+extracts its text (415 unsupported type, 413 over 10MB, 422 unreadable)
+and previews a draft through the same pipeline as /message.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import uuid
 from dataclasses import asdict
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.database import get_db
+from src.services.document_extract import (
+    DocumentExtractError,
+    extract_document_text,
+)
 from src.services.entity_service import (
     AmbiguousEntityError,
     EntityNotFoundError,
@@ -32,7 +43,9 @@ from src.services.entity_service import (
 )
 from src.services.orchestrator import (
     EntityScopeError,
+    OrchestrateResult,
     approve_entry,
+    orchestrate_document,
     orchestrate_message,
     reject_entry,
 )
@@ -103,6 +116,28 @@ def _entity_not_found_response(exc: EntityNotFoundError) -> JSONResponse:
     )
 
 
+def _preview_content(result: OrchestrateResult) -> dict[str, Any]:
+    """The preview payload shared by /message and /document (F38)."""
+    return {
+        "transaction_id": str(result.transaction_id),
+        "skill_id": result.skill_id,
+        "legs": [
+            {
+                "code": leg.code,
+                "name": leg.name,
+                "account_class": leg.account_class,
+                "debit_pence": leg.debit_pence,
+                "credit_pence": leg.credit_pence,
+                "description": leg.description,
+            }
+            for leg in (result.legs or [])
+        ],
+        "total_pence": result.total_pence,
+        "formance_preview": result.formance_preview,
+        "contact": result.contact,
+    }
+
+
 # ---------------------------------------------------------------------------
 # POST /message — preview (nothing posts)
 # ---------------------------------------------------------------------------
@@ -141,24 +176,7 @@ async def message(
             status_code=200,
             content={
                 "status": "preview",
-                "preview": {
-                    "transaction_id": str(result.transaction_id),
-                    "skill_id": result.skill_id,
-                    "legs": [
-                        {
-                            "code": leg.code,
-                            "name": leg.name,
-                            "account_class": leg.account_class,
-                            "debit_pence": leg.debit_pence,
-                            "credit_pence": leg.credit_pence,
-                            "description": leg.description,
-                        }
-                        for leg in (result.legs or [])
-                    ],
-                    "total_pence": result.total_pence,
-                    "formance_preview": result.formance_preview,
-                    "contact": result.contact,
-                },
+                "preview": _preview_content(result),
             },
         )
 
@@ -170,6 +188,186 @@ async def message(
                 "query_type": result.query_type,
                 "data": result.data,
                 "contact": result.contact,
+            },
+        )
+
+    error: dict[str, str] = result.error or {
+        "type": "invalid_response",
+        "message": "Orchestrator returned no result",
+    }
+    if error.get("type") == "clarification":
+        return JSONResponse(
+            status_code=200,
+            content={"status": "clarification", "error": error},
+        )
+    return JSONResponse(
+        status_code=422,
+        content={"type": error.get("type", "error"), "message": error.get("message", "")},
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /document — upload a PDF/JPG/PNG, extract its text, preview a draft
+# (Contract F38).  The document's TEXT (never an image) rides the SAME
+# classify → construct pipeline as /message, so preview/approve is unchanged.
+# ---------------------------------------------------------------------------
+
+#: Accepted extensions / content types (Contract F38) — anything else is 415.
+ALLOWED_DOCUMENT_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png")
+ALLOWED_DOCUMENT_CONTENT_TYPES = (
+    "application/pdf",
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+)
+#: Generic upload types are not a signal either way — the extension decides.
+GENERIC_DOCUMENT_CONTENT_TYPES = ("", "application/octet-stream")
+
+#: Hard upload limit (Contract F38) — larger uploads are 413.
+MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
+
+
+def _document_type_supported(filename: str, content_type: str) -> bool:
+    """True when the type is on the whitelist (Contract F38).
+
+    Verifier fix-list: the EXTRACTOR dispatches on the extension, so a
+    named file's extension must itself be whitelisted — the content type
+    is consulted only for extension-less uploads.  (A ``.exe`` that
+    claims ``image/png`` is refused here, not 422'd downstream.)
+    """
+    extension = os.path.splitext(filename or "")[1].lower()
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if extension:
+        return extension in ALLOWED_DOCUMENT_EXTENSIONS
+    if ctype in GENERIC_DOCUMENT_CONTENT_TYPES:
+        return False
+    return ctype in ALLOWED_DOCUMENT_CONTENT_TYPES
+
+
+def _parse_history_form(history: str) -> tuple[list[dict[str, Any]] | None, JSONResponse | None]:
+    """Parse the optional ``history`` form field (a JSON array of turns)."""
+    try:
+        parsed = json.loads(history)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, list):
+        return None, JSONResponse(
+            status_code=422,
+            content={
+                "type": "invalid_history",
+                "message": (
+                    "history must be a JSON array of {role, content} objects"
+                ),
+            },
+        )
+    return parsed, None
+
+
+@router.post(
+    "/document",
+    summary="Extract the text from an uploaded document and preview a draft",
+    status_code=200,
+    responses={
+        413: {"description": "Document over 10MB: {type: document_too_large}"},
+        415: {"description": "Unsupported type: {type: unsupported_document_type}"},
+        422: {"description": "Structured extraction/orchestrator error: {type, message}"},
+    },
+)
+async def document(
+    file: UploadFile = File(
+        ..., description="Invoice/bill/payroll document (PDF, JPG, JPEG or PNG)"
+    ),
+    entity_id: uuid.UUID | None = Form(
+        None, description="Entity scope (required when several are active)"
+    ),
+    history: str | None = Form(
+        None, description="Conversation history as a JSON string"
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Multipart upload → extract text → classify → construct → preview.
+
+    Guards: unsupported type → 415, over :data:`MAX_DOCUMENT_BYTES` → 413,
+    unreadable/OCR-missing → 422 {type, message}.  On success the response
+    mirrors /message plus ``source_text`` and ``filename`` so the UI can
+    show what was read.  Nothing is persisted and nothing posts here.
+    """
+    filename = file.filename or ""
+    if not _document_type_supported(filename, file.content_type or ""):
+        return JSONResponse(
+            status_code=415,
+            content={
+                "type": "unsupported_document_type",
+                "message": (
+                    f"{filename or 'uploaded file'} is not a supported "
+                    "document — upload a PDF, JPG, JPEG or PNG"
+                ),
+            },
+        )
+
+    data = await file.read()
+    if len(data) > MAX_DOCUMENT_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "type": "document_too_large",
+                "message": (
+                    f"document is {len(data)} bytes — the limit is "
+                    f"{MAX_DOCUMENT_BYTES} bytes (10MB)"
+                ),
+            },
+        )
+
+    parsed_history: list[dict[str, Any]] | None = None
+    if history:
+        parsed_history, history_error = _parse_history_form(history)
+        if history_error is not None:
+            return history_error
+
+    try:
+        scope_id = await _resolve_scope(db, entity_id)
+    except AmbiguousEntityError as exc:
+        return _ambiguous_response(exc)
+    except EntityNotFoundError as exc:
+        return _entity_not_found_response(exc)
+
+    try:
+        text = extract_document_text(filename, data)
+    except DocumentExtractError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"type": exc.type, "message": exc.message},
+        )
+
+    result = await orchestrate_document(
+        db,
+        text,
+        filename=filename,
+        entity_id=scope_id,
+        history=parsed_history,
+    )
+
+    if result.status == "preview":
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "preview",
+                "preview": _preview_content(result),
+                "source_text": result.source_text,
+                "filename": filename,
+            },
+        )
+
+    if result.status == "answer":
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "answer",
+                "query_type": result.query_type,
+                "data": result.data,
+                "contact": result.contact,
+                "source_text": result.source_text,
+                "filename": filename,
             },
         )
 

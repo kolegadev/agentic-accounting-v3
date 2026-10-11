@@ -261,6 +261,46 @@ async def orchestrator_message(data: dict):
     return await _forward_orchestrator("message", data)
 
 
+@app.post("/api/orchestrator/document")
+async def orchestrator_document(request: Request):
+    """POST → /api/v1/orchestrator/document (multipart upload passthrough).
+
+    Contract F38: the upload bytes pass through UNTOUCHED — the request
+    body is read whole via ``await request.body()`` and forwarded with the
+    browser's own content-type header (multipart boundary included), so no
+    form re-encoding can corrupt the file.  The browser's query string
+    (entity_id — F20) passes through; the document classify is slow, so
+    this uses the 65s LLM client, and an unreachable upstream is the usual
+    502 upstream_unreachable.  The body is buffered bytes, so the
+    cold-boot retry transport stays safe.
+    """
+    url = f"{API_BASE_URL}/api/v1/orchestrator/document"
+    headers: dict[str, str] = {}
+    content_type = request.headers.get("content-type")
+    if content_type:
+        headers["Content-Type"] = content_type
+    body = await request.body()
+    try:
+        client = _get_llm_upstream_client()
+        resp = await client.post(
+            url, content=body, headers=headers, params=dict(request.query_params)
+        )
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "type": "upstream_unreachable",
+                "message": f"Accounting API unreachable: {exc}",
+            },
+        )
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"detail": resp.text}
+    return JSONResponse(status_code=resp.status_code, content=payload)
+
+
 @app.post("/api/orchestrator/approve")
 async def orchestrator_approve(data: dict, request: Request):
     """POST → /api/v1/orchestrator/approve (post the approved draft)."""

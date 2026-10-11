@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient
 
 from src.index import app
 from src.models.transaction import Posting, Transaction
+from src.services.document_extract import DocumentExtractError
+from src.services.entity_service import AmbiguousEntityError
 from src.services.ledger_parity import ParityReport
 from src.services.orchestrator import (
     OrchestrateResult,
@@ -471,3 +473,235 @@ def test_pending_empty_returns_empty_list(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body == {"transactions": [], "total": 0}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/orchestrator/document (Contract F38) — multipart upload
+# ---------------------------------------------------------------------------
+
+DOC_FILES = {"file": ("inv-1001.pdf", b"%PDF-1.4 document bytes", "application/pdf")}
+DOC_TEXT = "ACME OFFICE SUPPLIES LTD\nInvoice INV-1001\nTotal due 120.00\n"
+DOC_ENTITY_ID = uuid.UUID("8f0b3c9a-3333-4a2b-9c3d-000000000003")
+
+
+def _document_preview_result() -> OrchestrateResult:
+    result = OrchestrateResult.preview(
+        transaction_id=TX_ID,
+        skill_id="supplier-invoice",
+        legs=_legs(),
+        total_pence=10000,
+        formance_preview=[
+            {"source": "2000", "destination": "5000", "amount": "100.00", "asset": "GBP/2"}
+        ],
+        contact={
+            "id": str(uuid.uuid4()),
+            "name": "Acme Office Supplies",
+            "created": True,
+        },
+    )
+    result.source_text = DOC_TEXT.strip()[:500]
+    return result
+
+
+def test_document_preview_returns_source_text_and_filename(client: TestClient) -> None:
+    with (
+        patch(
+            "src.routes.orchestrator.extract_document_text", return_value=DOC_TEXT
+        ) as extract,
+        patch(
+            "src.routes.orchestrator.orchestrate_document", new_callable=AsyncMock
+        ) as mock,
+    ):
+        mock.return_value = _document_preview_result()
+        response = client.post(
+            "/api/v1/orchestrator/document",
+            files=DOC_FILES,
+            data={"history": '[{"role": "user", "content": "hi"}]'},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "preview"
+    assert body["source_text"] == DOC_TEXT.strip()[:500]
+    assert body["filename"] == "inv-1001.pdf"
+    preview = body["preview"]
+    assert preview["transaction_id"] == str(TX_ID)
+    assert preview["skill_id"] == "supplier-invoice"
+    assert preview["total_pence"] == 10000
+    assert preview["legs"][0]["code"] == "5000"
+    assert preview["legs"][0]["debit_pence"] == 10000
+    assert preview["contact"]["name"] == "Acme Office Supplies"
+    assert preview["contact"]["created"] is True
+    # The extracted TEXT (never the file bytes) reaches the orchestrator.
+    assert mock.await_args.args[1] == DOC_TEXT
+    assert mock.await_args.kwargs["filename"] == "inv-1001.pdf"
+    assert mock.await_args.kwargs["history"] == [{"role": "user", "content": "hi"}]
+    assert extract.call_args.args[0] == "inv-1001.pdf"
+    assert extract.call_args.args[1] == b"%PDF-1.4 document bytes"
+
+
+def test_document_unsupported_type_returns_415(client: TestClient) -> None:
+    with patch("src.routes.orchestrator.extract_document_text") as extract:
+        response = client.post(
+            "/api/v1/orchestrator/document",
+            files={"file": ("notes.txt", b"hello", "text/plain")},
+        )
+
+    assert response.status_code == 415
+    body = response.json()
+    assert body["type"] == "unsupported_document_type"
+    assert "notes.txt" in body["message"]
+    extract.assert_not_called()
+
+
+def test_document_over_10mb_returns_413(client: TestClient) -> None:
+    oversized = b"0" * (10 * 1024 * 1024 + 1)
+    with (
+        patch("src.routes.orchestrator.extract_document_text") as extract,
+        patch(
+            "src.routes.orchestrator.orchestrate_document", new_callable=AsyncMock
+        ) as mock,
+    ):
+        response = client.post(
+            "/api/v1/orchestrator/document",
+            files={"file": ("big.pdf", oversized, "application/pdf")},
+        )
+
+    assert response.status_code == 413
+    assert response.json()["type"] == "document_too_large"
+    extract.assert_not_called()
+    mock.assert_not_awaited()
+
+
+def test_document_unreadable_returns_422(client: TestClient) -> None:
+    with patch(
+        "src.routes.orchestrator.extract_document_text",
+        side_effect=DocumentExtractError("no readable text", "document_unreadable"),
+    ):
+        response = client.post("/api/v1/orchestrator/document", files=DOC_FILES)
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["type"] == "document_unreadable"
+    assert "no readable text" in body["message"]
+
+
+def test_document_ocr_unavailable_returns_422(client: TestClient) -> None:
+    with patch(
+        "src.routes.orchestrator.extract_document_text",
+        side_effect=DocumentExtractError("pytesseract is not installed", "ocr_unavailable"),
+    ):
+        response = client.post(
+            "/api/v1/orchestrator/document",
+            files={"file": ("receipt.jpg", b"jpg bytes", "image/jpeg")},
+        )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["type"] == "ocr_unavailable"
+    assert "pytesseract" in body["message"]
+
+
+def test_document_clarification_returns_200(client: TestClient) -> None:
+    with (
+        patch("src.routes.orchestrator.extract_document_text", return_value=DOC_TEXT),
+        patch(
+            "src.routes.orchestrator.orchestrate_document", new_callable=AsyncMock
+        ) as mock,
+    ):
+        mock.return_value = OrchestrateResult.failure(
+            "clarification", "Which supplier is this invoice from?"
+        )
+        response = client.post("/api/v1/orchestrator/document", files=DOC_FILES)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "clarification"
+    assert body["error"]["type"] == "clarification"
+    assert "Which supplier" in body["error"]["message"]
+
+
+def test_document_structured_error_maps_to_422(client: TestClient) -> None:
+    with (
+        patch("src.routes.orchestrator.extract_document_text", return_value=DOC_TEXT),
+        patch(
+            "src.routes.orchestrator.orchestrate_document", new_callable=AsyncMock
+        ) as mock,
+    ):
+        mock.return_value = OrchestrateResult.failure(
+            "llm_unreachable", "LLM API error: connection refused"
+        )
+        response = client.post("/api/v1/orchestrator/document", files=DOC_FILES)
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["type"] == "llm_unreachable"
+    assert "connection refused" in body["message"]
+
+
+def test_document_invalid_history_form_returns_422(client: TestClient) -> None:
+    with patch("src.routes.orchestrator.extract_document_text") as extract:
+        response = client.post(
+            "/api/v1/orchestrator/document",
+            files=DOC_FILES,
+            data={"history": "{not-json"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["type"] == "invalid_history"
+    extract.assert_not_called()
+
+
+def test_document_passes_entity_id_and_resolved_scope_through(
+    client: TestClient,
+) -> None:
+    with (
+        patch(
+            "src.routes.orchestrator.require_active_entity", new_callable=AsyncMock
+        ),
+        patch(
+            "src.routes.orchestrator.resolve_entity_scope",
+            new_callable=AsyncMock,
+            return_value=DOC_ENTITY_ID,
+        ) as resolve,
+        patch("src.routes.orchestrator.extract_document_text", return_value=DOC_TEXT),
+        patch(
+            "src.routes.orchestrator.orchestrate_document", new_callable=AsyncMock
+        ) as mock,
+    ):
+        mock.return_value = _document_preview_result()
+        response = client.post(
+            "/api/v1/orchestrator/document",
+            files=DOC_FILES,
+            data={"entity_id": str(DOC_ENTITY_ID)},
+        )
+
+    assert response.status_code == 200
+    resolve.assert_awaited_once()
+    assert resolve.await_args.args[1] == DOC_ENTITY_ID
+    assert mock.await_args.kwargs["entity_id"] == DOC_ENTITY_ID
+
+
+def test_document_ambiguous_scope_returns_409(client: TestClient) -> None:
+    with (
+        patch(
+            "src.routes.orchestrator.resolve_entity_scope",
+            AsyncMock(side_effect=AmbiguousEntityError([uuid.uuid4(), uuid.uuid4()])),
+        ),
+        patch(
+            "src.routes.orchestrator.orchestrate_document", new_callable=AsyncMock
+        ) as mock,
+    ):
+        response = client.post("/api/v1/orchestrator/document", files=DOC_FILES)
+
+    assert response.status_code == 409
+    assert response.json()["type"] == "ambiguous_entity"
+    mock.assert_not_awaited()
+
+
+def test_document_missing_file_is_422_validation(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/orchestrator/document", data={"entity_id": str(DOC_ENTITY_ID)}
+    )
+
+    assert response.status_code == 422

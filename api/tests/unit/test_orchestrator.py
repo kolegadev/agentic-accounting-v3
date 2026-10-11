@@ -24,12 +24,18 @@ from src.models.account import Account
 from src.models.contact import Contact
 from src.models.transaction import Posting, Transaction
 from src.services.contact_service import ContactService
+from src.services.entity_service import AmbiguousEntityError
 from src.services.ledger_parity import ParityReport
 from src.services.orchestrator import (
+    DOCUMENT_SOURCE_TEXT_CHARS,
+    DOCUMENT_TEXT_CHAR_LIMIT,
+    DOCUMENT_USER_MESSAGE,
     EntityScopeError,
     LLMError,
     approve_entry,
+    build_document_system_prompt,
     build_system_prompt,
+    orchestrate_document,
     orchestrate_message,
     reject_entry,
 )
@@ -1109,3 +1115,214 @@ def test_build_system_prompt_includes_coa_when_provided() -> None:
 
     without = build_system_prompt()
     assert "## Chart of accounts" not in without
+
+
+# ---------------------------------------------------------------------------
+# Contract F38 — orchestrate_document (uploaded document text → ONE draft)
+# ---------------------------------------------------------------------------
+
+DOC_TEXT = (
+    "ACME OFFICE SUPPLIES LTD\n"
+    "Invoice INV-1001\n"
+    "Date: 01/10/2026\n"
+    "Printer paper 100.00\n"
+    "VAT 20% 20.00\n"
+    "Total due 120.00\n"
+)
+
+SUPPLIER_INVOICE_JSON = (
+    '{"skill_id": "supplier-invoice", "facts": {'
+    '"supplier_name": "Acme Office Supplies", "invoice_ref": "INV-1001", '
+    '"invoice_date": "2026-10-01", "lines": ['
+    '{"description": "Printer paper", "net_pence": 10000, '
+    '"vat_rate": "20%", "expense_account_code": "5000"}]}}'
+)
+
+
+def _supplier_invoice_db_side_effects(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    """The execute() sequence for a supplier-invoice preview: scope, COA,
+    the three account lookups, the idempotency check and account
+    validation (identical to the orchestrate_message happy-path test)."""
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=list(coa.values())),  # list_accounts
+        _result(scalar=coa["5000"]),  # get_account_by_code
+        _result(scalar=coa["2220"]),
+        _result(scalar=coa["2000"]),
+        _result(scalar=None),  # idempotency check
+        _result(scalars=[coa["5000"], coa["2220"], coa["2000"]]),
+    ]
+
+
+def test_build_document_system_prompt_carries_filename_and_text() -> None:
+    prompt = build_document_system_prompt(
+        None, filename="inv-1001.pdf", text=DOC_TEXT
+    )
+
+    assert "## Document text (extract ONE transaction from it)" in prompt
+    assert "inv-1001.pdf" in prompt
+    assert "ACME OFFICE SUPPLIES LTD" in prompt
+    assert "Total due 120.00" in prompt
+    # The chat rules/skills still apply — same classification surface.
+    assert '"skill_id": "supplier-invoice"' in prompt
+    assert "INTEGER PENCE" in prompt
+
+
+def test_build_document_system_prompt_truncates_long_text() -> None:
+    long_text = "H" * (DOCUMENT_TEXT_CHAR_LIMIT + 1000) + "ZZZTAILZZZ"
+
+    prompt = build_document_system_prompt(None, filename="scan.pdf", text=long_text)
+
+    assert "H" * DOCUMENT_TEXT_CHAR_LIMIT in prompt
+    assert "H" * (DOCUMENT_TEXT_CHAR_LIMIT + 1) not in prompt
+    assert "ZZZTAILZZZ" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_document_supplier_invoice_preview_with_contact(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    """A supplier invoice document → preview + legs + auto-created contact,
+    with the document text (and filename) carrying the classification."""
+    captured: dict[str, str] = {}
+
+    async def transport(system_prompt: str, user_message: str) -> str:
+        captured["system_prompt"] = system_prompt
+        captured["user_message"] = user_message
+        return SUPPLIER_INVOICE_JSON
+
+    _supplier_invoice_db_side_effects(mock_db, coa)
+    supplier_contact = _contact_response("Acme Office Supplies")
+
+    with patch.object(
+        ContactService,
+        "find_or_create",
+        AsyncMock(return_value=(supplier_contact, True)),
+    ) as mock_find_or_create:
+        result = await orchestrate_document(
+            mock_db, DOC_TEXT, filename="inv-1001.pdf", llm=transport
+        )
+
+    # The prompt carries the document; the user turn is the fixed instruction.
+    assert "inv-1001.pdf" in captured["system_prompt"]
+    assert "ACME OFFICE SUPPLIES LTD" in captured["system_prompt"]
+    assert captured["user_message"] == DOCUMENT_USER_MESSAGE
+    assert "Respond ONLY with JSON" in captured["user_message"]
+
+    assert result.status == "preview"
+    assert result.skill_id == "supplier-invoice"
+    assert result.transaction_id is not None
+    assert result.total_pence == 12000
+    assert [(l.code, l.debit_pence, l.credit_pence) for l in result.legs] == [
+        ("5000", 10000, 0),
+        ("2220", 2000, 0),
+        ("2000", 0, 12000),
+    ]
+    # F38 — the UI panel sources its text from the result.
+    assert result.source_text == DOC_TEXT.strip()
+    # The draft description is the extracted text (first 300 chars).
+    drafts = [o for o in mock_db.added if isinstance(o, Transaction)]
+    assert len(drafts) == 1
+    assert drafts[0].description == DOC_TEXT.strip()[:300]
+    assert drafts[0].contact_id == uuid.UUID(result.contact["id"])
+    mock_find_or_create.assert_awaited_once()
+    assert mock_find_or_create.call_args.args[1] == "Acme Office Supplies"
+    assert mock_find_or_create.call_args.kwargs["type"] == "supplier"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_document_source_text_truncated_to_500(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    long_text = "ACME SUPPLIES Invoice 120.00\n" + ("n" * 700)
+
+    async def transport(system_prompt: str, user_message: str) -> str:
+        return SUPPLIER_INVOICE_JSON
+
+    _supplier_invoice_db_side_effects(mock_db, coa)
+    with patch.object(
+        ContactService,
+        "find_or_create",
+        AsyncMock(return_value=(_contact_response("Acme Office Supplies"), True)),
+    ):
+        result = await orchestrate_document(
+            mock_db, long_text, filename="long.pdf", llm=transport
+        )
+
+    assert result.status == "preview"
+    assert result.source_text == long_text.strip()[:DOCUMENT_SOURCE_TEXT_CHARS]
+    assert len(result.source_text) == DOCUMENT_SOURCE_TEXT_CHARS
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_document_clarification_passes_through(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    async def transport(system_prompt: str, user_message: str) -> str:
+        return '{"skill_id": null, "clarification": "What is the invoice date?"}'
+
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope
+        _result(scalars=list(coa.values())),  # list_accounts
+    ]
+
+    result = await orchestrate_document(
+        mock_db, DOC_TEXT, filename="blurry.jpg", llm=transport
+    )
+
+    assert result.status == "error"
+    assert result.error == {
+        "type": "clarification",
+        "message": "What is the invoice date?",
+    }
+    assert result.source_text is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_document_prose_reply_retries_with_json_nudge(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    """The F35b prose retry is shared: a first prose reply + a JSON-only
+    nudge second call still yields the preview, document text intact."""
+    calls: list[tuple[str, str]] = []
+
+    async def transport(system_prompt: str, user_message: str) -> str:
+        calls.append((system_prompt, user_message))
+        if len(calls) == 1:
+            return "This looks like a supplier invoice for printer paper."
+        return SUPPLIER_INVOICE_JSON
+
+    _supplier_invoice_db_side_effects(mock_db, coa)
+    with patch.object(
+        ContactService,
+        "find_or_create",
+        AsyncMock(return_value=(_contact_response("Acme Office Supplies"), True)),
+    ):
+        result = await orchestrate_document(
+            mock_db, DOC_TEXT, filename="inv-1001.pdf", llm=transport
+        )
+
+    assert len(calls) == 2
+    assert "respond with NOTHING but the JSON object" in calls[1][0]
+    assert "inv-1001.pdf" in calls[1][0]  # the document survives the retry
+    assert result.status == "preview"
+    assert result.total_pence == 12000
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_document_ambiguous_entity_fails_loud(
+    mock_db: AsyncMock,
+) -> None:
+    with patch(
+        "src.services.orchestrator.resolve_entity_scope",
+        AsyncMock(side_effect=AmbiguousEntityError([uuid.uuid4(), uuid.uuid4()])),
+    ):
+        result = await orchestrate_document(
+            mock_db, DOC_TEXT, filename="inv.pdf"
+        )
+
+    assert result.status == "error"
+    assert result.error is not None
+    assert result.error["type"] == "ambiguous_entity"

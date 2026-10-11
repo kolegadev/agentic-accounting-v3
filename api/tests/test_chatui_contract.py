@@ -106,6 +106,20 @@ ACCOUNT_ENDPOINTS = [
     "/api/accounts/",
 ]
 
+# Contract F38 — document upload: the paperclip + hidden file input post
+# multipart to the proxy, and the preview pane carries the collapsible
+# "Extracted text" panel fed by the response's source_text.
+DOCUMENT_DOM_IDS = [
+    "attach-btn",
+    "file-input",
+    "extract-panel",
+    "extract-text",
+]
+
+DOCUMENT_ENDPOINTS = [
+    "/api/orchestrator/document",
+]
+
 FORBIDDEN_STRINGS = [
     "brightwork",
     "/api/companies",
@@ -289,3 +303,41 @@ def test_fiscal_year_start_never_null(html: str) -> None:
         "fiscal_year_start: document.getElementById('co-fys').value.trim() || null"
         not in html
     )
+
+
+# ---------------------------------------------------------------------------
+# Contract F38 — document upload (paperclip → /api/orchestrator/document)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dom_id", DOCUMENT_DOM_IDS)
+def test_required_document_dom_id_present(html: str, dom_id: str) -> None:
+    assert f'id="{dom_id}"' in html
+
+
+@pytest.mark.parametrize("endpoint", DOCUMENT_ENDPOINTS)
+def test_js_references_document_endpoint(html: str, endpoint: str) -> None:
+    assert endpoint in html
+
+
+def test_file_input_accepts_only_pdf_and_images(html: str) -> None:
+    """The hidden file input whitelists the extraction formats."""
+    assert 'type="file"' in html
+    assert 'accept=".pdf,.jpg,.jpeg,.png"' in html
+
+
+def test_document_upload_pushes_user_chat_history(html: str) -> None:
+    """A document upload becomes a 'user' turn ('Uploaded <filename>') in
+    the conversation history so the F35 clarification loop stays coherent."""
+    assert "pushChatHistory('user', label)" in html
+    assert "'Uploaded ' + file.name" in html
+
+
+def test_document_upload_shows_reading_status(html: str) -> None:
+    assert "setPreviewStatus('Reading document…', 'working')" in html
+
+
+def test_extracted_text_panel_is_escaped(html: str) -> None:
+    """The source_text panel is fed ONLY esc()'d text, never raw content."""
+    assert "textEl.innerHTML = esc(sourceText)" in html
+    assert "textEl.innerHTML = sourceText" not in html

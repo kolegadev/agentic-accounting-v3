@@ -1047,3 +1047,117 @@ def test_message_uses_llm_client_pending_uses_standard(client: TestClient, monke
 
     assert llm_calls == ["/api/v1/orchestrator/message"]
     assert std_calls == ["/api/v1/orchestrator/pending"]
+
+
+# ---------------------------------------------------------------------------
+# Document upload proxy (Contract F38) — multipart bytes pass through
+# ---------------------------------------------------------------------------
+
+DOCUMENT_PARTS = {
+    "file": ("inv-1001.pdf", b"%PDF-1.4 document bytes", "application/pdf")
+}
+DOCUMENT_ENTITY = "8f0b3c9a-3333-4a2b-9c3d-000000000003"
+
+
+def test_document_forwards_multipart_bytes_untouched(
+    client: TestClient, upstream
+) -> None:
+    resp = client.post(
+        "/api/orchestrator/document",
+        files=DOCUMENT_PARTS,
+        data={"entity_id": DOCUMENT_ENTITY, "history": "[]"},
+    )
+
+    assert resp.status_code == 200
+    echo = resp.json()
+    assert echo["method"] == "POST"
+    assert echo["path"] == "/api/v1/orchestrator/document"
+    req = upstream[0]
+    assert req.method == "POST"
+    assert req.url.path == "/api/v1/orchestrator/document"
+    content_type = req.headers.get("content-type", "")
+    assert content_type.startswith("multipart/form-data")
+    assert "boundary=" in content_type  # the browser's own header, untouched
+    # The upload bytes and both form fields survive the proxy untouched.
+    assert b"%PDF-1.4 document bytes" in req.content
+    assert b'name="file"' in req.content
+    assert b"inv-1001.pdf" in req.content
+    assert b'name="entity_id"' in req.content
+    assert b'name="history"' in req.content
+
+
+def test_document_forwards_entity_id_query_param(
+    client: TestClient, upstream
+) -> None:
+    """The F20 query-param pattern also passes through (entity_id)."""
+    resp = client.post(
+        f"/api/orchestrator/document?entity_id={DOCUMENT_ENTITY}",
+        files=DOCUMENT_PARTS,
+    )
+
+    assert resp.status_code == 200
+    assert upstream[0].url.path == "/api/v1/orchestrator/document"
+    assert upstream[0].url.params.get("entity_id") == DOCUMENT_ENTITY
+
+
+def test_document_upstream_unreachable_returns_502(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _set_transport(monkeypatch, handler)
+    resp = client.post("/api/orchestrator/document", files=DOCUMENT_PARTS)
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "upstream_unreachable"
+    assert "connection refused" in body["message"]
+
+
+def test_document_upstream_error_status_and_json_passthrough(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422, json={"type": "document_unreadable", "message": "no text found"}
+        )
+
+    _set_transport(monkeypatch, handler)
+    resp = client.post("/api/orchestrator/document", files=DOCUMENT_PARTS)
+
+    assert resp.status_code == 422
+    assert resp.json() == {
+        "type": "document_unreadable",
+        "message": "no text found",
+    }
+
+
+def test_document_uses_llm_client(client: TestClient, monkeypatch) -> None:
+    """The document classify can be slow — it must use the 65s LLM client
+    (Contract F36/F38), not the shared 10s one."""
+    llm_calls: list[str] = []
+
+    def llm_handler(request: httpx.Request) -> httpx.Response:
+        llm_calls.append(request.url.path)
+        return httpx.Response(200, json={"status": "preview", "preview": {}})
+
+    def std_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("document upload must use the 65s LLM client")
+
+    monkeypatch.setattr(
+        server,
+        "_llm_upstream_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(llm_handler)),
+    )
+    monkeypatch.setattr(
+        server,
+        "_upstream_client",
+        httpx.AsyncClient(transport=httpx.MockTransport(std_handler)),
+    )
+
+    resp = client.post("/api/orchestrator/document", files=DOCUMENT_PARTS)
+
+    assert resp.status_code == 200
+    assert llm_calls == ["/api/v1/orchestrator/document"]

@@ -27,6 +27,11 @@ dependencies = [
     "jinja2>=3.1.0",
     "python-dateutil>=2.9.0",
     "pendulum>=3.0.0",
+    # Contract F38 — document upload extraction (PDF text + OCR).  Both are
+    # import-guarded at call time; the deploy step installs them (plus the
+    # tesseract-ocr apt package) on thebrick.
+    "pypdf>=4.0.0",
+    "pytesseract>=0.3.10",
 ]
 
 [project.optional-dependencies]
