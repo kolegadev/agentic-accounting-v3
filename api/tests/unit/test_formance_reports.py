@@ -773,6 +773,146 @@ async def test_bs_penny_exactness(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Balance sheet — Contract F24: profit_for_period (flow-derived current
+# profit in equity; identity assets == liabilities + equity + profit)
+# ---------------------------------------------------------------------------
+
+
+def _profit_line(report: dict) -> dict:
+    return next(
+        line
+        for line in report["sections"]["equity"]
+        if line["code"] == "profit_for_period"
+    )
+
+
+async def test_bs_current_profit_capital_plus_expense(monkeypatch) -> None:
+    """A posted expense no longer breaks the identity: the equity section
+    carries profit_for_period = −expense (exact pence) and the identity
+    holds with assets == liabilities + equity (accounts + profit)."""
+    entries = [
+        ("capital", "posted", "2026-01-05T09:00:00+00:00", [
+            {"source": "3000", "destination": "1000", "amount": "1000.00", "asset": GBP},
+        ], {}),
+        ("expense", "posted", "2026-02-01T09:00:00+00:00", [
+            {"source": "1000", "destination": "6000", "amount": "50.00", "asset": GBP},
+        ], {}),
+    ]
+    balances = {"1000": "950.00", "6000": "50.00", "3000": "-1000.00"}
+    world = await make_world(monkeypatch, entries=entries, balances=balances)
+    try:
+        report = await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
+        assert report["identity_ok"] is True
+        assert _profit_line(report) == {
+            "code": "profit_for_period",
+            "name": "Profit for the period",
+            "amount": -5000,
+        }
+        eq = {line["code"]: line["amount"] for line in report["sections"]["equity"]}
+        assert eq["3000"] == 100000
+        assert report["totals"] == {
+            "assets": 95000,
+            "liabilities": 0,
+            "equity": 95000,
+            "liabilities_and_equity": 95000,
+        }
+    finally:
+        await world.close()
+
+
+async def test_bs_current_profit_income_only(monkeypatch) -> None:
+    """Income-only period: profit_for_period is positive revenue and the
+    identity holds (assets == equity accounts + profit)."""
+    entries = [
+        ("sale", "posted", "2026-01-02T00:00:00+00:00", [_sale_posting("10.00")], {}),
+    ]
+    balances = {"1100": "10.00", "4000": "-10.00"}
+    world = await make_world(monkeypatch, entries=entries, balances=balances)
+    try:
+        report = await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
+        assert report["identity_ok"] is True
+        assert _profit_line(report)["amount"] == 1000
+        assert report["totals"] == {
+            "assets": 1000,
+            "liabilities": 0,
+            "equity": 1000,
+            "liabilities_and_equity": 1000,
+        }
+    finally:
+        await world.close()
+
+
+async def test_bs_current_profit_live_60_shape(monkeypatch) -> None:
+    """The live £60 supplier-invoice shape: Dr 5000 5,000p expense, Dr 2220
+    1,000p VAT input, Cr 2000 6,000p creditors → profit −5,000p, VAT
+    recoverable 1,000p in assets, identity exact in pence."""
+    entries = [
+        ("supplier", "posted", "2026-10-02T09:00:00+00:00", [
+            {"source": "2000", "destination": "5000", "amount": "50.00", "asset": GBP},
+            {"source": "2000", "destination": "2220", "amount": "10.00", "asset": GBP},
+        ], {}),
+    ]
+    balances = {"5000": "50.00", "2220": "10.00", "2000": "-60.00"}
+    world = await make_world(monkeypatch, entries=entries, balances=balances)
+    try:
+        report = await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
+        assert report["identity_ok"] is True
+        assert _profit_line(report)["amount"] == -5000
+        assert report["vat_recoverable_asset"] == 1000
+        assert report["totals"] == {
+            "assets": 1000,
+            "liabilities": 6000,
+            "equity": -5000,
+            "liabilities_and_equity": 1000,
+        }
+    finally:
+        await world.close()
+
+
+async def test_bs_current_profit_period_start_filtering(monkeypatch) -> None:
+    """The fiscal-window ``period_start`` filters the profit flows: the
+    pre-window expense is excluded from profit_for_period (the balances
+    already close it into 3020), and dropping the window lets it leak in
+    and breaks the identity loudly."""
+    entries = [
+        ("capital", "posted", "2026-01-05T09:00:00+00:00", [
+            {"source": "3000", "destination": "1000", "amount": "1000.00", "asset": GBP},
+        ], {}),
+        ("expense_pre", "posted", "2026-02-01T09:00:00+00:00", [
+            {"source": "1000", "destination": "6000", "amount": "50.00", "asset": GBP},
+        ], {}),
+        ("expense_in", "posted", "2026-07-01T09:00:00+00:00", [
+            {"source": "1000", "destination": "6000", "amount": "20.00", "asset": GBP},
+        ], {}),
+    ]
+    # Balances as at 31 Dec: the pre-window expense is already closed into
+    # retained earnings (3020 carries the Dr 5,000p).
+    balances = {"1000": "930.00", "3000": "-1000.00", "3020": "50.00"}
+    world = await make_world(monkeypatch, entries=entries, balances=balances)
+    try:
+        report = await generate_bs(
+            world.db,
+            "main",
+            as_at=date(2026, 12, 31),
+            period_start=date(2026, 6, 1),
+        )
+        assert report["identity_ok"] is True
+        assert _profit_line(report)["amount"] == -2000
+        assert report["totals"] == {
+            "assets": 93000,
+            "liabilities": 0,
+            "equity": 93000,
+            "liabilities_and_equity": 93000,
+        }
+        # Inception (no window): both expenses flow into the profit line
+        # and the identity breaks loudly instead of being fudged.
+        with pytest.raises(ReportEngineError, match="balance sheet identity violated"):
+            await generate_bs(world.db, "main", as_at=date(2026, 12, 31))
+    finally:
+        await world.close()
+
+
+# ---------------------------------------------------------------------------
 # Trial balance
 # ---------------------------------------------------------------------------
 

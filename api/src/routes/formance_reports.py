@@ -16,6 +16,7 @@ one active entity without an explicit id is a 409
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import date
 from typing import Any, Optional
@@ -43,6 +44,8 @@ from src.services.formance_reports import (
     generate_tb,
     verify_against_postgres,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/reports/formance", tags=["Reports — Formance"])
 
@@ -86,6 +89,34 @@ def _fiscal_year_start(fiscal_year_start: str, today: date) -> date:
         return candidate if candidate <= today else date(today.year - 1, 4, 6)
 
 
+async def _entity_fiscal_start(
+    db: AsyncSession, scope_id: Optional[uuid.UUID], end: date
+) -> Optional[date]:
+    """Fiscal-year start for a window ending ``end`` (Contract F23b/F24).
+
+    The resolved entity's ``fiscal_year_start`` (UK 6-April fallback when
+    the entity has none); ``None`` when no entity scope resolves.  Lookup
+    failures degrade to the UK default — best-effort, like
+    ``get_ledger_for_entity`` — so a pre-F11 schema or an unreachable
+    entities table never breaks a report request.
+    """
+    if scope_id is None:
+        return None
+    fiscal_year_start = "04-06"
+    try:
+        entity = await EntityService.get_entity(db, scope_id)
+    except Exception as exc:  # noqa: BLE001 — resolution is best-effort
+        logger.warning(
+            "_entity_fiscal_start: entity lookup failed (%s); "
+            "using the UK 6-April default",
+            exc,
+        )
+        entity = None
+    if entity is not None and entity.fiscal_year_start:
+        fiscal_year_start = entity.fiscal_year_start
+    return _fiscal_year_start(fiscal_year_start, end)
+
+
 # ---------------------------------------------------------------------------
 # GET /{report_type} — run the engine + Postgres cross-check
 # ---------------------------------------------------------------------------
@@ -124,8 +155,11 @@ async def formance_report(
 
     pl / cash-flow / funds require period_start + period_end;
     balance-sheet / trial-balance take as_at (default: today).
-    P&L/BS/TB additionally run verify_against_postgres and include the
-    diff list; cash-flow/funds have no Postgres equivalent.
+    The balance sheet additionally receives the entity's fiscal-year start
+    as ``period_start`` (Contract F24, None = inception) for its
+    profit-for-period line. P&L/BS/TB additionally run
+    verify_against_postgres and include the diff list; cash-flow/funds
+    have no Postgres equivalent.
     """
     if report_type not in VALID_REPORT_TYPES:
         return JSONResponse(
@@ -163,14 +197,21 @@ async def formance_report(
         )
 
     if report_type in FLOW_TYPES and (period_start is None or period_end is None):
-        fiscal_year_start = "04-06"
-        if scope_id is not None:
-            entity = await EntityService.get_entity(db, scope_id)
-            if entity is not None and entity.fiscal_year_start:
-                fiscal_year_start = entity.fiscal_year_start
         period_end = period_end or date.today()
-        period_start = period_start or _fiscal_year_start(
-            fiscal_year_start, period_end
+        if period_start is None:
+            period_start = await _entity_fiscal_start(db, scope_id, period_end)
+            if period_start is None:
+                # No entity scope: the legacy UK fiscal default.
+                period_start = _fiscal_year_start("04-06", period_end)
+
+    # Contract F24: the balance sheet's profit-for-period line covers the
+    # current fiscal year — derive the same entity fiscal-window start and
+    # pass it to the engine (None = inception when no entity resolves).
+    # Trial balance passes nothing.
+    bs_period_start: Optional[date] = None
+    if report_type == "balance-sheet":
+        bs_period_start = await _entity_fiscal_start(
+            db, scope_id, as_at or date.today()
         )
 
     if report_type == "pl":
@@ -189,7 +230,10 @@ async def formance_report(
             "period_end": period_end,
         }
     elif report_type == "balance-sheet":
-        generator, kwargs = generate_bs, {"as_at": as_at or date.today()}
+        generator, kwargs = generate_bs, {
+            "as_at": as_at or date.today(),
+            "period_start": bs_period_start,
+        }
     else:
         generator, kwargs = generate_tb, {"as_at": as_at or date.today()}
 

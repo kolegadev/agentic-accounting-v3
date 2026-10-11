@@ -10,8 +10,9 @@ outputs and diff lists, and the route must shape the contract response.
 
 from __future__ import annotations
 
+import uuid
 from datetime import date
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -159,6 +160,79 @@ def test_balance_sheet_defaults_as_at_to_today(client: TestClient) -> None:
     assert generate.await_args.kwargs["as_at"] == date.today()
 
 
+def test_balance_sheet_passes_fiscal_period_start_when_entity_resolves(
+    client: TestClient,
+) -> None:
+    """Contract F24: with a resolved entity the balance sheet receives the
+    fiscal-year-derived period_start for its profit-for-period line."""
+    entity_id = uuid.uuid4()
+    entity = MagicMock()
+    entity.fiscal_year_start = "01-01"
+    with (
+        patch(
+            "src.routes.formance_reports._resolve_scope",
+            new_callable=AsyncMock,
+        ) as resolve,
+        patch(
+            "src.routes.formance_reports.EntityService.get_entity",
+            new_callable=AsyncMock,
+        ) as get_entity,
+        patch(
+            "src.routes.formance_reports.generate_bs", new_callable=AsyncMock
+        ) as generate,
+        patch(
+            "src.routes.formance_reports.verify_against_postgres",
+            new_callable=AsyncMock,
+        ) as verify,
+    ):
+        resolve.return_value = (entity_id, "entity-abc123")
+        get_entity.return_value = entity
+        generate.return_value = BS_REPORT
+        verify.return_value = []
+        response = client.get(
+            "/api/v1/reports/formance/balance-sheet",
+            params={"as_at": "2026-03-31"},
+        )
+
+    assert response.status_code == 200
+    kwargs = generate.await_args.kwargs
+    assert kwargs["as_at"] == date(2026, 3, 31)
+    assert kwargs["entity_id"] == entity_id
+    # "01-01" fiscal start for a window ending 2026-03-31 → 2026-01-01.
+    assert kwargs["period_start"] == date(2026, 1, 1)
+    get_entity.assert_awaited_once()
+
+
+def test_balance_sheet_no_entity_passes_none_period_start(
+    client: TestClient,
+) -> None:
+    """Contract F24: no entity scope → period_start None (inception) —
+    the engine measures profit from the start of the ledger."""
+    with (
+        patch(
+            "src.routes.formance_reports._resolve_scope",
+            new_callable=AsyncMock,
+        ) as resolve,
+        patch(
+            "src.routes.formance_reports.generate_bs", new_callable=AsyncMock
+        ) as generate,
+        patch(
+            "src.routes.formance_reports.verify_against_postgres",
+            new_callable=AsyncMock,
+        ) as verify,
+    ):
+        resolve.return_value = (None, "main")
+        generate.return_value = BS_REPORT
+        verify.return_value = []
+        response = client.get("/api/v1/reports/formance/balance-sheet")
+
+    assert response.status_code == 200
+    kwargs = generate.await_args.kwargs
+    assert kwargs["entity_id"] is None
+    assert kwargs["as_at"] == date.today()
+    assert kwargs["period_start"] is None
+
+
 def test_trial_balance_happy_path_with_as_at(client: TestClient) -> None:
     with (
         patch(
@@ -183,6 +257,8 @@ def test_trial_balance_happy_path_with_as_at(client: TestClient) -> None:
     assert body["cross_check"] == {"diffs": [], "ok": True}
     generate.assert_awaited_once()
     assert generate.await_args.kwargs["as_at"] == date(2026, 3, 31)
+    # Contract F24: the trial balance gets NO period_start (unaffected).
+    assert "period_start" not in generate.await_args.kwargs
     verify.assert_awaited_once()
     assert verify.await_args.args[2] == "trial-balance"
 

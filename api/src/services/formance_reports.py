@@ -45,6 +45,13 @@ Known conventions (documented, deterministic):
 - BS presents a negative VAT net as the ``1130`` VAT Recoverable asset (F8
   presentation rule); this reclassification intentionally differs from the
   Postgres ReportService, which never reclassifies.
+
+Contract F24: the balance-sheet equity section gains a flow-derived
+"Profit for the period" line (the P&L net over ``[period_start or
+date.min, as_at]``, computed with the SAME flow machinery as
+``generate_pl``) and the identity becomes
+assets == liabilities + equity + current_profit — a ledger with posted
+income/expenses no longer needs closing entries to balance.
 """
 
 from __future__ import annotations
@@ -406,6 +413,30 @@ async def _ledger_balances(
     return balances
 
 
+async def _pl_net_flows(
+    db: AsyncSession,
+    ledger: str,
+    entity_id: Optional[uuid.UUID],
+    period_start: Optional[date],
+    period_end: Optional[date],
+) -> tuple[
+    dict[str, int], dict[str, int], dict[str, str], dict[str, str]
+]:
+    """P&L-period per-code (debit, credit) flows + the entity COA maps.
+
+    Shared by ``generate_pl`` and ``generate_bs`` (Contract F24) so the
+    balance-sheet current-profit line is computed from the EXACT same
+    data as the P&L report: the entity-scoped COA classification, the
+    posted/reversed scope, the period window, and the unknown-code check.
+    Returns ``(debit, credit, class_map, name_map)``.
+    """
+    class_map, name_map = await _load_coa(db, entity_id=entity_id)
+    scope_ids = await _load_scope_ids(db)
+    debit, credit = await _period_flows(ledger, scope_ids, period_start, period_end)
+    _check_flow_codes(debit, credit, class_map)
+    return debit, credit, class_map, name_map
+
+
 # ---------------------------------------------------------------------------
 # P&L computation (shared by generate_pl / cash flow / funds)
 # ---------------------------------------------------------------------------
@@ -627,10 +658,9 @@ async def generate_pl(
     and raises :class:`ReportEngineError` when a section silently drops
     a line item — a broken P&L is never returned.
     """
-    class_map, name_map = await _load_coa(db, entity_id=entity_id)
-    scope_ids = await _load_scope_ids(db)
-    debit, credit = await _period_flows(ledger, scope_ids, period_start, period_end)
-    _check_flow_codes(debit, credit, class_map)
+    debit, credit, class_map, name_map = await _pl_net_flows(
+        db, ledger, entity_id, period_start, period_end
+    )
     body = _pl_from_flows(debit, credit, class_map, name_map)
     _check_pl_guard(debit, credit, class_map, body)
     return {
@@ -651,6 +681,7 @@ async def generate_bs(
     ledger: str = DEFAULT_LEDGER,
     as_at: Optional[date] = None,
     entity_id: Optional[uuid.UUID] = None,
+    period_start: Optional[date] = None,
 ) -> dict[str, Any]:
     """F8 balance sheet from Formance balances (never period flows).
 
@@ -659,10 +690,23 @@ async def generate_bs(
     carried negative within assets, VAT net as a liability line (presented
     as the ``1130`` asset when the net is negative — the F8 rule).
 
-    Identity: Σ assets == Σ liabilities + Σ equity, exact in pence.
+    Contract F24: the equity section gains a flow-derived
+    ``profit_for_period`` line — the P&L net over
+    ``[period_start or date.min, as_at]`` using the SAME flow machinery as
+    ``generate_pl`` (``_pl_net_flows`` + ``_pl_from_flows``) — and the
+    identity is assets == liabilities + equity + current_profit, exact in
+    pence. A genuinely broken ledger still raises
+    :class:`ReportEngineError`.
     """
     as_at = as_at or date.today()
-    class_map, name_map = await _load_coa(db, entity_id=entity_id)
+    # F24: the current-profit line reuses the P&L flow machinery — the
+    # entity-scoped COA/class maps come from the same shared read.
+    debit, credit, class_map, name_map = await _pl_net_flows(
+        db, ledger, entity_id, period_start, as_at
+    )
+    current_profit_pence = _pl_from_flows(debit, credit, class_map, name_map)[
+        "profit"
+    ]
     balances = await _ledger_balances(ledger, class_map)
 
     def raw_section(codes: list[str]) -> list[dict[str, Any]]:
@@ -719,12 +763,14 @@ async def generate_bs(
 
     total_assets = bank_total + current_assets_total + fixed_net + vat_recoverable
     total_liabilities = current_liab_total + vat_liability_line + lt_total
-    liabilities_and_equity = total_liabilities + equity_total
+    equity_with_profit = equity_total + current_profit_pence
+    liabilities_and_equity = total_liabilities + equity_with_profit
 
     if total_assets != liabilities_and_equity:
         raise ReportEngineError(
             f"balance sheet identity violated: assets {total_assets} != "
             f"liabilities {total_liabilities} + equity {equity_total} "
+            f"+ current profit {current_profit_pence} "
             f"= {liabilities_and_equity}"
         )
 
@@ -744,6 +790,15 @@ async def generate_bs(
         "long_term_liabilities": neg_section(lt_codes),
         "equity": neg_section(equity_codes) + neg_section(list(_CONTRA_EQUITY_CODES)),
     }
+    # F24: current-year profit/loss closes the equity section (flow-derived;
+    # the equity ACCOUNTS alone no longer need to absorb P&L flows).
+    sections["equity"].append(
+        {
+            "code": "profit_for_period",
+            "name": "Profit for the period",
+            "amount": current_profit_pence,
+        }
+    )
     if vat_recoverable:
         recoverable_line = next(
             (
@@ -773,7 +828,7 @@ async def generate_bs(
         "totals": {
             "assets": total_assets,
             "liabilities": total_liabilities,
-            "equity": equity_total,
+            "equity": equity_with_profit,
             "liabilities_and_equity": liabilities_and_equity,
         },
         "identity_ok": True,
@@ -1168,6 +1223,16 @@ async def verify_against_postgres(
     Postgres engine so both sides of the cross-check read the SAME
     entity's rows — two entities with posted data never produce false
     cross-entity drift.  ``None`` keeps the legacy global comparison.
+
+    Contract F24: the BS comparison covers exactly the sections both
+    engines compute identically — current assets (bank + current assets),
+    fixed assets (fixed + accumulated depreciation), current liabilities,
+    long-term liabilities, the equity ACCOUNTS (excluding the
+    ``profit_for_period`` line, which ``ReportService.run_bs`` has no
+    equivalent for — its equity subtotal is the equity accounts only),
+    total assets, and total liabilities. The profit line itself is not
+    compared. (The F8 VAT reclassification into ``1130`` remains an
+    intentional engine-only difference outside this comparison.)
     """
     from src.services.report_service import ReportService
     from src.validators.report import ReportRunRequest
@@ -1225,7 +1290,13 @@ async def verify_against_postgres(
         engine_ll = sum(
             line["amount"] for line in sections["long_term_liabilities"]
         )
-        engine_eq = sum(line["amount"] for line in sections["equity"])
+        # F24: run_bs has no current-profit line — compare the equity
+        # ACCOUNTS only, excluding profit_for_period from the engine side.
+        engine_eq = sum(
+            line["amount"]
+            for line in sections["equity"]
+            if line["code"] != "profit_for_period"
+        )
         diff("current_assets", engine_ca, pg.current_assets.subtotal)
         diff("fixed_assets", engine_fa, pg.fixed_assets.subtotal)
         diff("current_liabilities", engine_cl, pg.current_liabilities.subtotal)

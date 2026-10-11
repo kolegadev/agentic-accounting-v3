@@ -13,11 +13,12 @@ Asserts:
       numbers computed from the seeded postings;
   (b) P&L/BS/TB ``verify_against_postgres`` returns an empty diff
       (Formance-derived == Postgres-derived exactly);
-  (c) sabotaging one mirror amount raises a ReportEngineError on the
-      balance sheet and produces non-empty P&L/TB cross-check diffs.
+  (c) sabotaging one mirror amount still satisfies the balance-sheet
+      identity (the F24 profit-for-period line absorbs the drift) and
+      produces non-empty P&L/BS/TB cross-check diffs.
 
 Scenario numbers (integer pence, profit designed to zero so the balance
-sheet balances without closing entries):
+sheet identity holds identically with or without the F24 profit line):
   A. opening-balances: Dr 1000 2,000,000; Dr 1320 400,000; Cr 3000 2,400,000
   B. sales-invoice:      Dr 1100 120,000; Cr 4000 100,000; Cr 2210 20,000
   C. supplier-invoice:   Dr 5000 90,000; Dr 2220 18,000; Cr 2000 108,000
@@ -52,7 +53,6 @@ from src.config.database import Base
 from src.models.account import Account
 from src.services.coa_service import CoaService
 from src.services.formance_reports import (
-    ReportEngineError,
     generate_bs,
     generate_cash_flow,
     generate_funds,
@@ -165,6 +165,16 @@ SUPPLIER_RAW = (
     '"invoice_date": "2026-10-02", "lines": ['
     '{"description": "Stock purchases", "net_pence": 90000, '
     '"vat_rate": "20%", "expense_account_code": "5000"}]}}'
+)
+
+# Zero-rated variant — no VAT legs, so the BS cross-check stays fully
+# comparable (no engine-only 1130 reclassification) for the F24 test.
+SUPPLIER_ZERO_VAT_RAW = (
+    '{"skill_id": "supplier-invoice", "facts": {'
+    '"supplier_name": "Beta Office Ltd", "invoice_ref": "INV-3002", '
+    '"invoice_date": "2026-10-02", "lines": ['
+    '{"description": "Stock purchases", "net_pence": 90000, '
+    '"vat_rate": "0%", "expense_account_code": "5000"}]}}'
 )
 
 DEPRECIATION_RAW = (
@@ -438,6 +448,9 @@ async def test_mini_scenario_bs_matches_expected_numbers(ctx) -> None:
     equity = {line["code"]: line["amount"] for line in sections["equity"]}
     assert equity["3000"] == 2400000
     assert equity["3020"] == 0
+    # F24: the profit-for-period line is present; the scenario profit is
+    # designed to zero so it adds nothing to the identity.
+    assert equity["profit_for_period"] == 0
     assert bs["vat_net"] == 2000
     assert bs["vat_recoverable_asset"] == 0
 
@@ -505,6 +518,59 @@ async def test_mini_scenario_funds_matches_expected_numbers(ctx) -> None:
     }
 
 
+async def test_mini_scenario_bs_current_profit_matches_pl(ctx) -> None:
+    """Contract F24: seed capital + one posted zero-rated supplier invoice
+    → the BS identity holds with profit_for_period == the P&L profit
+    exactly, and verify_against_postgres stays empty (the BS cross-check
+    compares section totals EXCLUDING the profit line — run_bs has no
+    current-profit line)."""
+    db, fake = ctx["db"], ctx["fake"]
+    llm = make_fake_llm(
+        {
+            "opening balances": OPENING_RAW,
+            "supplier invoice INV-3002": SUPPLIER_ZERO_VAT_RAW,
+        }
+    )
+
+    opening = await orchestrate_message(
+        db, "Opening balances as at 2026-01-01", llm=llm
+    )
+    assert opening.status == "preview", opening.error
+    post = await approve_entry(db, opening.transaction_id)
+    assert post.parity_ok is True
+
+    supplier = await orchestrate_message(
+        db, "supplier invoice INV-3002 from Beta Office Ltd", llm=llm
+    )
+    assert supplier.status == "preview", supplier.error
+    post = await approve_entry(db, supplier.transaction_id)
+    assert post.parity_ok is True
+
+    pl = await generate_pl(db, "main", START, END)
+    assert pl["profit"] == -90000
+
+    bs = await generate_bs(db, "main", as_at=END)
+    assert bs["identity_ok"] is True
+    profit_line = next(
+        line
+        for line in bs["sections"]["equity"]
+        if line["code"] == "profit_for_period"
+    )
+    assert profit_line["name"] == "Profit for the period"
+    assert profit_line["amount"] == pl["profit"] == -90000
+    assert bs["vat_net"] == 0
+    assert bs["totals"] == {
+        "assets": 2400000,
+        "liabilities": 90000,
+        "equity": 2310000,
+        "liabilities_and_equity": 2400000,
+    }
+    # Empty diff: engine account-equity (2,400,000p, excluding the profit
+    # line) == Postgres equity subtotal; the −90,000p profit line itself
+    # has no Postgres equivalent and is not compared.
+    assert await verify_against_postgres(db, bs, "bs") == []
+
+
 # ---------------------------------------------------------------------------
 # (b) cross-check against the Postgres ReportService — empty diff
 # ---------------------------------------------------------------------------
@@ -537,9 +603,24 @@ async def test_sabotage_mirror_amount_flags_identity_and_diff(ctx) -> None:
     assert sales_mirror["postings"][0]["source"] == "4000"
     sales_mirror["postings"][0]["amount"] = "1001.00"
 
-    # Balance sheet: assets now exceed liabilities + equity by £10.00.
-    with pytest.raises(ReportEngineError, match="balance sheet identity violated"):
-        await generate_bs(db, "main", as_at=END)
+    # Balance sheet: the F24 profit-for-period line absorbs the £10 drift
+    # (revenue flows through profit), so the identity still holds — the
+    # Postgres cross-check flags the drift on the asset side instead.
+    bs = await generate_bs(db, "main", as_at=END)
+    assert bs["identity_ok"] is True
+    bs_profit = next(
+        line
+        for line in bs["sections"]["equity"]
+        if line["code"] == "profit_for_period"
+    )
+    assert bs_profit["amount"] == 100
+    bs_diffs = await verify_against_postgres(db, bs, "bs")
+    assert bs_diffs
+    bs_lines = {d["line"]: d for d in bs_diffs}
+    assert bs_lines["current_assets"]["engine"] == 2620100
+    assert bs_lines["current_assets"]["postgres"] == 2620000
+    assert bs_lines["total_assets"]["engine"] == 3010100
+    assert bs_lines["total_assets"]["postgres"] == 3010000
 
     # P&L still satisfies its own identity, but the cross-check flags drift.
     pl = await generate_pl(db, "main", START, END)
