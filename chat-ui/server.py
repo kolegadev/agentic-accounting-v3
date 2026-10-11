@@ -9,6 +9,7 @@ source (the LLM over the real reports, via /api/books).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -147,6 +148,37 @@ async def update_settings(data: dict):
 # ---------------------------------------------------------------------------
 _upstream_client: httpx.AsyncClient | None = None
 
+_RETRY_BACKOFF_SECONDS = 0.6
+
+
+class _ColdBootRetryTransport(httpx.AsyncBaseTransport):
+    """One retry (short backoff) on connection-level failures.
+
+    The API and UI restart together (Contract F32): the browser's first
+    request can race the API's bind.  One quick retry absorbs that window;
+    anything else surfaces as the usual 502 upstream_unreachable.  Retrying
+    is safe here because every forwarded body is a buffered JSON dict.
+    """
+
+    def __init__(
+        self, inner: httpx.AsyncBaseTransport | None = None
+    ) -> None:
+        self._inner = inner or httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(
+        self, request: httpx.Request
+    ) -> httpx.Response:
+        last_exc: httpx.HTTPError | None = None
+        for attempt in (0, 1):
+            try:
+                return await self._inner.handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
+        assert last_exc is not None  # loop always runs both attempts
+        raise last_exc
+
 _ORCHESTRATOR_ROUTES = {
     "message": {"method": "POST", "path": "/api/v1/orchestrator/message"},
     "approve": {"method": "POST", "path": "/api/v1/orchestrator/approve"},
@@ -159,7 +191,9 @@ def _get_upstream_client() -> httpx.AsyncClient:
     """Return the injectable upstream client (tests replace this seam)."""
     global _upstream_client
     if _upstream_client is None:
-        _upstream_client = httpx.AsyncClient(timeout=10.0)
+        _upstream_client = httpx.AsyncClient(
+            timeout=10.0, transport=_ColdBootRetryTransport()
+        )
     return _upstream_client
 
 
@@ -519,10 +553,16 @@ def _books_pounds_summary(pl: dict, bs: dict) -> dict:
 
 
 async def _llm_explain_books(pl: dict, bs: dict) -> str:
-    """Ask the configured LLM to explain the entity's books in plain English."""
-    llm_url = os.getenv("LLM_API_URL") or LLM_CONFIG["api_url"]
-    llm_key = os.getenv("LLM_API_KEY") or LLM_CONFIG["api_key"]
-    llm_model = os.getenv("LLM_MODEL") or LLM_CONFIG["model"]
+    """Ask the configured LLM to explain the entity's books in plain English.
+
+    LLM_CONFIG is initialized from env at import; the settings modal updates
+    it at runtime, so the SAVED config wins here (Contract F33 — the old
+    ``os.getenv(...) or LLM_CONFIG[...]`` precedence made saves ineffective
+    whenever env vars were set, which is always, on deploy).
+    """
+    llm_url = LLM_CONFIG["api_url"]
+    llm_key = LLM_CONFIG["api_key"]
+    llm_model = LLM_CONFIG["model"]
 
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if llm_key:

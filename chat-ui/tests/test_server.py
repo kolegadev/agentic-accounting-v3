@@ -830,3 +830,114 @@ def test_books_pounds_summary_degrades_to_zero_on_garbage() -> None:
     )
     assert summary["profit_or_loss_pounds"] == "0.00"
     assert summary["vat_net_pounds"] == "0.00"
+
+
+# ---------------------------------------------------------------------------
+# Cold-boot retry (Contract F32)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_cold_boot_retry_succeeds_on_second_attempt() -> None:
+    """A ConnectError on the first attempt retries once and succeeds."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("connection refused (cold boot)")
+        return httpx.Response(200, json={"ok": True})
+
+    transport = server._ColdBootRetryTransport(
+        httpx.MockTransport(handler)
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        resp = await client.get("http://accounting-api:8000/health")
+
+    assert resp.status_code == 200
+    assert calls == 2
+
+
+@pytest.mark.anyio
+async def test_cold_boot_retry_surrenders_after_two_failures() -> None:
+    """Two ConnectErrors surface as an exception (the 502 handlers catch it)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused (still booting)")
+
+    transport = server._ColdBootRetryTransport(
+        httpx.MockTransport(handler)
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(httpx.ConnectError):
+            await client.get("http://accounting-api:8000/health")
+
+
+@pytest.mark.anyio
+async def test_cold_boot_retry_skips_non_connect_errors() -> None:
+    """Only connect-level failures retry; a 500 passes straight through."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, json={"detail": "boom"})
+
+    transport = server._ColdBootRetryTransport(
+        httpx.MockTransport(handler)
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        resp = await client.get("http://accounting-api:8000/health")
+
+    assert resp.status_code == 500
+    assert calls == 1
+
+
+# ---------------------------------------------------------------------------
+# LLM config settings (Contract F33)
+# ---------------------------------------------------------------------------
+
+
+def test_llm_config_get_returns_masked_key(client: TestClient) -> None:
+    server.LLM_CONFIG["api_key"] = "sk-test-1234567890"
+    server.LLM_CONFIG["model"] = "deepseek-flash"
+    resp = client.get("/api/llm-config")
+    data = resp.json()
+    assert data["model"] == "deepseek-flash"
+    assert data["has_key"] is True
+    assert "1234567890" not in data["api_key"]
+
+
+def test_llm_config_post_updates_runtime_config(client: TestClient, monkeypatch) -> None:
+    saved = []
+
+    async def fake_push(url: str, json: dict) -> None:
+        saved.append(json)
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", None)  # unreachable below
+    # The push runs inside an httpx client block; stub it out entirely.
+    import httpx as _httpx
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None, **k):
+            saved.append((url, json))
+            return _httpx.Response(200, json={"status": "ok"})
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", _FakeClient)
+    resp = client.post("/api/llm-config", json={"model": "deepseek-flash"})
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["config"]["model"] == "deepseek-flash"
+    assert server.LLM_CONFIG["model"] == "deepseek-flash"
+    assert saved and saved[0][1]["model"] == "deepseek-flash"
+    # The push targets the accounting API's config route.
+    assert saved[0][0].endswith("/api/v1/chat/llm-config")
