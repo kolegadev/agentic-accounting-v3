@@ -768,8 +768,26 @@ async def orchestrate_message(
         )
     try:
         payload = _parse_llm_json(raw)
-    except LLMError as exc:
-        return OrchestrateResult.failure("invalid_response", str(exc))
+    except LLMError as first_exc:
+        # deepseek-flash occasionally answers in prose instead of JSON —
+        # one bounded retry with an explicit JSON-only nudge (Contract F35).
+        retry_prompt = (
+            system_prompt
+            + "\n\nIMPORTANT: respond with NOTHING but the JSON object "
+            "(no prose, no markdown)."
+        )
+        try:
+            raw = await transport(retry_prompt, message)
+            payload = _parse_llm_json(raw)
+        except LLMError as exc:
+            return OrchestrateResult.failure(
+                "invalid_response", f"{first_exc} (retry: {exc})"
+            )
+        except Exception as exc:  # noqa: BLE001 — injected transports
+            return OrchestrateResult.failure(
+                "llm_error",
+                f"LLM retry failed: {exc.__class__.__name__}: {exc}",
+            )
 
     skill_id = payload.get("skill_id")
     if not skill_id:

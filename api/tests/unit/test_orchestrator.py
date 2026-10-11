@@ -675,6 +675,46 @@ async def test_orchestrate_llm_bad_json_structured_error(mock_db: AsyncMock) -> 
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_prose_then_json_retries_and_succeeds(
+    mock_db: AsyncMock, coa: dict[str, Account]
+) -> None:
+    """deepseek-flash prose flake: the first classify returns prose, the
+    one-bounded-retry classifies correctly on the second call."""
+    calls = 0
+
+    async def flaky_llm(system_prompt: str, message: str) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "Sure, I can help record that for you!"
+        return (
+            '{"skill_id": "bank-transfer", "facts": {'
+            '"transfer_date": "2026-10-05", "source_account_code": "1000", '
+            '"destination_account_code": "1001", "amount_pence": 50000}}'
+        )
+
+    mock_db.execute.side_effect = [
+        _result(scalars=[]),  # resolve_entity_scope — no entities (legacy)
+        _result(scalars=list(coa.values())),  # list_accounts
+        _result(scalar=coa["1000"]),  # Dr bank
+        _result(scalar=coa["1001"]),  # Cr bank
+        _result(scalar=None),  # idempotency check
+        _result(scalars=[coa["1000"], coa["1001"]]),  # validate accounts
+    ]
+    result = await orchestrate_message(
+        mock_db, "transfer 500 between accounts", llm=flaky_llm
+    )
+
+    assert result.status == "preview"
+    assert result.skill_id == "bank-transfer"
+    assert calls == 2
+    assert [(l.code, l.debit_pence, l.credit_pence) for l in result.legs] == [
+        ("1001", 50000, 0),
+        ("1000", 0, 50000),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_clarification_error_preview_absent(
     mock_db: AsyncMock,
 ) -> None:
