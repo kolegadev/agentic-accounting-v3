@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from src.index import app
 from src.services.contact_service import ContactNotFoundError, DuplicateContactError
-from src.validators.contact import ContactResponse
+from src.validators.contact import ContactResponse, ContactUpdate
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -225,6 +225,60 @@ async def test_update_contact_success(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json()["name"] == "Updated Corp"
+
+
+# Contract F42 — the UI edit modal PATCHes ALL fields (blank optionals
+# become null).  The exact payload shape must round-trip the route.
+F42_EDIT_PAYLOAD = {
+    "name": "Zephyr Ltd",
+    "type": "customer",
+    "company": "Zephyr Trading",
+    "email": None,
+    "phone": "0131 555 0100",
+    "address_line1": "12 Leith Walk",
+    "address_line2": None,
+    "city": "Edinburgh",
+    "postcode": "EH6 5HB",
+    "country": "GB",
+}
+
+
+def test_f42_edit_payload_validates() -> None:
+    """The edit-modal body is a valid ContactUpdate; nulls stay explicit so
+    ContactService.update_contact (exclude_unset) clears the field."""
+    update = ContactUpdate.model_validate(F42_EDIT_PAYLOAD)
+    assert update.model_dump(exclude_unset=True) == F42_EDIT_PAYLOAD
+
+
+@pytest.mark.asyncio
+async def test_update_contact_rich_fields_forwarded(client: TestClient) -> None:
+    """PATCH forwards every F42 field (phone/address/city/postcode/…)."""
+    with patch(
+        "src.routes.contacts.ContactService.update_contact",
+        new_callable=AsyncMock,
+    ) as mock_update:
+        mock_update.return_value = make_response(
+            name="Zephyr Ltd",
+            phone="0131 555 0100",
+            address_line1="12 Leith Walk",
+            city="Edinburgh",
+            postcode="EH6 5HB",
+        )
+        response = client.patch(
+            f"/api/v1/contacts/{CONTACT_ID}", json=F42_EDIT_PAYLOAD
+        )
+
+    assert response.status_code == 200
+    sent = mock_update.await_args.args[-1]
+    assert isinstance(sent, ContactUpdate)
+    assert sent.phone == "0131 555 0100"
+    assert sent.address_line1 == "12 Leith Walk"
+    assert sent.city == "Edinburgh"
+    assert sent.postcode == "EH6 5HB"
+    assert sent.address_line2 is None
+    body = response.json()
+    assert body["phone"] == "0131 555 0100"
+    assert body["address_line1"] == "12 Leith Walk"
 
 
 @pytest.mark.asyncio

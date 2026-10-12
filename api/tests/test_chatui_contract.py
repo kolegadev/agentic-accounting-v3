@@ -127,6 +127,34 @@ FORBIDDEN_STRINGS = [
     "/ws/chat",
 ]
 
+# Contract F42 — rich + editable contacts: the add form gains the model's
+# optional fields, and each row's Edit button opens a modal pre-filled with
+# ALL fields that PATCHes the new proxy.
+CONTACT_RICH_ADD_DOM_IDS = [
+    "contact-company",
+    "contact-phone",
+    "contact-address1",
+    "contact-address2",
+    "contact-city",
+    "contact-postcode",
+    "contact-country",
+]
+
+CONTACT_EDIT_DOM_IDS = [
+    "contact-edit-overlay",
+    "contact-edit-name",
+    "contact-edit-type",
+    "contact-edit-company",
+    "contact-edit-email",
+    "contact-edit-phone",
+    "contact-edit-address1",
+    "contact-edit-address2",
+    "contact-edit-city",
+    "contact-edit-postcode",
+    "contact-edit-country",
+    "contact-edit-submit",
+]
+
 
 @pytest.fixture(scope="module")
 def html() -> str:
@@ -341,3 +369,58 @@ def test_extracted_text_panel_is_escaped(html: str) -> None:
     """The source_text panel is fed ONLY esc()'d text, never raw content."""
     assert "textEl.innerHTML = esc(sourceText)" in html
     assert "textEl.innerHTML = sourceText" not in html
+
+
+# ---------------------------------------------------------------------------
+# Contract F42 — counterparty columns + rich editable contacts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dom_id", CONTACT_RICH_ADD_DOM_IDS)
+def test_contact_add_form_field_present(html: str, dom_id: str) -> None:
+    """The contacts add form exposes the model's optional fields."""
+    assert f'id="{dom_id}"' in html
+
+
+@pytest.mark.parametrize("dom_id", CONTACT_EDIT_DOM_IDS)
+def test_contact_edit_modal_dom_id_present(html: str, dom_id: str) -> None:
+    """The contact-edit modal carries every editable field."""
+    assert f'id="{dom_id}"' in html
+
+
+def test_contacts_list_has_edit_button_opening_prefilled_modal(html: str) -> None:
+    """Each contact row renders an Edit button wired to openContactEdit(id),
+    which pre-fills the modal from the loaded contact record."""
+    assert 'class="contact-edit-btn"' in html
+    assert "openContactEdit(" in html
+    assert "function openContactEdit(contactId)" in html
+    assert "function closeContactEdit()" in html
+    assert "async function submitContactEdit()" in html
+    assert "contactCache[c.id] = c" in html
+
+
+def test_contact_edit_patches_the_proxy_and_reloads(html: str) -> None:
+    """The edit modal PATCHes /api/contacts/{id} (the F42 proxy) and the
+    list reloads from the API afterwards."""
+    assert "method: 'PATCH'" in html
+    assert "'/api/contacts/' + encodeURIComponent(editContactId || '')" in html
+    assert "await loadContacts();" in html
+    assert "closeContactEdit();" in html
+
+
+def test_counterparty_column_in_account_modal_and_aging(html: str) -> None:
+    """The F37 account-modal items table AND the aging items table each
+    gained exactly one Counterparty column, fed ONLY through esc()."""
+    assert html.count("<th>Counterparty</th>") == 2
+    assert "esc(t.contact_name || '—')" in html
+    assert "esc(it.contact_name || '—')" in html
+    # Never interpolated raw.
+    assert "+ (t.contact_name" not in html
+    assert "+ (it.contact_name" not in html
+
+
+def test_contacts_rows_show_company_and_phone(html: str) -> None:
+    """F42: the list rows surface the richer data (company + phone)."""
+    assert 'class="contact-company"' in html
+    assert "esc(c.company)" in html
+    assert "if (c.phone) meta.push(esc(c.phone));" in html

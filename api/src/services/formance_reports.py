@@ -68,6 +68,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.models.account import Account
+from src.models.contact import Contact
 from src.models.transaction import Posting, Transaction
 from src.services.formance_client import formance_client
 from src.services.ledger_parity import (
@@ -983,6 +984,17 @@ async def _aging_legs(
         stmt = stmt.where(Transaction.entity_id == entity_id)
     transactions = list((await db.execute(stmt)).scalars().all())
 
+    # ---- Contract F42: counterparty names (join on contact_id) ----
+    # One batched lookup for the loaded rows; a missing / unknown contact
+    # (or an unstamped transaction) yields None — never a failed aging.
+    contact_ids = {tx.contact_id for tx in transactions if tx.contact_id is not None}
+    contact_names: dict[uuid.UUID, str] = {}
+    if contact_ids:
+        name_rows = await db.execute(
+            select(Contact.id, Contact.name).where(Contact.id.in_(contact_ids))
+        )
+        contact_names = {row.id: row.name for row in name_rows}
+
     legs: list[dict[str, Any]] = []
     for tx in transactions:
         debit = sum(
@@ -1000,6 +1012,7 @@ async def _aging_legs(
                 "date": tx.effective_date,
                 "debit_pence": debit,
                 "credit_pence": credit,
+                "contact_name": contact_names.get(tx.contact_id),
             }
         )
     legs.sort(
@@ -1037,6 +1050,7 @@ def _fifo_age_legs(
                 {
                     "ref": leg["reference"] or str(leg["transaction_id"])[:8],
                     "date": leg["date"],
+                    "contact_name": leg.get("contact_name"),
                     "original_pence": amount,
                     "paid_pence": 0,
                     "outstanding_pence": amount,

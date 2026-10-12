@@ -495,6 +495,19 @@ async def create_contact(data: dict):
     return _admin_passthrough(resp)
 
 
+@app.patch("/api/contacts/{contact_id}")
+async def patch_contact(contact_id: str, data: dict):
+    """PATCH → /api/v1/contacts/{contact_id} (Contract F42 — same global,
+    unauthenticated contact resource as GET/POST /api/contacts; no token)."""
+    url = f"{API_BASE_URL}/api/v1/contacts/{contact_id}"
+    try:
+        client = _get_upstream_client()
+        resp = await client.patch(url, json=data)
+    except httpx.HTTPError as exc:
+        return _admin_unreachable(exc)
+    return _admin_passthrough(resp)
+
+
 @app.get("/api/users")
 async def list_users():
     """GET → /api/v1/auth/users (admin header)."""

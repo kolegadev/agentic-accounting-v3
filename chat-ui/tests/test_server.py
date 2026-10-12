@@ -749,6 +749,61 @@ def test_post_contacts_forwards_body_without_token(
     assert "authorization" not in reqs[0].headers
 
 
+def test_patch_contacts_forwards_body_without_token(
+    client: TestClient, admin_upstream
+) -> None:
+    """Contract F42: PATCH /api/contacts/{id} → the API's contact PATCH
+    (same global, unauthenticated resource as the GET/POST proxies)."""
+    contact_id = "3f2a1b4c-0000-4a2b-9c3d-000000000042"
+    body = {"phone": "0131 555 0100", "address_line1": "12 Leith Walk"}
+    resp = client.patch(f"/api/contacts/{contact_id}", json=body)
+
+    assert resp.status_code == 200
+    reqs = [
+        r
+        for r in admin_upstream
+        if r.url.path == f"/api/v1/contacts/{contact_id}"
+    ]
+    assert len(reqs) == 1
+    assert reqs[0].method == "PATCH"
+    assert json.loads(reqs[0].content) == body
+    assert "authorization" not in reqs[0].headers
+    # No owner login happens for the unauthenticated contacts proxy.
+    logins = [r for r in admin_upstream if r.url.path == "/api/v1/auth/login"]
+    assert logins == []
+
+
+def test_patch_contacts_upstream_error_passthrough(
+    client: TestClient, monkeypatch
+) -> None:
+    """A duplicate-contact 409 passes through untouched."""
+    _reset_admin_login(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"detail": "Duplicate contact detected"})
+
+    _set_transport(monkeypatch, handler)
+    resp = client.patch("/api/contacts/some-id", json={"email": "dup@acme.test"})
+
+    assert resp.status_code == 409
+    assert resp.json() == {"detail": "Duplicate contact detected"}
+
+
+def test_patch_contacts_upstream_unreachable_returns_502(
+    client: TestClient, monkeypatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host", request=request)
+
+    _set_transport(monkeypatch, handler)
+    resp = client.patch("/api/contacts/some-id", json={"phone": "0131 555 0100"})
+
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["type"] == "upstream_unreachable"
+
+
 def test_get_users_forwards_admin_header(client: TestClient, admin_upstream) -> None:
     resp = client.get("/api/users")
 
@@ -1281,3 +1336,26 @@ def test_accounts_crud_upstream_unreachable_returns_502(
     assert body["status"] == "error"
     assert body["type"] == "upstream_unreachable"
     assert "connection refused" in body["message"]
+
+
+# ---------------------------------------------------------------------------
+# Contract F42 — static frontend contract strings: the counterparty columns
+# and the editable-contact modal that drives the PATCH proxy above.
+# ---------------------------------------------------------------------------
+
+CHATUI_INDEX = Path(__file__).resolve().parents[1] / "index.html"
+
+
+def test_f42_counterparty_columns_and_contact_edit_modal() -> None:
+    html = CHATUI_INDEX.read_text(encoding="utf-8")
+
+    # Both F37 item tables (account drill-down + aging) name the counterparty.
+    assert html.count("<th>Counterparty</th>") == 2
+    assert "esc(t.contact_name || '—')" in html
+    assert "esc(it.contact_name || '—')" in html
+    # The edit modal exists with its key fields and PATCHes the proxy path.
+    assert 'id="contact-edit-overlay"' in html
+    assert 'id="contact-edit-phone"' in html
+    assert 'id="contact-edit-postcode"' in html
+    assert "'/api/contacts/' + encodeURIComponent(editContactId || '')" in html
+    assert "method: 'PATCH'" in html

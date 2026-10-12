@@ -34,6 +34,7 @@ from sqlalchemy.pool import StaticPool
 
 from src.config.database import Base
 from src.models.account import Account
+from src.models.contact import Contact
 from src.models.entity import Entity
 from src.models.transaction import Posting, Transaction
 from src.services import formance_reports as fr
@@ -126,6 +127,32 @@ _SQLITE_SCHEMA = [
         setup_state VARCHAR(16) NOT NULL DEFAULT 'none',
         created_by CHAR(36) NOT NULL,
         is_active BOOLEAN NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    # Contract F42 — the counterparty join reads this table.
+    """
+    CREATE TABLE IF NOT EXISTS contacts (
+        id CHAR(36) PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
+        type VARCHAR(10) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        company VARCHAR(255),
+        email VARCHAR(255),
+        phone VARCHAR(50),
+        address_line1 VARCHAR(255),
+        address_line2 VARCHAR(255),
+        city VARCHAR(100),
+        postcode VARCHAR(10),
+        country VARCHAR(2) NOT NULL DEFAULT 'GB',
+        vat_number VARCHAR(20),
+        payment_terms VARCHAR(50) NOT NULL DEFAULT 'Net 30',
+        default_gl_account_id CHAR(36),
+        currency VARCHAR(3) NOT NULL DEFAULT 'GBP',
+        status VARCHAR(10) NOT NULL DEFAULT 'active',
+        total_invoiced INTEGER NOT NULL DEFAULT 0,
+        total_paid INTEGER NOT NULL DEFAULT 0,
+        total_owing INTEGER NOT NULL DEFAULT 0,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
@@ -2103,6 +2130,63 @@ async def test_ar_aging_fifo_partial_allocations_exact_pence(monkeypatch) -> Non
         {"bucket": "90+", "count": 0, "total_pence": 0},
     ]
     assert "1100" in report["note"] and "ledger" in report["note"].lower()
+
+
+async def test_aging_items_carry_contact_name(monkeypatch) -> None:
+    """Contract F42: every aging item names the counterparty (or None).
+
+    The contact is joined from the item transaction's ``contact_id``;
+    unstamped and dangling links degrade to None instead of failing.
+    """
+    db, engine, ids = await _aging_world(monkeypatch, AGING_INVOICES, AGING_BALANCES)
+    try:
+        zephyr = Contact(id=uuid.uuid4(), type="customer", name="Zephyr Ltd")
+        db.add(zephyr)
+        await db.execute(
+            text("UPDATE transactions SET contact_id = :cid WHERE id = :tid"),
+            {"cid": zephyr.id.hex, "tid": ids["invoice-1"].hex},
+        )
+        await db.execute(
+            text("UPDATE transactions SET contact_id = :cid WHERE id = :tid"),
+            {"cid": uuid.uuid4().hex, "tid": ids["invoice-2"].hex},
+        )
+        await db.commit()
+
+        report = await generate_ar_aging(db, "main", as_at=date(2026, 3, 31))
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert [(i["ref"], i["contact_name"]) for i in report["items"]] == [
+        ("JE-2026-0001", "Zephyr Ltd"),
+        ("JE-2026-0002", None),
+    ]
+    assert all("contact_name" in item for item in report["items"])
+
+
+async def test_ap_aging_items_carry_contact_name(monkeypatch) -> None:
+    """Contract F42: the AP mirror carries the supplier name per item."""
+    entries = [
+        ("bill-1", "posted", date(2026, 1, 20), [("5000", 60000, 0), ("2000", 0, 60000)]),
+    ]
+    db, engine, ids = await _aging_world(
+        monkeypatch, entries, {"2000": -60000, "5000": 60000}
+    )
+    try:
+        jost = Contact(id=uuid.uuid4(), type="supplier", name="Jost Supplies")
+        db.add(jost)
+        await db.execute(
+            text("UPDATE transactions SET contact_id = :cid WHERE id = :tid"),
+            {"cid": jost.id.hex, "tid": ids["bill-1"].hex},
+        )
+        await db.commit()
+
+        report = await generate_ap_aging(db, "main", as_at=date(2026, 3, 31))
+    finally:
+        await db.close()
+        await engine.dispose()
+
+    assert [i["contact_name"] for i in report["items"]] == ["Jost Supplies"]
 
 
 async def test_ar_aging_penny_exact_fifo_partial(monkeypatch) -> None:

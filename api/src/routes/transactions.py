@@ -261,6 +261,11 @@ async def list_account_transactions(
     date window; newest first, each row carrying the per-item running
     ``balance_pence``). An unknown or inactive code is a 404
     ``{type: account_not_found}`` — never an empty 200.
+
+    Contract F42: each item also carries ``contact_name`` (the
+    counterparty joined on ``Transaction.contact_id``; ``None`` when the
+    row is unstamped or the contact is unknown) — the route passes the
+    service's items through unchanged.
     """
     result = await TransactionService.list_for_account(
         db,

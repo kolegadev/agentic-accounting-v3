@@ -480,7 +480,15 @@
     border-radius:8px; padding:7px 9px;
   }
   .contact-name { display:block; font-size:12px; font-weight:600; }
+  .contact-company { display:block; font-size:11px; color:var(--text-dim2); }
   .contact-meta { display:block; font-size:10.5px; color:var(--text-dim3); }
+  .contact-row-head { display:flex; align-items:flex-start; gap:6px; }
+  .contact-edit-btn {
+    flex:none; background:var(--surface3, var(--surface2)); border:1px solid var(--border4);
+    border-radius:6px; padding:2px 8px; color:var(--text-dim2); font-size:10.5px;
+    font-family:inherit; cursor:pointer; transition:border-color .15s, color .15s;
+  }
+  .contact-edit-btn:hover { border-color:var(--accent); color:var(--accent); }
   .contacts-add {
     flex:none; padding:8px 12px 12px; border-top:1px solid var(--border2);
     display:flex; flex-direction:column; gap:6px;
@@ -604,6 +612,17 @@
               <option value="other">other</option>
             </select>
             <input class="admin-input" id="contact-email" type="text" placeholder="Email (optional)" style="flex:1;min-width:0" />
+          </div>
+          <input class="admin-input" id="contact-company" type="text" placeholder="Company / trading name (optional)" />
+          <div style="display:flex;gap:6px">
+            <input class="admin-input" id="contact-phone" type="text" placeholder="Phone (optional)" style="flex:1;min-width:0" />
+            <input class="admin-input" id="contact-postcode" type="text" placeholder="Postcode (optional)" style="flex:none;width:110px" />
+          </div>
+          <input class="admin-input" id="contact-address1" type="text" placeholder="Address line 1 (optional)" />
+          <input class="admin-input" id="contact-address2" type="text" placeholder="Address line 2 (optional)" />
+          <div style="display:flex;gap:6px">
+            <input class="admin-input" id="contact-city" type="text" placeholder="City (optional)" style="flex:1;min-width:0" />
+            <input class="admin-input" id="contact-country" type="text" maxlength="2" placeholder="GB" style="flex:none;width:60px" />
           </div>
           <button class="modal-btn-primary" id="contact-add" style="padding:8px">Add contact</button>
           <div class="admin-error" id="contact-error"></div>
@@ -986,6 +1005,70 @@
   </div>
 </div>
 
+<!-- ═══════════ EDIT CONTACT MODAL (F42) ═══════════ -->
+<div class="modal-overlay" id="contact-edit-overlay" onclick="closeContactEdit()">
+  <div class="modal-panel" style="width:90%;max-width:480px" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2 style="font-size:18px;color:var(--accent);margin:0">Edit contact</h2>
+      <button class="modal-close" onclick="closeContactEdit()">✕</button>
+    </div>
+    <div class="modal-body admin-form">
+      <div>
+        <label>Name</label>
+        <input type="text" id="contact-edit-name" class="admin-input" maxlength="255" placeholder="Contact name" />
+      </div>
+      <div>
+        <label>Type</label>
+        <select id="contact-edit-type" class="admin-select">
+          <option value="customer">customer</option>
+          <option value="supplier">supplier</option>
+          <option value="both">both</option>
+          <option value="other">other</option>
+        </select>
+      </div>
+      <div>
+        <label>Company / trading name</label>
+        <input type="text" id="contact-edit-company" class="admin-input" maxlength="255" placeholder="Company (optional)" />
+      </div>
+      <div>
+        <label>Email</label>
+        <input type="text" id="contact-edit-email" class="admin-input" maxlength="255" placeholder="Email (optional)" />
+      </div>
+      <div>
+        <label>Phone</label>
+        <input type="text" id="contact-edit-phone" class="admin-input" maxlength="50" placeholder="Phone (optional)" />
+      </div>
+      <div>
+        <label>Address line 1</label>
+        <input type="text" id="contact-edit-address1" class="admin-input" maxlength="255" placeholder="Address line 1 (optional)" />
+      </div>
+      <div>
+        <label>Address line 2</label>
+        <input type="text" id="contact-edit-address2" class="admin-input" maxlength="255" placeholder="Address line 2 (optional)" />
+      </div>
+      <div class="admin-row">
+        <div style="flex:1;min-width:0">
+          <label>City</label>
+          <input type="text" id="contact-edit-city" class="admin-input" maxlength="100" placeholder="City (optional)" />
+        </div>
+        <div style="flex:none;width:110px">
+          <label>Postcode</label>
+          <input type="text" id="contact-edit-postcode" class="admin-input" maxlength="10" placeholder="Postcode" />
+        </div>
+        <div style="flex:none;width:70px">
+          <label>Country</label>
+          <input type="text" id="contact-edit-country" class="admin-input" maxlength="2" placeholder="GB" />
+        </div>
+      </div>
+      <div class="admin-error" id="contact-edit-error"></div>
+      <div class="modal-btn-row" style="justify-content:flex-end">
+        <button class="modal-btn-secondary" onclick="closeContactEdit()" style="flex:none">Cancel</button>
+        <button class="modal-btn-primary" id="contact-edit-submit" onclick="submitContactEdit()" style="flex:none">Save changes</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 // ═══════════════════════════════════════════
 //  APP STATE (Contract F23 — one selector: the entity)
@@ -1327,12 +1410,13 @@ async function openAccount(code) {
       return '<tr><td>' + esc(t.effective_date || '') + '</td>' +
         '<td>' + esc(t.reference || '') + '</td>' +
         '<td>' + esc(t.description || '') + '</td>' +
+        '<td>' + esc(t.contact_name || '—') + '</td>' +
         '<td class="num">' + (t.debit_pence ? fmtMoney(t.debit_pence) : '') + '</td>' +
         '<td class="num">' + (t.credit_pence ? fmtMoney(t.credit_pence) : '') + '</td>' +
         '<td class="num">' + fmtMoney(t.balance_pence) + '</td></tr>';
     }).join('');
     var html = '<table class="report-table"><thead><tr>' +
-      '<th>Date</th><th>Ref</th><th>Description</th>' +
+      '<th>Date</th><th>Ref</th><th>Description</th><th>Counterparty</th>' +
       '<th class="num">Debit</th><th class="num">Credit</th><th class="num">Balance</th>' +
       '</tr></thead><tbody>' + rows + '</tbody></table>';
     if (!rows) html = '<div class="report-empty">No posted transactions for this account.</div>';
@@ -1933,13 +2017,14 @@ function renderFormanceReport(data) {
     var itemRows = (r.items || []).map(function(it) {
       return '<tr><td>' + esc(it.date || '') + '</td>' +
         '<td>' + esc(it.ref || '') + '</td>' +
+        '<td>' + esc(it.contact_name || '—') + '</td>' +
         '<td class="num">' + fmtMoney(it.original_pence) + '</td>' +
         '<td class="num">' + fmtMoney(it.paid_pence) + '</td>' +
         '<td class="num">' + fmtMoney(it.outstanding_pence) + '</td>' +
         '<td class="num">' + esc(String(it.days_overdue == null ? '' : it.days_overdue)) + '</td></tr>';
     }).join('');
     html += '<table class="report-table"><thead><tr>' +
-      '<th>Date</th><th>Reference</th><th class="num">Original</th>' +
+      '<th>Date</th><th>Reference</th><th>Counterparty</th><th class="num">Original</th>' +
       '<th class="num">Paid</th><th class="num">Outstanding</th>' +
       '<th class="num">Days overdue</th></tr></thead><tbody>' + itemRows + '</tbody></table>';
     if (!itemRows) html += '<div class="report-empty">No open items.</div>';
@@ -2573,6 +2658,10 @@ async function loadUsers() {
 document.getElementById('company-admin-btn').addEventListener('click', window.openCompanyAdmin);
 
 // ── Contacts (global — not entity-scoped) ──
+// F42: the last-loaded contacts, keyed by id, so the edit modal can be
+// pre-filled with ALL fields without re-fetching.
+var contactCache = {};
+
 async function loadContacts() {
   var list = document.getElementById('contacts-list');
   if (!list) return;
@@ -2581,18 +2670,107 @@ async function loadContacts() {
     var data = await resp.json().catch(function() { return null; });
     if (!resp.ok) throw new Error(adminErrorMessage(data, resp.status));
     var contacts = (data && data.contacts) || [];
+    contactCache = {};
+    contacts.forEach(function(c) { if (c && c.id) contactCache[c.id] = c; });
     if (!contacts.length) {
       list.innerHTML = '<div class="contacts-empty">No contacts yet — add one below. Contacts are global, shared across all entities.</div>';
       return;
     }
     list.innerHTML = contacts.map(function(c) {
+      var meta = [esc(c.type || '')];
+      if (c.email) meta.push(esc(c.email));
+      if (c.phone) meta.push(esc(c.phone));
       return '<div class="contact-item">' +
+        '<div class="contact-row-head">' +
+        '<div style="flex:1;min-width:0">' +
         '<span class="contact-name">' + esc(c.name) + '</span>' +
-        '<span class="contact-meta">' + esc(c.type || '') + (c.email ? ' · ' + esc(c.email) : '') + '</span>' +
+        (c.company ? '<span class="contact-company">' + esc(c.company) + '</span>' : '') +
+        '</div>' +
+        '<button class="contact-edit-btn" onclick="openContactEdit(\'' + esc(c.id || '') + '\')">Edit</button>' +
+        '</div>' +
+        '<span class="contact-meta">' + meta.join(' · ') + '</span>' +
         '</div>';
     }).join('');
   } catch (e) {
     list.innerHTML = '<div class="contacts-empty">Contacts unavailable: ' + esc(e.message) + '</div>';
+  }
+}
+
+// Fields on the shared contact form shape (model + PATCH validator) with
+// their add-form / edit-modal input ids.  Empty text inputs become null
+// for PATCH (clearing an optional field) and are omitted on POST (letting
+// the server defaults apply).
+var CONTACT_FIELDS = [
+  { field: 'company', add: 'contact-company', edit: 'contact-edit-company' },
+  { field: 'phone', add: 'contact-phone', edit: 'contact-edit-phone' },
+  { field: 'address_line1', add: 'contact-address1', edit: 'contact-edit-address1' },
+  { field: 'address_line2', add: 'contact-address2', edit: 'contact-edit-address2' },
+  { field: 'city', add: 'contact-city', edit: 'contact-edit-city' },
+  { field: 'postcode', add: 'contact-postcode', edit: 'contact-edit-postcode' }
+];
+
+function contactFieldValue(id) {
+  var el = document.getElementById(id);
+  return el ? el.value.trim() : '';
+}
+
+var editContactId = null;
+
+function openContactEdit(contactId) {
+  var c = contactCache[contactId] || {};
+  editContactId = contactId;
+  document.getElementById('contact-edit-name').value = c.name || '';
+  document.getElementById('contact-edit-type').value = c.type || 'customer';
+  document.getElementById('contact-edit-company').value = c.company || '';
+  document.getElementById('contact-edit-email').value = c.email || '';
+  document.getElementById('contact-edit-phone').value = c.phone || '';
+  document.getElementById('contact-edit-address1').value = c.address_line1 || '';
+  document.getElementById('contact-edit-address2').value = c.address_line2 || '';
+  document.getElementById('contact-edit-city').value = c.city || '';
+  document.getElementById('contact-edit-postcode').value = c.postcode || '';
+  document.getElementById('contact-edit-country').value = c.country || 'GB';
+  document.getElementById('contact-edit-error').textContent = '';
+  document.getElementById('contact-edit-overlay').classList.add('open');
+}
+
+function closeContactEdit() {
+  document.getElementById('contact-edit-overlay').classList.remove('open');
+}
+
+async function submitContactEdit() {
+  var errEl = document.getElementById('contact-edit-error');
+  var btn = document.getElementById('contact-edit-submit');
+  var name = contactFieldValue('contact-edit-name');
+  if (!name) { errEl.textContent = 'Contact name is required.'; return; }
+  var country = contactFieldValue('contact-edit-country') || 'GB';
+  var body = {
+    name: name,
+    type: document.getElementById('contact-edit-type').value,
+    email: contactFieldValue('contact-edit-email') || null,
+    country: country
+  };
+  CONTACT_FIELDS.forEach(function(item) {
+    body[item.field] = contactFieldValue(item.edit) || null;
+  });
+  errEl.textContent = '';
+  btn.disabled = true;
+  try {
+    var resp = await fetch('/api/contacts/' + encodeURIComponent(editContactId || ''), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    var data = await resp.json().catch(function() { return null; });
+    if (!resp.ok) {
+      errEl.textContent = 'Could not save the contact: ' + adminErrorMessage(data, resp.status);
+      return;
+    }
+    closeContactEdit();
+    await loadContacts();
+  } catch (e) {
+    errEl.textContent = 'Could not save the contact: ' + e.message;
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -2607,14 +2785,21 @@ async function addContact() {
   err.textContent = '';
   btn.disabled = true;
   try {
+    var body = {
+      name: name,
+      type: typeInput.value,
+      email: emailInput.value.trim() || null
+    };
+    CONTACT_FIELDS.forEach(function(item) {
+      var value = contactFieldValue(item.add);
+      if (value) body[item.field] = value;
+    });
+    var country = contactFieldValue('contact-country');
+    if (country) body.country = country;
     var resp = await fetch('/api/contacts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: name,
-        type: typeInput.value,
-        email: emailInput.value.trim() || null
-      })
+      body: JSON.stringify(body)
     });
     var data = await resp.json().catch(function() { return null; });
     if (!resp.ok) {
@@ -2623,6 +2808,12 @@ async function addContact() {
     }
     nameInput.value = '';
     emailInput.value = '';
+    CONTACT_FIELDS.forEach(function(item) {
+      var el = document.getElementById(item.add);
+      if (el) el.value = '';
+    });
+    var countryInput = document.getElementById('contact-country');
+    if (countryInput) countryInput.value = '';
     await loadContacts();
   } catch (e) {
     err.textContent = 'Could not add the contact: ' + e.message;

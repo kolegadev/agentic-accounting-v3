@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.models.account import Account
+from src.models.contact import Contact
 from src.models.transaction import Posting, Transaction, VATLine
 from src.services.entity_service import get_ledger_for_entity
 from src.services.formance_client import formance_client, FormanceClient
@@ -574,9 +575,12 @@ class TransactionService:
 
         - ``items`` are newest-first (effective_date DESC, id DESC); each
           carries THIS account's ``debit_pence`` / ``credit_pence`` legs,
-          the transaction fields, and ``balance_pence`` — the cumulative
-          Σ debits − Σ credits from the oldest in-scope transaction
-          through that row (a true running balance, not a window total).
+          the transaction fields, ``contact_name`` (Contract F42 — the
+          counterparty joined on ``Transaction.contact_id``; ``None`` when
+          the transaction is unstamped or the contact is unknown) and
+          ``balance_pence`` — the cumulative Σ debits − Σ credits from the
+          oldest in-scope transaction through that row (a true running
+          balance, not a window total).
         - ``running_balance_pence`` is the ENDING balance over the full
           in-scope history (independent of the date window and ``limit``).
         - ``count`` is the number of items returned.
@@ -607,6 +611,18 @@ class TransactionService:
         if entity_id is not None:
             stmt = stmt.where(Transaction.entity_id == entity_id)
         transactions = list((await db.execute(stmt)).scalars().all())
+
+        # ---- Contract F42: counterparty names (join on contact_id) ----
+        # One batched lookup keyed on the loaded rows' contact_ids; a
+        # missing / unknown contact (or an unstamped transaction) yields
+        # None — a broken contact link never fails the drill-down.
+        contact_ids = {tx.contact_id for tx in transactions if tx.contact_id is not None}
+        contact_names: dict[uuid.UUID, str] = {}
+        if contact_ids:
+            name_rows = await db.execute(
+                select(Contact.id, Contact.name).where(Contact.id.in_(contact_ids))
+            )
+            contact_names = {row.id: row.name for row in name_rows}
 
         ordered = sorted(
             transactions,
@@ -642,6 +658,7 @@ class TransactionService:
                     "debit_pence": debit,
                     "credit_pence": credit,
                     "status": tx.status,
+                    "contact_name": contact_names.get(tx.contact_id),
                     "balance_pence": running,
                 }
             )

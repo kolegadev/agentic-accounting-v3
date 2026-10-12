@@ -24,6 +24,7 @@ from sqlalchemy.pool import StaticPool
 from src.config.database import Base, get_db
 from src.index import app
 from src.models.account import Account
+from src.models.contact import Contact
 from src.models.transaction import Posting, Transaction
 from src.routes.transactions import list_account_transactions
 from src.services.transaction_service import TransactionService
@@ -80,6 +81,32 @@ _SQLITE_SCHEMA = [
         vat_amount INTEGER NOT NULL,
         net_amount INTEGER NOT NULL,
         vat_type VARCHAR(6) NOT NULL
+    )
+    """,
+    # Contract F42 — the counterparty join reads this table.
+    """
+    CREATE TABLE IF NOT EXISTS contacts (
+        id CHAR(36) PRIMARY KEY NOT NULL DEFAULT (gen_random_uuid()),
+        type VARCHAR(10) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        company VARCHAR(255),
+        email VARCHAR(255),
+        phone VARCHAR(50),
+        address_line1 VARCHAR(255),
+        address_line2 VARCHAR(255),
+        city VARCHAR(100),
+        postcode VARCHAR(10),
+        country VARCHAR(2) NOT NULL DEFAULT 'GB',
+        vat_number VARCHAR(20),
+        payment_terms VARCHAR(50) NOT NULL DEFAULT 'Net 30',
+        default_gl_account_id CHAR(36),
+        currency VARCHAR(3) NOT NULL DEFAULT 'GBP',
+        status VARCHAR(10) NOT NULL DEFAULT 'active',
+        total_invoiced INTEGER NOT NULL DEFAULT 0,
+        total_paid INTEGER NOT NULL DEFAULT 0,
+        total_owing INTEGER NOT NULL DEFAULT 0,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
 ]
@@ -390,3 +417,66 @@ async def test_route_limit_clamp_and_query_params(api_client) -> None:
     )
     assert bad_entity.status_code == 404
     assert bad_entity.json()["type"] == "account_not_found"
+
+
+# ---------------------------------------------------------------------------
+# Contract F42 — the counterparty name on every drill-down item
+# ---------------------------------------------------------------------------
+
+
+async def test_list_for_account_items_carry_contact_name() -> None:
+    """F42: items are joined to their contact; unstamped/dangling -> None."""
+    world = await _make_world()
+    zephyr = Contact(id=uuid.uuid4(), type="customer", name="Zephyr Ltd")
+    try:
+        world.db.add(zephyr)
+        await world.db.commit()
+        # JE-0003 -> a real contact; JE-0002 -> a DANGLING contact_id (no
+        # row); JE-0001 -> unstamped.  Neither broken link may fail.
+        await world.db.execute(
+            text("UPDATE transactions SET contact_id = :cid WHERE reference = :ref"),
+            {"cid": zephyr.id.hex, "ref": "JE-2026-0003"},
+        )
+        await world.db.execute(
+            text("UPDATE transactions SET contact_id = :cid WHERE reference = :ref"),
+            {"cid": uuid.uuid4().hex, "ref": "JE-2026-0002"},
+        )
+        await world.db.commit()
+
+        result = await TransactionService.list_for_account(world.db, "1100")
+    finally:
+        await _close(world)
+
+    assert result is not None
+    assert {item["reference"]: item["contact_name"] for item in result["items"]} == {
+        "JE-2026-0003": "Zephyr Ltd",
+        "JE-2026-0002": None,
+        "JE-2026-0001": None,
+    }
+    # Every item carries the key, even when the contact is missing.
+    assert all("contact_name" in item for item in result["items"])
+
+
+async def test_route_items_pass_contact_name_through() -> None:
+    """F42: the drill-down route serialises the item's contact_name."""
+    world = await _make_world()
+    jost = Contact(id=uuid.uuid4(), type="supplier", name="Jost Supplies")
+    try:
+        world.db.add(jost)
+        await world.db.commit()
+        await world.db.execute(
+            text("UPDATE transactions SET contact_id = :cid WHERE reference = :ref"),
+            {"cid": jost.id.hex, "ref": "JE-2026-0001"},
+        )
+        await world.db.commit()
+
+        response = await list_account_transactions(code="1100", db=world.db, limit=100)
+    finally:
+        await _close(world)
+
+    assert response.status_code == 200
+    items = json.loads(response.body)["items"]
+    by_ref = {item["reference"]: item["contact_name"] for item in items}
+    assert by_ref["JE-2026-0001"] == "Jost Supplies"
+    assert by_ref["JE-2026-0002"] is None
+    assert by_ref["JE-2026-0003"] is None

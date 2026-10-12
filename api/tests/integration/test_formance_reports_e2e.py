@@ -715,6 +715,8 @@ async def test_aging_receivables_reconciles_to_tb_with_partial_receipt(ctx) -> N
     assert item["paid_pence"] == 60000
     assert item["outstanding_pence"] == 60000
     assert item["days_overdue"] == (END - date(2026, 10, 1)).days
+    # Contract F42: the route shape carries the counterparty per item.
+    assert "contact_name" in item
     buckets = {b["bucket"]: b for b in report["buckets"]}
     assert buckets["90+"] == {"bucket": "90+", "count": 1, "total_pence": 60000}
     assert buckets["0-30"] == {"bucket": "0-30", "count": 0, "total_pence": 0}
@@ -804,3 +806,6 @@ async def test_account_drilldown_route_returns_postings_and_running_balance(ctx)
     ) == (120000, 0, 120000)
     assert invoice["status"] == "posted"
     assert invoice["description"]
+    # Contract F42: the drill-down items carry the counterparty key too.
+    assert "contact_name" in receipt
+    assert "contact_name" in invoice

@@ -154,6 +154,10 @@ async def _run_aging_report(
     balance for 1100 / 2000 — a mismatch raises
     :class:`ReportEngineError` (422 ``{type: report_engine_error}``), never
     a quietly wrong report.
+
+    Contract F42: each item carries ``contact_name`` (the counterparty
+    from the Postgres ``Transaction.contact_id`` join; ``None`` when
+    absent) — the route forwards the engine's items unchanged.
     """
     as_of = as_at or date.today()
     generator = (
